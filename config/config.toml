@@ -1,0 +1,25 @@
+[game]
+title = "Killzone 2"
+title_id = "BCES00081"
+version = "01.00"
+category = "HG"
+
+[memory]
+main_ram_mb = 256
+rsx_vram_mb = 256
+enable_bounds_checking = true
+
+[cell]
+ppu_threads = 2
+spu_threads = 6
+spu_loop_optimization = true
+
+[graphics]
+backend = "Vulkan"
+resolution_scale = 1.0
+vsync = true
+async_shaders = true
+
+[audio]
+backend = "SDL"
+sample_rate = 48000

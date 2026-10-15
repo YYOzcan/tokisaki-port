@@ -1,0 +1,31 @@
+# Build directories
+build/
+bin/
+lib/
+out/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# IDE / Tooling
+.cache/
+.vscode/
+.idea/
+compile_commands.json
+CMakeUserPresets.json
+
+# Game Assets & Dumps
+*.iso
+*.bin
+*.elf
+*.self
+*.sprx
+*.edat
+*.pkg
+game_dump/
+dump/
+assets/
