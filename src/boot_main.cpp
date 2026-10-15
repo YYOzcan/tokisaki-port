@@ -47,6 +47,7 @@ int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 void     ps3_load_prx_modules(void);
 void     kz2_hle_register(void);              /* src/kz2_hle.cpp */
 void     cellGame_init_from_paramsfo(const char* sfo_path);
+void     kz2_ftrace_mark_main(void);              /* src/kz2_ftrace.cpp */
 
 extern const char* ppu_vfs_root;
 extern int     g_sys_process_exit_called;
@@ -329,6 +330,7 @@ struct GuestRun { uint32_t entry; int rc; };
 static void* guest_main(void* p)
 {
     GuestRun* run = (GuestRun*)p;
+    kz2_ftrace_mark_main();
     run->rc = ppu_run(run->entry, STACK_TOP);
     return nullptr;
 }

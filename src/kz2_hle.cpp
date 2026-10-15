@@ -20,6 +20,28 @@ typedef void (*hle_ctx_fn)(ppu_context*);
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn);
 extern "C" int32_t cellSpursEventFlagSet(void* event_flag_ea, uint16_t bits);
 extern "C" uint8_t* vm_base;
+extern "C" int32_t cellFontInit(const void* config);
+extern "C" int32_t cellFontGetRenderCharGlyphMetrics(void* font, uint32_t code, void* metrics);
+
+/* ---------------------------------------------------------------------------
+ * Guest scratch memory for structures these handlers hand to the title.
+ *
+ * 0x2F000000 sits between the runtime's HLE inject window (0x20000000, GCM
+ * labels / control register / offset tables, 0x8000 bytes) and the raw-SPU
+ * windows at 0x30000000; Killzone 2 never maps anything there (its heaps come
+ * from sys_memory at 0x40000000 and the stacks at 0xD0000000). Bump-allocated,
+ * never freed -- only a handful of small objects are ever created.
+ * -----------------------------------------------------------------------*/
+static uint32_t kz2_guest_alloc(uint32_t size, uint32_t align)
+{
+    static std::atomic<uint32_t> next{0x2F000000u};
+    uint32_t cur = next.load(), ea;
+    do {
+        ea = (cur + align - 1) & ~(align - 1);
+    } while (!next.compare_exchange_weak(cur, ea + size));
+    memset(vm_base + ea, 0, size);
+    return ea;
+}
 
 /* Killzone 2 ships no game-side PRX in USRDIR; every import is firmware. */
 extern "C" void ps3_load_prx_modules(void)
@@ -131,7 +153,55 @@ static void kz2_lfqueue_push_body(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * cellFont, SDK 3.x entry points
+ *
+ * Killzone 2 initialises the font library with the *WithRevision forms, which
+ * the runtime does not register. Unregistered imports return CELL_OK without
+ * doing anything, so cellFontInit never ran (every later cellFont call then
+ * reported UNINITIALIZED) and the FreeType library pointer stayed NULL --
+ * cellFontOpenFontset was handed lib=0. Both forward to the existing
+ * implementation; the revision flags only describe the SDK the title was
+ * built with.
+ * -----------------------------------------------------------------------*/
+static void kz2_font_initialize_with_revision(ppu_context* ctx)
+{
+    /* (u64 revisionFlags, CellFontConfig* config) */
+    int32_t rc = cellFontInit((const void*)(uintptr_t)(uint32_t)ctx->gpr[4]);
+    if (rc == (int32_t)0x80540004u) rc = 0;   /* ALREADY_INITIALIZED: harmless */
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
+
+static void kz2_font_init_library_freetype_with_revision(ppu_context* ctx)
+{
+    /* (u64 revisionFlags, const CellFontLibraryConfigFT* config,
+     *  const CellFontLibrary** lib) */
+    const uint32_t lib_out = (uint32_t)ctx->gpr[5];
+    if (!lib_out) { ctx->gpr[3] = 0x80540002u; return; }   /* INVALID_PARAMETER */
+    static uint32_t lib = 0;
+    if (!lib) lib = kz2_guest_alloc(0x40, 0x10);
+    vm_write32(lib_out, lib);
+    fprintf(stderr, "[kz2] cellFontInitLibraryFreeTypeWithRevision -> lib=0x%08X\n", lib);
+    ctx->gpr[3] = 0;
+}
+
+/* cellFontGetCharGlyphMetrics(CellFont* font, u32 code, CellFontGlyphMetrics* m):
+ * the unscaled-outline form of the metrics query; the runtime only has the
+ * render (scaled) form, which fills the same struct. */
+static void kz2_font_get_char_glyph_metrics(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellFontGetRenderCharGlyphMetrics(
+        (void*)(uintptr_t)(uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+        (void*)(uintptr_t)(uint32_t)ctx->gpr[5]);
+}
+
 extern "C" void kz2_hle_register(void)
 {
+    ps3_hle_register_ctx(0xD8EAEE9F, "cellFontGetCharGlyphMetrics",
+                         kz2_font_get_char_glyph_metrics);
+    ps3_hle_register_ctx(0xF03DCC29, "cellFontInitializeWithRevision",
+                         kz2_font_initialize_with_revision);
+    ps3_hle_register_ctx(0x7A0A83C4, "cellFontInitLibraryFreeTypeWithRevision",
+                         kz2_font_init_library_freetype_with_revision);
     ps3_hle_register_ctx(0x8A85674D, "_cellSpursLFQueuePushBody", kz2_lfqueue_push_body);
 }

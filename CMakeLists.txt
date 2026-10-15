@@ -81,9 +81,12 @@ endif()
 # ---------------------------------------------------------------------------
 file(GLOB KZ2_LIB_INC_DIRS LIST_DIRECTORIES true "${PS3RECOMP_DIR}/libs/*")
 
+option(KZ2_FTRACE "Instrument the lifted chunks for src/kz2_ftrace.cpp (diagnostics)" OFF)
+
 add_executable(killzone2
     src/boot_main.cpp
     src/kz2_hle.cpp
+    src/kz2_ftrace.cpp
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_loader.cpp"
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_hle.cpp"
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"
@@ -118,8 +121,12 @@ if(MSVC)
 else()
     target_compile_options(killzone2 PRIVATE -Wall -Wextra -Wno-unused-parameter -fno-strict-aliasing)
     # Generated code: no warnings, and no fused multiply-add the guest did not ask for.
+    set(KZ2_RECOMP_FLAGS "-w;-ffp-contract=off;${KZ2_RECOMP_COMPILE_OPTIONS}")
+    if(KZ2_FTRACE)
+        list(APPEND KZ2_RECOMP_FLAGS -finstrument-functions)
+    endif()
     set_source_files_properties(${KZ2_RECOMP_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "-w;-ffp-contract=off;${KZ2_RECOMP_COMPILE_OPTIONS}")
+        COMPILE_OPTIONS "${KZ2_RECOMP_FLAGS}")
 endif()
 
 if(KZ2_SPU_SOURCES)
