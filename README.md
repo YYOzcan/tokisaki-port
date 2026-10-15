@@ -1,6 +1,6 @@
 # Tokisaki Port (Killzone 2 PC Port)
 
-[![Project Status](https://img.shields.io/badge/Status-Not%20Started%20(0%25)-red.svg)]()
+[![Project Status](https://img.shields.io/badge/Status-Boots%20%2F%20first%20frames-orange.svg)]()
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![Target Platform](https://img.shields.io/badge/Target-PC%20(x86__64)-lightgrey.svg)]()
 
@@ -13,20 +13,33 @@
 
 Static recompilation project for **Killzone 2** (PlayStation 3) targeting native PC execution.
 
-### 📊 Project Status: 0% (Not Started / Pre-Alpha)
+### 📊 Project Status: boots, streams data, renders its first frames (pre-alpha)
 
-> [!NOTE]
-> **Current Progress: 0%**
-> The project has not functionally started yet. Only the foundational repository architecture, CMake build system, and basic runtime skeletons (guest memory and SPU dispatchers) have been set up. Reverse engineering, binary disassembly, instruction lifting, and graphics pipeline porting have not begun. This tracker will be updated with every milestone.
+Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.14.0, pinned as a submodule, with this port's fixes in `patches/ps3recomp/`). Linux/Vulkan is the primary host.
+
+| Stage | State |
+|---|---|
+| EBOOT → ELF, PPU lift | **done** — 34,145 OPD functions → 67,196 lifted, 41 chunks, ~6.1 M lines of C++, 234 switch tables |
+| SPU lift | **done** — 23 embedded SPU ELFs, the WWS job-manager policy module, 36 WWS job modules |
+| Build & link | **done** — ~118 MB native x86-64 binary (clang, ~3 min at -j8) |
+| Boot | CRT, TLS, SPURS ×2, FIOS, cellGcm 720p, display buffers/tiles/zcull, cellFont, cellSaveData, cellAudio, trophies |
+| Asset streaming | **works** — FIOS reads `data_ps3.psarc`; Edge Zlib requests are inflated on the host |
+| Rendering | the front-end background renders into its offscreen target (see below); the presented frame is still black |
+| Where it stops | after the `svo.svobootstrap` lump: the SVML front end (`interface/svo/svml/en/kin/index.jsp`) is never requested |
+| Input / audio / gameplay | not reached |
+
+![First render: the front-end sky, pass 0 of frame 2410](docs/media/first-render-menu-sky.png)
+
+Full engineering log: [docs/PROGRESS.md](docs/PROGRESS.md).
 
 #### Roadmap
-- [ ] **Phase 0: Runtime & Build System Scaffolding** (Initial layout complete, 0% game code)
-- [ ] **Phase 1: ELF Decryption, Extraction & Symbol Analysis** (0%)
-- [ ] **Phase 2: Static Recompilation (PPU & SPU to C++20)** (0%)
-- [ ] **Phase 3: Syscall & OS Layer Stubs (libsysmodule, sys_spu)** (0%)
-- [ ] **Phase 4: RSX Rendering Pipeline (Vulkan Backend)** (0%)
-- [ ] **Phase 5: Audio, Input & Game Loop Execution** (0%)
-- [ ] **Phase 6: In-Game Playability & Bug Fixes** (0%)
+- [x] **Phase 0: Runtime & Build System** (ps3recomp submodule, CMake, Linux/Vulkan runner)
+- [x] **Phase 1: ELF extraction & analysis** (imports, SPU images, job modules)
+- [x] **Phase 2: Static recompilation** (PPU + SPU lifted and linked)
+- [ ] **Phase 3: HLE / OS layer** — in progress (lwcond ABI, Edge Zlib, cellFont fixed; SVO front end next)
+- [ ] **Phase 4: RSX rendering** — first passes render; final composition missing
+- [ ] **Phase 5: Audio, input, game loop**
+- [ ] **Phase 6: Playability**
 
 ### ⏳ Naming & Inspiration: Kurumi Tokisaki (時崎 狂三)
 
@@ -39,35 +52,38 @@ This project derives its name and philosophical inspiration from **Kurumi Tokisa
 - **Ruthless Precision and Timing**:
   The asynchronous DMA queues, AltiVec/SPU vector instruction sets, and intricate memory barriers of the Cell architecture demand the exact same millisecond-grade precision as Kurumi's bullets traversing the clock dial.
 
-### Key Features
-- **C++20 Runtime Core**: Built on the modern C++20 standard for maximum efficiency and deterministic execution.
-- **Cell SPU Pipeline**: Multi-threaded emulation of Cell Synergistic Processing Units with hardware-accelerated DMA channels.
-- **Big-Endian Transparent Memory Mapping**: Flat 4 GB virtual address space reservation allowing zero-overhead 1:1 pointer translation.
-- **Modern Hardware Optimization**: Tailored for contemporary multi-core architectures with SIMD support (AVX2 / AVX-512).
-
 ### Project Layout
 ```
-├── CMakeLists.txt         # Root build configuration (C++20)
-├── config/                # Port configurations and game profiles
-│   └── config.toml
-├── docs/                  # Architecture & engineering notes
-│   └── ARCHITECTURE.md
-└── src/
-    ├── common/            # Data types, endian conversion, vector structs
-    ├── runtime/           # Memory manager, SPU worker manager, runtime orchestrator
-    └── main.cpp           # Host executable entry point
+├── CMakeLists.txt          # links the lifted game against the ps3recomp runtime
+├── external/ps3recomp/     # toolkit + runtime (git submodule, pinned)
+├── patches/ps3recomp/      # this port's fixes to the toolkit (tools/apply_patches.sh)
+├── src/
+│   ├── boot_main.cpp       # Linux/Windows runner: guest VM, frame clock, backend pick
+│   ├── kz2_hle.cpp         # Killzone 2 HLE overrides (Edge Zlib, cellFont, ...)
+│   ├── kz2_spu_pm.c        # registers the lifted WWS job-manager policy module
+│   └── kz2_ftrace.cpp      # function-entry histogram (diagnostic builds)
+├── tools/                  # lift / build / run / diagnostics scripts
+└── docs/                   # PROGRESS.md (engineering log), ARCHITECTURE.md
 ```
+Game files, the lifted C++ (`recompiled/`, `spu_recompiled/`) and loader output (`out/`) are generated from **your own** disc and are never committed.
 
-### Building
+### Building (Linux)
+Requirements: clang, CMake ≥ 3.20, Ninja, Python ≥ 3.10, SDL2, Vulkan headers, glslang, zlib; a decrypted `EBOOT.ELF` in `game_dump/PS3_GAME/USRDIR/`.
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
+git submodule update --init
+tools/apply_patches.sh      # this port's ps3recomp fixes
+tools/lift.sh               # PPU: EBOOT.ELF -> recompiled/   (~1 min)
+tools/lift_spu.sh           # SPU: images, policy module, job modules -> spu_recompiled/
+BUILD_JOBS=8 tools/build.sh # ~0.6 GB RAM per job
 ```
 
 ### Running
 ```bash
-./build/tokisaki-port [path/to/EBOOT.ELF]
+tools/run.sh                # Vulkan window; KZ2_RSX=null for headless
 ```
+`run/vfs/PS3_GAME` links to the dump, `/dev_hdd0` maps to `run/hdd0`, firmware fonts come from RPCS3's `dev_flash` (`PS3_DEV_FLASH`).
+
+Diagnostics: `tools/snapshot.sh` (all thread stacks under gdb), `tools/sample.sh` (main-thread sampler), `tools/import_audit.py` (imports without HLE), `tools/psarc_map.py` (which archive members were read), `KZ2_PEEK` / `KZ2_DUMPAT` (watch guest memory).
 
 ---
 
@@ -76,20 +92,31 @@ cmake --build build -j$(nproc)
 
 **Killzone 2** (PlayStation 3) için geliştirilen, yerel PC çalıştırmasını hedefleyen statik yeniden derleme (static recompilation) projesidir.
 
-### 📊 Proje Durumu: %0 (Henüz Başlamadı / Ön Geliştirme)
+### 📊 Proje Durumu: açılıyor, veri akıtıyor, ilk karelerini çiziyor (ön-alfa)
 
-> [!NOTE]
-> **Mevcut İlerleme: %0**
-> Proje henüz fiilen başlamamıştır. Şu ana kadar yalnızca temel repo altyapısı, CMake derleme sistemi ve başlangıç çalışma zamanı iskeleti (konak bellek ve SPU yöneticisi taslağı) oluşturulmuştur. Tersine mühendislik, ELF çözümleme, kod çevirimi ve grafik iş hattı portlama çalışmaları henüz başlamamıştır. Her aşama kaydedildikçe bu alan güncellenecektir.
+**[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.14.0, alt modül olarak sabitlendi; bu porta ait düzeltmeler `patches/ps3recomp/` altında) üzerine kuruludur. Ana hedef Linux/Vulkan'dır.
+
+| Aşama | Durum |
+|---|---|
+| EBOOT → ELF, PPU çevirimi | **tamam** — 34.145 OPD fonksiyonu → 67.196 çevrilmiş fonksiyon, 41 parça, ~6,1 M satır C++ |
+| SPU çevirimi | **tamam** — 23 gömülü SPU ELF, WWS iş yöneticisi policy module'ü, 36 WWS iş modülü |
+| Derleme | **tamam** — ~118 MB yerel x86-64 çalıştırılabilir dosya |
+| Açılış | CRT, TLS, 2×SPURS, FIOS, cellGcm 720p, ekran tamponları, cellFont, cellSaveData, cellAudio, kupalar |
+| Varlık akışı | **çalışıyor** — FIOS `data_ps3.psarc` okuyor; Edge Zlib istekleri host'ta açılıyor |
+| Grafik | menü arka planı offscreen hedefe çiziliyor; ekrana giden kare hâlâ siyah |
+| Durduğu yer | `svo.svobootstrap` lump'ından sonra SVML arayüzü (`index.jsp`) hiç istenmiyor |
+| Giriş / ses / oynanış | henüz ulaşılmadı |
+
+Ayrıntılı mühendislik günlüğü: [docs/PROGRESS.md](docs/PROGRESS.md).
 
 #### Yol Haritası
-- [ ] **Aşama 0: Repo ve Çalışma Zamanı İskeleti** (İlk yapılandırma hazır, %0 oyun kodu)
-- [ ] **Aşama 1: ELF Şifre Çözümü, Ayrıştırma ve Sembol Analizi** (%0)
-- [ ] **Aşama 2: Statik Kod Çevrimi (PPU & SPU'dan C++20'ye)** (%0)
-- [ ] **Aşama 3: Syscall ve İşletim Sistemi Stub'ları (libsysmodule, sys_spu)** (%0)
-- [ ] **Aşama 4: RSX Grafik İş Hattı (Vulkan Arka Yüzü)** (%0)
-- [ ] **Aşama 5: Ses, Giriş Kontrolleri ve Oyun Döngüsü** (%0)
-- [ ] **Aşama 6: Oyun İçi Oynanabilirlik ve Hata Giderme** (%0)
+- [x] **Aşama 0: Çalışma zamanı ve derleme sistemi**
+- [x] **Aşama 1: ELF çıkarımı ve analiz**
+- [x] **Aşama 2: Statik çevirim (PPU + SPU)**
+- [ ] **Aşama 3: HLE / işletim sistemi katmanı** — sürüyor
+- [ ] **Aşama 4: RSX grafik** — ilk geçişler çiziliyor, son kompozisyon eksik
+- [ ] **Aşama 5: Ses, giriş, oyun döngüsü**
+- [ ] **Aşama 6: Oynanabilirlik**
 
 ### ⏳ İsimlendirme ve İlham: Kurumi Tokisaki (時崎 狂三)
 
@@ -102,32 +129,18 @@ Bu proje, adını ve felsefi ilhamını *Date A Live* serisinin unutulmaz karakt
 - **Kusursuz Hassasiyet ve Zamanlama**:
   Cell mimarisinin asenkron DMA kuyrukları, AltiVec/SPU vektör yönergeleri ve karmaşık bellek bariyerleri; Kurumi'nin saat kadranı üzerindeki mermileri gibi milisaniyelik bir zamanlama hassasiyeti gerektirir.
 
-### Temel Özellikler
-- **C++20 Çalışma Zamanı Çekirdeği**: Yüksek performans ve belirlenimli yürütme için modern C++20 standardıyla geliştirildi.
-- **Cell SPU İş Hattı**: Donanım hızlandırmalı DMA simülasyonuna sahip çok iş parçacıklı Cell SPU emülasyonu.
-- **Big-Endian Şeffaf Bellek Eşleme**: Sıfır ek yüklü 1:1 işaretçi çevrimi sağlayan 4 GB düz sanal bellek tahsisi.
-- **Modern Donanım Optimizasyonu**: SIMD destekli (AVX2 / AVX-512) güncel çok çekirdekli işlemciler için tasarlandı.
-
-### Proje Dizini
-```
-├── CMakeLists.txt         # Kök derleme yapılandırması (C++20)
-├── config/                # Port yapılandırmaları ve oyun profilleri
-│   └── config.toml
-├── docs/                  # Mimari ve mühendislik notları
-│   └── ARCHITECTURE.md
-└── src/
-    ├── common/            # Veri tipleri, endian dönüştürücüleri, SIMD yapıları
-    ├── runtime/           # Bellek yöneticisi, SPU havuzu, çekirdek çalışma zamanı
-    └── main.cpp           # Ana PC başlatıcı giriş noktası
-```
-
-### Derleme
+### Derleme (Linux)
+Gerekenler: clang, CMake ≥ 3.20, Ninja, Python ≥ 3.10, SDL2, Vulkan başlıkları, glslang, zlib; `game_dump/PS3_GAME/USRDIR/` içinde şifresi çözülmüş `EBOOT.ELF`.
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
+git submodule update --init
+tools/apply_patches.sh      # bu portun ps3recomp düzeltmeleri
+tools/lift.sh               # PPU çevirimi -> recompiled/
+tools/lift_spu.sh           # SPU çevirimi -> spu_recompiled/
+BUILD_JOBS=8 tools/build.sh
 ```
 
 ### Çalıştırma
 ```bash
-./build/tokisaki-port [path/to/EBOOT.ELF]
+tools/run.sh                # Vulkan penceresi; başsız için KZ2_RSX=null
 ```
+Oyun dosyaları ve diskinizden üretilen C++ kodu depoya asla eklenmez.
