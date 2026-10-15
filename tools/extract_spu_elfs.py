@@ -62,6 +62,6 @@ def extract_spu_elfs(eboot_path, output_dir):
     return extracted
 
 if __name__ == "__main__":
-    eboot = sys.argv[1] if len(sys.argv) > 1 else "/home/yigit/Kurumi Tokisaki/game_dump/PS3_GAME/USRDIR/EBOOT.ELF"
-    out_dir = sys.argv[2] if len(sys.argv) > 2 else "/home/yigit/Kurumi Tokisaki/game_dump/spu_modules"
+    eboot = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "game_dump", "PS3_GAME", "USRDIR", "EBOOT.ELF")
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "game_dump", "spu_modules")
     extract_spu_elfs(eboot, out_dir)

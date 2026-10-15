@@ -29,3 +29,12 @@ CMakeUserPresets.json
 game_dump/
 dump/
 assets/
+
+# Game-derived generated code and runtime state (never commit)
+recompiled/
+spu_recompiled/
+out/
+run/
+logs/
+.venv/
+build*/

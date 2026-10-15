@@ -1,55 +1,128 @@
+# Tokisaki Port -- Killzone 2 (BCUS98116) on ps3recomp.
+#
+# The lifted game code is generated locally from your own EBOOT.ELF and is
+# never committed (see tools/lift.sh). This file wires it to the ps3recomp
+# runtime, built from external/ps3recomp as a subdirectory.
+#
+#   tools/lift.sh                                    # out/ + recompiled/
+#   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+#         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+#         -DPS3RECOMP_RSX_VULKAN=ON
+#   cmake --build build -j4
+#   tools/run.sh
 cmake_minimum_required(VERSION 3.20)
 project(tokisaki-port
-    VERSION 0.1.0
-    DESCRIPTION "Killzone 2 PC Port (PS3 Recompilation Framework)"
+    VERSION 0.2.0
+    DESCRIPTION "Killzone 2 PC port (ps3recomp static recompilation)"
     LANGUAGES C CXX
 )
 
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Compiler Warnings and Optimizations
-if(MSVC)
-    add_compile_options(/W4 /permissive- /utf-8)
-else()
-    add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
+set(PS3RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/ps3recomp" CACHE PATH
+    "ps3recomp toolkit checkout")
+set(KZ2_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/recompiled" CACHE PATH
+    "ppu_lifter.py output: ppu_recomp.h and ppu_recomp_NNN.cpp")
+set(KZ2_SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu_recompiled" CACHE PATH
+    "spu_lifter.py output: one <image>/spu_recomp.c per SPU image")
+# -O1 keeps the compiler's memory per 150k-line chunk around 2 GB.
+set(KZ2_RECOMP_COMPILE_OPTIONS "-O1" CACHE STRING
+    "extra compile options for the lifted PPU chunks")
+
+if(NOT EXISTS "${PS3RECOMP_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "ps3recomp not found at ${PS3RECOMP_DIR}. "
+                        "Run: git submodule update --init")
+endif()
+if(NOT EXISTS "${KZ2_RECOMP_DIR}/ppu_recomp.h")
+    message(FATAL_ERROR "No lifted code in ${KZ2_RECOMP_DIR}. Run tools/lift.sh first.")
 endif()
 
-# Find Threads
+add_subdirectory("${PS3RECOMP_DIR}" ps3recomp EXCLUDE_FROM_ALL)
+
+# ---------------------------------------------------------------------------
+# Generated inputs
+# ---------------------------------------------------------------------------
+file(GLOB KZ2_RECOMP_SOURCES CONFIGURE_DEPENDS "${KZ2_RECOMP_DIR}/ppu_recomp_*.cpp")
+list(LENGTH KZ2_RECOMP_SOURCES KZ2_RECOMP_COUNT)
+message(STATUS "Killzone 2 lifted PPU chunks: ${KZ2_RECOMP_COUNT}")
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(KZ2_HLE_NIDS "${CMAKE_CURRENT_BINARY_DIR}/ppu_hle_nids.cpp")
+add_custom_command(
+    OUTPUT "${KZ2_HLE_NIDS}"
+    COMMAND "${Python3_EXECUTABLE}" -I "${PS3RECOMP_DIR}/tools/gen_hle_nids.py"
+            --out "${KZ2_HLE_NIDS}" --all
+    DEPENDS "${PS3RECOMP_DIR}/tools/gen_hle_nids.py"
+            "${PS3RECOMP_DIR}/tools/nid_database.py"
+    COMMENT "Generating the HLE NID -> handler table")
+
+set(KZ2_SPU_SOURCES "")
+file(GLOB KZ2_SPU_LIFTED CONFIGURE_DEPENDS "${KZ2_SPU_DIR}/*/spu_recomp.c")
+if(KZ2_SPU_LIFTED)
+    list(APPEND KZ2_SPU_SOURCES ${KZ2_SPU_LIFTED}
+         "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
+    foreach(gen IN ITEMS spu_workloads.c jobmods_register.c)
+        if(EXISTS "${KZ2_SPU_DIR}/${gen}")
+            list(APPEND KZ2_SPU_SOURCES "${KZ2_SPU_DIR}/${gen}")
+        endif()
+    endforeach()
+    list(LENGTH KZ2_SPU_LIFTED KZ2_SPU_COUNT)
+    message(STATUS "Killzone 2 lifted SPU images: ${KZ2_SPU_COUNT}")
+endif()
+
+# ---------------------------------------------------------------------------
+# The game
+# ---------------------------------------------------------------------------
+file(GLOB KZ2_LIB_INC_DIRS LIST_DIRECTORIES true "${PS3RECOMP_DIR}/libs/*")
+
+add_executable(killzone2
+    src/boot_main.cpp
+    src/kz2_hle.cpp
+    "${PS3RECOMP_DIR}/runtime/ppu/ppu_loader.cpp"
+    "${PS3RECOMP_DIR}/runtime/ppu/ppu_hle.cpp"
+    "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"
+    "${PS3RECOMP_DIR}/runtime/ppu/ppu_sysprx.cpp"
+    "${KZ2_HLE_NIDS}"
+    ${KZ2_RECOMP_SOURCES}
+    ${KZ2_SPU_SOURCES}
+)
+
+target_include_directories(killzone2 PRIVATE
+    "${KZ2_RECOMP_DIR}"
+    "${PS3RECOMP_DIR}/include"
+    "${PS3RECOMP_DIR}/runtime/ppu"
+    "${PS3RECOMP_DIR}/runtime/spu"
+    "${PS3RECOMP_DIR}/runtime/memory"
+    "${PS3RECOMP_DIR}/runtime/syscalls"
+    "${PS3RECOMP_DIR}/runtime/platform"
+    ${KZ2_LIB_INC_DIRS}
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+
 find_package(Threads REQUIRED)
+target_link_libraries(killzone2 PRIVATE ps3recomp_runtime Threads::Threads ${CMAKE_DL_LIBS})
+set_target_properties(killzone2 PROPERTIES LINKER_LANGUAGE CXX)
 
-# Include directories
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
+if(MSVC)
+    target_compile_options(killzone2 PRIVATE /W3 /wd4100 /wd4244 /wd4267)
+    target_link_libraries(killzone2 PRIVATE dbghelp user32 gdi32 winmm)
+    target_link_options(killzone2 PRIVATE /STACK:268435456)
+    set_source_files_properties(${KZ2_RECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "/w;/bigobj")
+else()
+    target_compile_options(killzone2 PRIVATE -Wall -Wextra -Wno-unused-parameter -fno-strict-aliasing)
+    # Generated code: no warnings, and no fused multiply-add the guest did not ask for.
+    set_source_files_properties(${KZ2_RECOMP_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-w;-ffp-contract=off;${KZ2_RECOMP_COMPILE_OPTIONS}")
+endif()
 
-# Runtime Sources
-set(RUNTIME_SOURCES
-    src/common/types.hpp
-    src/common/endian.hpp
-    src/runtime/memory.hpp
-    src/runtime/memory.cpp
-    src/runtime/spu_manager.hpp
-    src/runtime/spu_manager.cpp
-    src/runtime/runtime.hpp
-    src/runtime/runtime.cpp
-)
+if(KZ2_SPU_SOURCES)
+    set_source_files_properties(${KZ2_SPU_SOURCES} PROPERTIES
+        INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
+        COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT
+        COMPILE_OPTIONS "-w;-O2")
+endif()
 
-add_library(tokisaki_runtime STATIC ${RUNTIME_SOURCES})
-target_link_libraries(tokisaki_runtime PUBLIC Threads::Threads)
-
-# Main Executable
-add_executable(tokisaki-port
-    src/main.cpp
-)
-
-target_link_libraries(tokisaki-port PRIVATE tokisaki_runtime)
-
-# Configuration summary
-message(STATUS "--------------------------------------------------------")
-message(STATUS "  Tokisaki Port (Killzone 2 PC Port - PS3 Recomp)")
-message(STATUS "  Target Architecture: Host (x86_64)")
-message(STATUS "  Guest Architecture: Cell Broadband Engine (PPU/SPU)")
-message(STATUS "  C++ Standard: 20")
-message(STATUS "--------------------------------------------------------")
+install(TARGETS killzone2 RUNTIME DESTINATION bin)
