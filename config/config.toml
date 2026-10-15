@@ -1,8 +1,15 @@
 [game]
 title = "Killzone 2"
-title_id = "BCES00081"
-version = "01.00"
+title_id = "BCUS98116"
+disc_id = "BCUS98116"
+version = "01.01"
 category = "HG"
+
+[paths]
+game_dump = "game_dump"
+eboot_bin = "game_dump/PS3_GAME/USRDIR/EBOOT.BIN"
+eboot_elf = "game_dump/PS3_GAME/USRDIR/EBOOT.ELF"
+psarc_archive = "game_dump/PS3_GAME/USRDIR/data_ps3.psarc"
 
 [memory]
 main_ram_mb = 256
