@@ -1,3 +1,4 @@
 [submodule "external/ps3recomp"]
 	path = external/ps3recomp
 	url = https://github.com/sp00nznet/ps3recomp
+	ignore = dirty

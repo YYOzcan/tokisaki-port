@@ -46,6 +46,7 @@ void     lv2_init_syscalls(void);
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 void     ps3_load_prx_modules(void);
 void     kz2_hle_register(void);              /* src/kz2_hle.cpp */
+void     cellGame_init_from_paramsfo(const char* sfo_path);
 
 extern const char* ppu_vfs_root;
 extern int     g_sys_process_exit_called;
@@ -319,6 +320,14 @@ int main(int argc, char** argv)
 
     derive_vfs_root(argv[1]);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
+
+    /* Title id (BCUS98116) and name from the disc's own PARAM.SFO: cellGame,
+     * cellSaveData and trophies build their /dev_hdd0/game/<id> paths on it. */
+    {
+        char sfo[1100];
+        snprintf(sfo, sizeof sfo, "%s/PS3_GAME/PARAM.SFO", ppu_vfs_root);
+        cellGame_init_from_paramsfo(sfo);
+    }
 
     ppu_recomp_register();
     ps3_load_prx_modules();
