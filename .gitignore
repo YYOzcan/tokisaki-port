@@ -38,3 +38,4 @@ run/
 logs/
 .venv/
 build*/
+gamedata/

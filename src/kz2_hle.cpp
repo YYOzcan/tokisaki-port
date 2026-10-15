@@ -22,6 +22,10 @@ extern "C" int32_t cellSpursEventFlagSet(void* event_flag_ea, uint16_t bits);
 extern "C" uint8_t* vm_base;
 extern "C" int32_t cellFontInit(const void* config);
 extern "C" int32_t cellFontGetRenderCharGlyphMetrics(void* font, uint32_t code, void* metrics);
+extern "C" void cellSaveData_register_ctx_handlers(void);
+extern "C" int32_t cellSaveDataAutoSave2(uint32_t version, const char* dirName, uint32_t errDialog,
+                                         void* setBuf, void* funcStat, void* funcFile,
+                                         uint32_t container, void* userdata);
 
 /* ---------------------------------------------------------------------------
  * Guest scratch memory for structures these handlers hand to the title.
@@ -195,8 +199,34 @@ static void kz2_font_get_char_glyph_metrics(ppu_context* ctx)
         (void*)(uintptr_t)(uint32_t)ctx->gpr[5]);
 }
 
+/* ---------------------------------------------------------------------------
+ * cellSaveDataUserAutoSave: nine arguments
+ *
+ * (version, userId, dirName, errDialog, setBuf, funcStat, funcFile, container,
+ *  userdata) -- the ninth does not fit in r3..r10 and is the caller's
+ * parameter-save-area doubleword at SP+0x70. The generated 8-argument bridge
+ * called the stat/file callbacks with userdata = NULL; Killzone 2's callbacks
+ * dereference it as their save-job object, so its profile load/save state
+ * machine wrote into the null page and never finished.
+ * (cellSaveDataUserAutoLoad has a correct ctx handler in the runtime, which
+ * nothing registers; cellSaveData_register_ctx_handlers() below does.)
+ * -----------------------------------------------------------------------*/
+static void kz2_savedata_user_auto_save(ppu_context* ctx)
+{
+    const uint32_t userdata = (uint32_t)vm_read64((uint32_t)ctx->gpr[1] + 0x70);
+    fprintf(stderr, "[kz2] cellSaveDataUserAutoSave(user=%u, userdata=0x%08X)\n",
+            (uint32_t)ctx->gpr[4], userdata);
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataAutoSave2(
+        (uint32_t)ctx->gpr[3], (const char*)(uintptr_t)(uint32_t)ctx->gpr[5],
+        (uint32_t)ctx->gpr[6], (void*)(uintptr_t)(uint32_t)ctx->gpr[7],
+        (void*)(uintptr_t)(uint32_t)ctx->gpr[8], (void*)(uintptr_t)(uint32_t)ctx->gpr[9],
+        (uint32_t)ctx->gpr[10], (void*)(uintptr_t)userdata);
+}
+
 extern "C" void kz2_hle_register(void)
 {
+    cellSaveData_register_ctx_handlers();          /* 9-arg cellSaveDataUserAutoLoad */
+    ps3_hle_register_ctx(0x52AAC4FA, "cellSaveDataUserAutoSave", kz2_savedata_user_auto_save);
     ps3_hle_register_ctx(0xD8EAEE9F, "cellFontGetCharGlyphMetrics",
                          kz2_font_get_char_glyph_metrics);
     ps3_hle_register_ctx(0xF03DCC29, "cellFontInitializeWithRevision",

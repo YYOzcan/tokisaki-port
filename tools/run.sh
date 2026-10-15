@@ -14,4 +14,5 @@ export PS3_DEV_FLASH="${PS3_DEV_FLASH:-${HOME}/.config/rpcs3/dev_flash}"
 export PS3RECOMP_VK_WINDOW="${PS3RECOMP_VK_WINDOW:-1}"
 export PS3RECOMP_VK_GUEST_PROGRAMS="${PS3RECOMP_VK_GUEST_PROGRAMS:-1}"
 
+cd "${ROOT}/run"   # cellSaveData writes ./gamedata/dev_hdd0/... relative to the cwd
 exec "${ROOT}/build/killzone2" "${ROOT}/game_dump/PS3_GAME/USRDIR/EBOOT.ELF" "$@"
