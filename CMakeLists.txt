@@ -69,6 +69,9 @@ if(KZ2_SPU_LIFTED)
             list(APPEND KZ2_SPU_SOURCES "${KZ2_SPU_DIR}/${gen}")
         endif()
     endforeach()
+    if(EXISTS "${KZ2_SPU_DIR}/pm_DDD59DC528B4CED6/spu_recomp.c")
+        list(APPEND KZ2_SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/kz2_spu_pm.c")
+    endif()
     list(LENGTH KZ2_SPU_LIFTED KZ2_SPU_COUNT)
     message(STATUS "Killzone 2 lifted SPU images: ${KZ2_SPU_COUNT}")
 endif()
@@ -103,7 +106,8 @@ target_include_directories(killzone2 PRIVATE
 )
 
 find_package(Threads REQUIRED)
-target_link_libraries(killzone2 PRIVATE ps3recomp_runtime Threads::Threads ${CMAKE_DL_LIBS})
+find_package(ZLIB REQUIRED)        # Edge Zlib requests are inflated on the host
+target_link_libraries(killzone2 PRIVATE ps3recomp_runtime Threads::Threads ZLIB::ZLIB ${CMAKE_DL_LIBS})
 set_target_properties(killzone2 PROPERTIES LINKER_LANGUAGE CXX)
 
 if(MSVC)

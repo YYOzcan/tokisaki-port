@@ -1,0 +1,17 @@
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 66c65e5..3c1d567 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -3691,7 +3691,11 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+             tables[all_insns[i].addr] = cb
+             continue
+         # the indexed table load
+-        lwzx = next((w for w in reversed(win) if w.mnemonic == 'lwzx'), None)
++        # `lwax` is the same indexed load, sign-extended: gcc emits it for
++        # offset tables whose index is a 64-bit value (Killzone 2
++        # func_003AC15C: `lwax r0,r9,r0; add r0,r0,r9; mtctr r0; bctr`).
++        # Entries are signed offsets either way.
++        lwzx = next((w for w in reversed(win) if w.mnemonic in ('lwzx', 'lwax')), None)
+         # 64-bit offset-table idiom emits `sldi rIdx,idx,2; add rT,rIdx,rBase;
+         # lwz rEnt,0(rT)` instead of `lwzx rEnt,rIdx,rBase` (gcc -O2 PPC64).
+         # Synthesize the equivalent lwzx operands (rEnt,rA,rB) so the base/offset
