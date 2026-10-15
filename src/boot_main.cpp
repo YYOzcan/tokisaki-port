@@ -133,6 +133,8 @@ static uint64_t now_ms(void)
 #endif
 }
 
+static void peek_tick(void);
+
 /* Drain the FIFO about every millisecond, deliver 60 Hz vblank ticks on the
  * guest thread (cellGcm_request_tick), and present on the guest's flip once
  * the FIFO has drained up to it. */
@@ -151,6 +153,7 @@ static void frame_clock_loop(void)
     for (;;) {
         Sleep(1);
         if (rsx_ok) cellGcm_rsx_process_fifo();
+        peek_tick();
 
         const uint64_t now = now_ms();
         int fired = 0;
@@ -172,6 +175,27 @@ static void frame_clock_loop(void)
                 g_frames_presented.fetch_add(1);
             }
         }
+    }
+}
+
+/* KZ2_PEEK=<ea>[,<ea>...]: once a second, print each guest word and the word
+ * at +8 of what it points to -- for watching a counter the guest polls. */
+static void peek_tick(void)
+{
+    static const char* spec = getenv("KZ2_PEEK");
+    static uint64_t last = 0;
+    if (!spec) return;
+    uint64_t now = now_ms();
+    if (now - last < 1000) return;
+    last = now;
+    char buf[256];
+    strncpy(buf, spec, sizeof buf - 1);
+    buf[sizeof buf - 1] = 0;
+    for (char* tok = strtok(buf, ","); tok; tok = strtok(nullptr, ",")) {
+        uint32_t ea = (uint32_t)strtoul(tok, nullptr, 0);
+        uint32_t v = __builtin_bswap32(*(uint32_t*)(vm_base + ea));
+        uint32_t d8 = __builtin_bswap32(*(uint32_t*)(vm_base + v + 8));
+        fprintf(stderr, "[peek] [0x%08X]=0x%08X  [+8]=0x%08X\n", ea, v, d8);
     }
 }
 
