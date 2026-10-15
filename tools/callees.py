@@ -7,8 +7,8 @@ counts from an ftrace run (logs/ftrace_boot_funcs.txt: "<count> func_XXXXXXXX").
 import bisect, json, os, struct, sys
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 elf = open(os.path.join(ROOT, "game_dump/PS3_GAME/USRDIR/EBOOT.ELF"), "rb").read()
-funcs = sorted({int(f["start"], 16) if isinstance(f["start"], str) else f["start"]
-                for f in json.load(open(os.path.join(ROOT, "out/EBOOT.functions.json")))})
+# Every lifted function (OPD entries plus bl targets), from tools/lift.sh.
+funcs = sorted(int(l, 16) for l in open(os.path.join(ROOT, "out/lifted_funcs.txt")))
 counts = {}
 for line in open(sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "logs/ftrace_boot_funcs.txt")):
     n, name = line.split()

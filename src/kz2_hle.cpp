@@ -23,6 +23,7 @@ extern "C" uint8_t* vm_base;
 extern "C" int32_t cellFontInit(const void* config);
 extern "C" int32_t cellFontGetRenderCharGlyphMetrics(void* font, uint32_t code, void* metrics);
 extern "C" void cellSaveData_register_ctx_handlers(void);
+extern "C" int32_t cellFontOpenFontFile(void* font, const char* path, uint32_t sub, int32_t uid);
 extern "C" int32_t cellSaveDataAutoSave2(uint32_t version, const char* dirName, uint32_t errDialog,
                                          void* setBuf, void* funcStat, void* funcFile,
                                          uint32_t container, void* userdata);
@@ -199,6 +200,34 @@ static void kz2_font_get_char_glyph_metrics(ppu_context* ctx)
         (void*)(uintptr_t)(uint32_t)ctx->gpr[5]);
 }
 
+/* cellFontOpenFontset(CellFontLibrary* lib, CellFontType* type, CellFont* font)
+ *
+ * The runtime's version hands back an empty slot ("system fonts are not
+ * available in recomp"), so every glyph is blank. The firmware fonts are in
+ * the user's own dev_flash ($PS3_DEV_FLASH, RPCS3's by default): open the
+ * matching SCE-PS3 TrueType file through cellFontOpenFontFile, which reads a
+ * host path. Killzone 2 asks for type 0x109; anything that is not an explicit
+ * light/bold request gets Rodin Sans Serif Latin. */
+static void kz2_font_open_fontset(ppu_context* ctx)
+{
+    const uint32_t type_ea = (uint32_t)ctx->gpr[4];
+    const uint32_t font_ea = (uint32_t)ctx->gpr[5];
+    const uint32_t type = type_ea ? vm_read32(type_ea) : 0;
+    const char* file = "SCE-PS3-RD-R-LATIN.TTF";
+    if ((type & 0xFF) == 0x01) file = "SCE-PS3-RD-L-LATIN.TTF";
+    if ((type & 0xFF) == 0x02) file = "SCE-PS3-RD-B-LATIN.TTF";
+    const char* flash = getenv("PS3_DEV_FLASH");
+    char host[600];
+    snprintf(host, sizeof host, "%s/data/font/%s", flash && *flash ? flash : ".", file);
+    const uint32_t path_ea = kz2_guest_alloc((uint32_t)strlen(host) + 1, 16);
+    memcpy(vm_base + path_ea, host, strlen(host) + 1);
+    int32_t rc = cellFontOpenFontFile((void*)(uintptr_t)font_ea,
+                                      (const char*)(uintptr_t)path_ea, 0, 0);
+    if (rc == 0) vm_write32(font_ea + 4, type);   /* CellFont +4: font type */
+    fprintf(stderr, "[kz2] cellFontOpenFontset(type=0x%X) -> %s rc=0x%X\n", type, host, (uint32_t)rc);
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
+
 /* ---------------------------------------------------------------------------
  * cellSaveDataUserAutoSave: nine arguments
  *
@@ -226,6 +255,7 @@ static void kz2_savedata_user_auto_save(ppu_context* ctx)
 extern "C" void kz2_hle_register(void)
 {
     cellSaveData_register_ctx_handlers();          /* 9-arg cellSaveDataUserAutoLoad */
+    ps3_hle_register_ctx(0xA885CC9B, "cellFontOpenFontset", kz2_font_open_fontset);
     ps3_hle_register_ctx(0x52AAC4FA, "cellSaveDataUserAutoSave", kz2_savedata_user_auto_save);
     ps3_hle_register_ctx(0xD8EAEE9F, "cellFontGetCharGlyphMetrics",
                          kz2_font_get_char_glyph_metrics);

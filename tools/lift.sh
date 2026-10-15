@@ -31,3 +31,4 @@ rm -f "${ROOT}"/recompiled/ppu_recomp_*.cpp
     --chunk-lines 150000 \
     -j "${LIFT_JOBS:-8}" \
     -o "${ROOT}/recompiled/"
+grep -ho "^void func_[0-9A-F]*(" "${ROOT}"/recompiled/ppu_recomp_*.cpp | sed "s/void func_//; s/(//" | sort -u > "${ROOT}/out/lifted_funcs.txt"
