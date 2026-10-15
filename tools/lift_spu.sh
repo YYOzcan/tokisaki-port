@@ -26,7 +26,13 @@ PYEOF
 "${PY}" -I "${T}/wrap_spu_elf.py" "${OUT}/spu_pm/wws_pm.bin" --base 0xA00 --entry 0xA00 \
     --out "${OUT}/spu_pm/pm_DDD59DC528B4CED6.elf"
 "${PY}" -I "${T}/spu_lifter.py" --auto-functions "${OUT}/spu_pm/pm_DDD59DC528B4CED6.elf" \
-    --symbol-prefix pm_DDD59DC528B4CED6_ -o "${SPU}/pm_DDD59DC528B4CED6"
+    --symbol-prefix pm_DDD59DC528B4CED6_ -o "${SPU}/pm_DDD59DC528B4CED6" \
+    --extra-funcs 0xA2C,0xA84,0xA90,0xAD0
+# 0xA2C is the PM's SPU interrupt vector (MFC list stall-and-notify while a
+# job is being loaded); 0xA84/0xA90/0xAD0 are where it returns from the
+# register save/restore stub it generates at LS 0x3FEC0. Nothing branches to
+# them statically, so without these entries the whole handler ran in the
+# fallback interpreter and the PM ended mid-handler: no job ever started.
 
 "${PY}" -I "${ROOT}/tools/extract_jobmods_elf.py" "${ELF}" "${OUT}/jobmods"
 "${PY}" -I "${T}/lift_jobmods.py" --jobmods "${OUT}/jobmods" --out "${SPU}" \
