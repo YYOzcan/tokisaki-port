@@ -134,6 +134,7 @@ static uint64_t now_ms(void)
 }
 
 static void peek_tick(void);
+static void dumpat_tick(void);
 
 /* Drain the FIFO about every millisecond, deliver 60 Hz vblank ticks on the
  * guest thread (cellGcm_request_tick), and present on the guest's flip once
@@ -154,6 +155,7 @@ static void frame_clock_loop(void)
         Sleep(1);
         if (rsx_ok) cellGcm_rsx_process_fifo();
         peek_tick();
+        dumpat_tick();
 
         const uint64_t now = now_ms();
         int fired = 0;
@@ -196,6 +198,33 @@ static void peek_tick(void)
         uint32_t v = __builtin_bswap32(*(uint32_t*)(vm_base + ea));
         uint32_t d8 = __builtin_bswap32(*(uint32_t*)(vm_base + v + 8));
         fprintf(stderr, "[peek] [0x%08X]=0x%08X  [+8]=0x%08X\n", ea, v, d8);
+    }
+}
+
+/* KZ2_DUMPAT=<sec>:<ea>:<len>[,...]: hex-dump guest memory once, <sec>
+ * seconds after the frame clock starts. */
+static void dumpat_tick(void)
+{
+    static const char* spec = getenv("KZ2_DUMPAT");
+    static uint64_t t0 = 0;
+    static bool done[16];
+    if (!spec) return;
+    if (!t0) t0 = now_ms();
+    char buf[512];
+    strncpy(buf, spec, sizeof buf - 1);
+    buf[sizeof buf - 1] = 0;
+    int i = 0;
+    for (char* tok = strtok(buf, ","); tok && i < 16; tok = strtok(nullptr, ","), i++) {
+        unsigned sec = 0, ea = 0, len = 0;
+        if (sscanf(tok, "%u:%x:%x", &sec, &ea, &len) != 3 || done[i]) continue;
+        if (now_ms() - t0 < sec * 1000ull) continue;
+        done[i] = true;
+        fprintf(stderr, "[dumpat] t=%us 0x%08X+0x%X:", sec, ea, len);
+        for (unsigned o = 0; o < len; o += 4) {
+            if ((o & 31) == 0) fprintf(stderr, "\n  %08X:", ea + o);
+            fprintf(stderr, " %08X", __builtin_bswap32(*(uint32_t*)(vm_base + ea + o)));
+        }
+        fprintf(stderr, "\n");
     }
 }
 
