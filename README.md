@@ -4,6 +4,11 @@
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![Target Platform](https://img.shields.io/badge/Target-PC%20(x86__64)-lightgrey.svg)]()
 
+> [!WARNING]
+> **⚠️ NOTICE / DUYURU:**
+> - **EN**: **EVERYTHING IN THIS REPOSITORY IS CURRENTLY A PLACEHOLDER / WIP!** It was put here solely to show active ongoing development and scaffold the recompilation foundation. As actual systems and modules are implemented, placeholders will be removed and updated. Do not treat this as a finished port.
+> - **TR**: **BU DEPODAKİ HER ŞEY BİR YER TUTUCUDUR (PLACEHOLDER)!** Sadece aktif olarak üzerinde çalışıldığını göstermek ve altyapı temellerini atmak amacıyla yapılmıştır. Üzerinde çalışıldıkça tüm bu yer tutucular teker teker kaldırılacaktır.
+
 [English](#english) | [Türkçe](#türkçe)
 
 ---
@@ -12,6 +17,10 @@
 ## English
 
 Static recompilation project for **Killzone 2** (PlayStation 3) targeting native PC execution.
+
+> [!IMPORTANT]
+> ### 🛑 CURRENT STATE & PLACEHOLDER CLARIFICATION
+> **Everything currently in this repository is a placeholder.** This project was published to demonstrate active development and establish the initial scaffolding. These stubs, scaffolds, and experimental implementations **will be replaced and removed as active work progresses**.
 
 ### 📊 Project Status: boots, streams data, renders its first frames (pre-alpha)
 
@@ -91,6 +100,10 @@ Diagnostics: `tools/snapshot.sh` (all thread stacks under gdb), `tools/sample.sh
 ## Türkçe
 
 **Killzone 2** (PlayStation 3) için geliştirilen, yerel PC çalıştırmasını hedefleyen statik yeniden derleme (static recompilation) projesidir.
+
+> [!IMPORTANT]
+> ### 🛑 MEVCUT DURUM VE YER TUTUCU (PLACEHOLDER) BİLGİLENDİRMESİ
+> **Bu depoda yer alan her şey şu an için bir yer tutucudur (placeholder).** Proje, yalnızca aktif olarak üzerinde çalışıldığını göstermek ve geliştirme temellerini atmak amacıyla yayımlanmıştır. Bu taslaklar ve kod parçaları **üzerinde fiilen çalışıldıkça teker teker kaldırılacak ve gerçek uygulamalarla değiştirilecektir**.
 
 ### 📊 Proje Durumu: açılıyor, veri akıtıyor, ilk karelerini çiziyor (ön-alfa)
 
