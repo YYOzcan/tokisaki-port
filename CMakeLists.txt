@@ -106,6 +106,7 @@ target_include_directories(killzone2 PRIVATE
     "${PS3RECOMP_DIR}/runtime/platform"
     ${KZ2_LIB_INC_DIRS}
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${PS3RECOMP_DIR}/libs/font"              # stb_truetype.h (glyph outlines)
 )
 
 find_package(Threads REQUIRED)

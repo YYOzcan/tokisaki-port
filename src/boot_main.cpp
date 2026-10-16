@@ -153,6 +153,7 @@ static uint64_t now_ms(void)
 
 static void peek_tick(void);
 static void dumpat_tick(void);
+static void dumpfile_tick(void);
 
 /* Drain the FIFO about every millisecond, deliver 60 Hz vblank ticks on the
  * guest thread (cellGcm_request_tick), and present on the guest's flip once
@@ -174,6 +175,7 @@ static void frame_clock_loop(void)
         if (rsx_ok) cellGcm_rsx_process_fifo();
         peek_tick();
         dumpat_tick();
+        dumpfile_tick();
 
         const uint64_t now = now_ms();
         int fired = 0;
@@ -244,6 +246,24 @@ static void dumpat_tick(void)
         }
         fprintf(stderr, "\n");
     }
+}
+
+/* KZ2_DUMPFILE=<sec>:<ea>:<len>:<path>: write guest memory to a file once. */
+static void dumpfile_tick(void)
+{
+    static const char* spec = getenv("KZ2_DUMPFILE");
+    static uint64_t t0 = 0;
+    static bool done = false;
+    if (!spec || done) return;
+    if (!t0) t0 = now_ms();
+    unsigned sec = 0, ea = 0, len = 0;
+    char path[512] = {0};
+    if (sscanf(spec, "%u:%x:%x:%511s", &sec, &ea, &len, path) != 4) { done = true; return; }
+    if (now_ms() - t0 < sec * 1000ull) return;
+    done = true;
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(vm_base + ea, 1, len, f); fclose(f); }
+    fprintf(stderr, "[dumpfile] 0x%08X+0x%X -> %s\n", ea, len, path);
 }
 
 static DWORD WINAPI frame_clock(LPVOID)

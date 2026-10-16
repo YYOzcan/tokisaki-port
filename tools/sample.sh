@@ -11,7 +11,7 @@ mkdir -p "${ROOT}/run/vfs" "${ROOT}/run/hdd0" "${ROOT}/logs"
 [ -e "${ROOT}/run/vfs/PS3_GAME" ] || ln -s "${ROOT}/game_dump/PS3_GAME" "${ROOT}/run/vfs/PS3_GAME"
 export PS3_VFS_ROOT="${PS3_VFS_ROOT:-${ROOT}/run/vfs}" PS3_HDD0_ROOT="${ROOT}/run/hdd0"
 export PS3_DEV_FLASH="${PS3_DEV_FLASH:-${HOME}/.config/rpcs3/dev_flash}"
-export KZ2_NO_CRASH_HANDLER=1 KZ2_RSX="${KZ2_RSX:-null}"
+export KZ2_NO_CRASH_HANDLER=1 KZ2_RSX="${KZ2_RSX:-null}" PS3RECOMP_VK_GUEST_PROGRAMS="${PS3RECOMP_VK_GUEST_PROGRAMS:-1}"
 CMDS="$(mktemp)"
 {
     echo "set pagination off"; echo "handle SIGPIPE nostop noprint"; echo "run"

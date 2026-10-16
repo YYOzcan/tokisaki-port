@@ -6,8 +6,8 @@
 
 > [!WARNING]
 > **Work in progress — this is not a playable port.**
-> The game boots, streams its data, runs its SPU jobs and walks its menus up to the start of a campaign, but it is far from playable: menu text is missing, the Vulkan renderer runs at about half a frame per second, and gameplay has not been reached. Status details below.
-> **Devam eden bir çalışma — oynanabilir bir port değildir.** Oyun açılıyor, verisini okuyor, SPU işlerini çalıştırıyor ve menülerinde bir kampanya başlatmaya kadar ilerliyor; ancak menü yazıları yok, Vulkan çizimi saniyede yarım kare civarında ve oynanışa ulaşılmadı.
+> The game boots, streams its data, runs its SPU jobs and walks its menus up to the start of a campaign, but it is far from playable: some menu glyphs are missing, the intro movie and campaign loading stall, and gameplay has not been reached. Status details below.
+> **Devam eden bir çalışma — oynanabilir bir port değildir.** Oyun açılıyor, verisini okuyor, SPU işlerini çalıştırıyor ve menülerinde bir kampanya başlatmaya kadar ilerliyor; ancak bazı harfler eksik, giriş videosu ve kampanya yüklemesi takılıyor ve oynanışa ulaşılmadı.
 >
 > Built on [ps3recomp](https://github.com/sp00nznet/ps3recomp); the boot harness is adapted from [Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal). Developed with an AI coding agent. See [CREDITS.md](CREDITS.md).
 
@@ -31,11 +31,11 @@ Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.14.0, pinne
 | Build & link | **done** — ~118 MB native x86-64 binary (clang, ~3 min at -j8) |
 | Boot | CRT, TLS, SPURS ×2, FIOS, cellGcm 720p, display buffers/tiles/zcull, cellFont, cellSaveData, cellAudio, trophies |
 | Asset streaming | **works** — FIOS reads `data_ps3.psarc`; Edge Zlib requests are inflated on the host |
-| Rendering | menus reach the display buffer (background, button prompts); text missing; Vulkan path ~0.5 fps |
+| Rendering | menus with text are presented on Vulkan (some glyphs missing); real-time speed |
 | Front end | language select → gamma → main menu → save warning → start screen → campaign difficulty → campaign start (driven with `PAD_SCRIPT`) |
 | Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); campaign start waits on the sound engine; gameplay not reached |
 
-![Language-select menu in the display buffer](docs/media/first-menu-frame.png)
+![Welcome screen, presented by the Vulkan backend: text renders, some letters still missing](docs/media/welcome-screen-first-text.png)
 
 Full engineering log: [docs/PROGRESS.md](docs/PROGRESS.md).
 
@@ -105,7 +105,7 @@ Diagnostics: `tools/snapshot.sh` (all thread stacks under gdb), `tools/sample.sh
 | Derleme | **tamam** — ~118 MB yerel x86-64 çalıştırılabilir dosya |
 | Açılış | CRT, TLS, 2×SPURS, FIOS, cellGcm 720p, ekran tamponları, cellFont, cellSaveData, cellAudio, kupalar |
 | Varlık akışı | **çalışıyor** — FIOS `data_ps3.psarc` okuyor; Edge Zlib istekleri host'ta açılıyor |
-| Grafik | menüler ekran tamponuna ulaşıyor (arka plan, tuş simgeleri); yazılar eksik; Vulkan ~0,5 kare/sn |
+| Grafik | menüler yazılarıyla Vulkan'da ekrana geliyor (bazı harfler eksik); gerçek zamanlı hız |
 | Menüler | dil seçimi → gama → ana menü → kayıt uyarısı → başlangıç ekranı → zorluk seçimi → kampanya başlangıcı (`PAD_SCRIPT` ile) |
 | Video / oynanış | giriş videosu oynatıcısı kilitleniyor (`tools/make_vfs_nointro.sh` ile atlanıyor); kampanya başlangıcı ses motorunda bekliyor; oynanışa ulaşılmadı |
 

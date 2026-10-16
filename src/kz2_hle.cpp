@@ -16,6 +16,9 @@
 #include <initializer_list>
 
 #include <zlib.h>
+#include <vector>
+
+#include "stb_truetype.h"   /* implementation is compiled into the runtime (libs/font/cellFont.c) */
 
 typedef void (*hle_ctx_fn)(ppu_context*);
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn);
@@ -234,6 +237,129 @@ static void kz2_font_open_fontset(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * cellFontGenerateCharGlyph(CellFont* font, u32 code, CellFontGlyph** glyph)
+ *
+ * The title rasterises some text itself from glyph OUTLINES -- the
+ * language-select names in Cyrillic and other scripts its own fonts lack --
+ * into a 512x512 glyph-cache texture. The runtime has no outline API, so the
+ * cache stayed empty and those strings never drew. Outlines come from the same
+ * firmware TTF cellFontOpenFontset opened, scaled to the font's pixel scale
+ * (CellFont +8/+12, set by cellFontSetScalePixel), y up, FreeType tags
+ * (1 = on curve, 0 = conic control, 2 = cubic control).
+ *
+ * CellFontGlyph (64 bytes): u16 CF_type, u16 type, u32 size,
+ *   Metrics { f32 width, height; Horizontal {bearingX, bearingY, advance};
+ *             Vertical {bearingX, bearingY, advance} }            @ +0x08
+ *   Outline { s16 contoursCount, pointsCount; u32 Points, pointTags,
+ *             contourIndexs, flags, generateEnv }                 @ +0x28
+ * followed here by the point, tag and contour arrays in the same block.
+ * -----------------------------------------------------------------------*/
+static stbtt_fontinfo s_kz2_font;
+static std::vector<unsigned char> s_kz2_font_data;
+
+static bool kz2_font_ready(void)
+{
+    if (!s_kz2_font_data.empty()) return true;
+    const char* flash = getenv("PS3_DEV_FLASH");
+    char path[600];
+    snprintf(path, sizeof path, "%s/data/font/SCE-PS3-RD-R-LATIN.TTF", flash && *flash ? flash : ".");
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    s_kz2_font_data.resize((size_t)n);
+    size_t got = fread(s_kz2_font_data.data(), 1, (size_t)n, f);
+    fclose(f);
+    if (got != (size_t)n ||
+        !stbtt_InitFont(&s_kz2_font, s_kz2_font_data.data(),
+                        stbtt_GetFontOffsetForIndex(s_kz2_font_data.data(), 0))) {
+        s_kz2_font_data.clear();
+        return false;
+    }
+    return true;
+}
+
+static inline void wf32(uint32_t ea, float v) { uint32_t u; memcpy(&u, &v, 4); vm_write32(ea, u); }
+
+static void kz2_font_generate_char_glyph(ppu_context* ctx)
+{
+    const uint32_t font_ea = (uint32_t)ctx->gpr[3];
+    const uint32_t code    = (uint32_t)ctx->gpr[4];
+    const uint32_t out_ea  = (uint32_t)ctx->gpr[5];
+    if (!out_ea || !kz2_font_ready()) { ctx->gpr[3] = 0x80540002u; return; }
+
+    float sy = 0;
+    if (font_ea) { uint32_t u = vm_read32(font_ea + 12); memcpy(&sy, &u, 4); }
+    if (!(sy > 0.5f && sy < 512.0f)) sy = 32.0f;
+    const float scale = stbtt_ScaleForMappingEmToPixels(&s_kz2_font, sy);
+
+    const int gi = stbtt_FindGlyphIndex(&s_kz2_font, (int)code);
+    stbtt_vertex* v = nullptr;
+    const int nv = gi ? stbtt_GetGlyphShape(&s_kz2_font, gi, &v) : 0;
+
+    std::vector<float> px, py; std::vector<uint8_t> tag; std::vector<uint16_t> cont;
+    for (int i = 0; i < nv; i++) {
+        switch (v[i].type) {
+        case STBTT_vmove:
+            if (!px.empty()) cont.push_back((uint16_t)(px.size() - 1));
+            px.push_back(v[i].x * scale); py.push_back(v[i].y * scale); tag.push_back(1); break;
+        case STBTT_vline:
+            px.push_back(v[i].x * scale); py.push_back(v[i].y * scale); tag.push_back(1); break;
+        case STBTT_vcurve:
+            px.push_back(v[i].cx * scale); py.push_back(v[i].cy * scale); tag.push_back(0);
+            px.push_back(v[i].x * scale);  py.push_back(v[i].y * scale);  tag.push_back(1); break;
+        case STBTT_vcubic:
+            px.push_back(v[i].cx * scale);  py.push_back(v[i].cy * scale);  tag.push_back(2);
+            px.push_back(v[i].cx1 * scale); py.push_back(v[i].cy1 * scale); tag.push_back(2);
+            px.push_back(v[i].x * scale);   py.push_back(v[i].y * scale);   tag.push_back(1); break;
+        }
+    }
+    if (!px.empty()) cont.push_back((uint16_t)(px.size() - 1));
+    if (v) stbtt_FreeShape(&s_kz2_font, v);
+
+    const uint32_t np = (uint32_t)px.size(), nc = (uint32_t)cont.size();
+    const uint32_t pts_off = 0x40, tag_off = pts_off + np * 8;
+    const uint32_t con_off = (tag_off + np + 1) & ~1u;
+    const uint32_t size    = (con_off + nc * 2 + 15) & ~15u;
+    const uint32_t g = kz2_guest_alloc(size, 16);
+
+    int adv = 0, lsb = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    if (gi) {
+        stbtt_GetGlyphHMetrics(&s_kz2_font, gi, &adv, &lsb);
+        stbtt_GetGlyphBox(&s_kz2_font, gi, &x0, &y0, &x1, &y1);
+    }
+    vm_write16(g + 0, 0); vm_write16(g + 2, 0); vm_write32(g + 4, size);
+    wf32(g + 0x08, (x1 - x0) * scale);   /* width   */
+    wf32(g + 0x0C, (y1 - y0) * scale);   /* height  */
+    wf32(g + 0x10, x0 * scale);          /* Horizontal.bearingX */
+    wf32(g + 0x14, y1 * scale);          /* Horizontal.bearingY */
+    wf32(g + 0x18, adv * scale);         /* Horizontal.advance  */
+    wf32(g + 0x1C, -(x1 - x0) * scale * 0.5f);  /* Vertical.bearingX */
+    wf32(g + 0x20, 0.0f);                /* Vertical.bearingY */
+    wf32(g + 0x24, sy);                  /* Vertical.advance  */
+    vm_write16(g + 0x28, (uint16_t)nc);
+    vm_write16(g + 0x2A, (uint16_t)np);
+    vm_write32(g + 0x2C, np ? g + pts_off : 0);
+    vm_write32(g + 0x30, np ? g + tag_off : 0);
+    vm_write32(g + 0x34, nc ? g + con_off : 0);
+    vm_write32(g + 0x38, 0);
+    vm_write32(g + 0x3C, 0);
+    for (uint32_t i = 0; i < np; i++) { wf32(g + pts_off + i * 8, px[i]); wf32(g + pts_off + i * 8 + 4, py[i]); }
+    for (uint32_t i = 0; i < np; i++) vm_write8(g + tag_off + i, tag[i]);
+    for (uint32_t i = 0; i < nc; i++) vm_write16(g + con_off + i * 2, cont[i]);
+    vm_write32(out_ea, g);
+
+    static int n = 0;
+    if (n++ < 12)
+        fprintf(stderr, "[kz2] GenerateCharGlyph(U+%04X, %.1fpx) -> 0x%08X: %u contours, %u points\n",
+                code, sy, g, nc, np);
+    ctx->gpr[3] = 0;
+}
+
+/* cellFontDeleteGlyph(CellFont*, CellFontGlyph*): the scratch heap is
+ * bump-allocated; the handful of glyphs the title generates are not reused. */
+static void kz2_font_delete_glyph(ppu_context* ctx) { ctx->gpr[3] = 0; }
+
+/* ---------------------------------------------------------------------------
  * cellSaveDataUserAutoSave: nine arguments
  *
  * (version, userId, dirName, errDialog, setBuf, funcStat, funcFile, container,
@@ -371,6 +497,8 @@ extern "C" void kz2_hle_register(void)
     if (getenv("KZ2_SELFTEST")) kz2_selftest();
     cellSaveData_register_ctx_handlers();          /* 9-arg cellSaveDataUserAutoLoad */
     ps3_hle_register_ctx(0xA885CC9B, "cellFontOpenFontset", kz2_font_open_fontset);
+    ps3_hle_register_ctx(0xC17259DE, "cellFontGenerateCharGlyph", kz2_font_generate_char_glyph);
+    ps3_hle_register_ctx(0xD62F5D76, "cellFontDeleteGlyph", kz2_font_delete_glyph);
     ps3_hle_register_ctx(0x52AAC4FA, "cellSaveDataUserAutoSave", kz2_savedata_user_auto_save);
     ps3_hle_register_ctx(0xD8EAEE9F, "cellFontGetCharGlyphMetrics",
                          kz2_font_get_char_glyph_metrics);
