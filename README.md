@@ -33,7 +33,7 @@ Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.14.0, pinne
 | Asset streaming | **works** — FIOS reads `data_ps3.psarc`; Edge Zlib requests are inflated on the host |
 | Rendering | menus with text are presented on Vulkan (some glyphs missing); real-time speed |
 | Front end | language select → gamma → main menu → save warning → start screen → campaign difficulty → campaign start (driven with `PAD_SCRIPT`) |
-| Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); campaign start waits on the sound engine; gameplay not reached |
+| Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); campaign start sound teardown hang resolved; advances to level asset loading; gameplay not reached |
 
 ![Welcome screen, presented by the Vulkan backend: text renders, some letters still missing](docs/media/welcome-screen-first-text.png)
 
@@ -107,7 +107,7 @@ Diagnostics: `tools/snapshot.sh` (all thread stacks under gdb), `tools/sample.sh
 | Varlık akışı | **çalışıyor** — FIOS `data_ps3.psarc` okuyor; Edge Zlib istekleri host'ta açılıyor |
 | Grafik | menüler yazılarıyla Vulkan'da ekrana geliyor (bazı harfler eksik); gerçek zamanlı hız |
 | Menüler | dil seçimi → gama → ana menü → kayıt uyarısı → başlangıç ekranı → zorluk seçimi → kampanya başlangıcı (`PAD_SCRIPT` ile) |
-| Video / oynanış | giriş videosu oynatıcısı kilitleniyor (`tools/make_vfs_nointro.sh` ile atlanıyor); kampanya başlangıcı ses motorunda bekliyor; oynanışa ulaşılmadı |
+| Video / oynanış | giriş videosu oynatıcısı kilitleniyor (`tools/make_vfs_nointro.sh` ile atlanıyor); kampanya başlangıcı ses motoru kilitlenmesi çözüldü, seviye varlık yüklemesine geçildi; oynanışa ulaşılmadı |
 
 Ayrıntılı mühendislik günlüğü: [docs/PROGRESS.md](docs/PROGRESS.md).
 

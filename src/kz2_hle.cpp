@@ -489,8 +489,59 @@ static void kz2_adec_open_ex(ppu_context* ctx)
         (const void*)(uintptr_t)(uint32_t)ctx->gpr[5], (void*)(uintptr_t)(uint32_t)ctx->gpr[6]);
 }
 
+/* ---------------------------------------------------------------------------
+ * Sound stream stop watchdog (func_009AD268)
+ *
+ * When the campaign starts, the sound engine halts active streams. Stream 7
+ * (menu music, handle 0x84070002) is waited on in func_009AD268 via
+ * func_009B6098 (sys_timer_usleep 100ms) indefinitely because its teardown
+ * is not completed. After 5 consecutive spin iterations (~500ms), we release
+ * the stream record so the title can progress into level loading.
+ * -----------------------------------------------------------------------*/
+typedef int64_t (*lv2_syscall_fn)(ppu_context* ctx);
+struct lv2_syscall_table {
+    lv2_syscall_fn handlers[1024];
+};
+extern "C" lv2_syscall_table g_lv2_syscalls;
+
+static lv2_syscall_fn s_orig_sys_timer_usleep = nullptr;
+
+static int64_t kz2_sys_timer_usleep(ppu_context* ctx)
+{
+    const uint32_t caller_lr = (uint32_t)ctx->lr;
+    if (caller_lr == 0x009AD294 || caller_lr == 0x009AD2CC) {
+        static int s_spin_count[16] = {0};
+        const uint32_t stream_idx = (uint32_t)ctx->gpr[29];
+        if (stream_idx < 16) {
+            s_spin_count[stream_idx]++;
+            if (s_spin_count[stream_idx] >= 5) {
+                const uint32_t toc = (uint32_t)ctx->gpr[2];
+                const uint32_t stream_base_ptr = vm_read32(toc - 0x4358);
+                const uint32_t stream_base = stream_base_ptr ? vm_read32(stream_base_ptr) : 0;
+                if (stream_base) {
+                    const uint32_t rec_ea = stream_base + stream_idx * 0x38D8;
+                    const uint32_t h = vm_read32(rec_ea);
+                    fprintf(stderr, "[kz2-sound] stream %u spinning in stop wait (spin=%d, handle=0x%08X at 0x%08X), releasing\n",
+                            stream_idx, s_spin_count[stream_idx], h, rec_ea);
+                    vm_write32(rec_ea + 0x00, h & 0x7FFFFFFF);
+                    vm_write32(rec_ea + 0x04, 0);
+                    vm_write32(rec_ea + 0x1B0, 0);
+                    vm_write32(rec_ea + 0x1C0, 0);
+                    s_spin_count[stream_idx] = 0;
+                    ctx->gpr[3] = 0;
+                    return 0;
+                }
+            }
+        }
+    }
+    return s_orig_sys_timer_usleep ? s_orig_sys_timer_usleep(ctx) : 0;
+}
+
 extern "C" void kz2_hle_register(void)
 {
+    s_orig_sys_timer_usleep = g_lv2_syscalls.handlers[141];
+    g_lv2_syscalls.handlers[141] = kz2_sys_timer_usleep;
+
     ps3_hle_register_ctx(0x8B5551A4, "cellAdecOpenEx", kz2_adec_open_ex);
     ps3_hle_register_ctx(0xC982A84A, "cellVdecQueryAttrEx", kz2_vdec_query_attr_ex);
     ps3_hle_register_ctx(0x0053E2D8, "cellVdecOpenEx", kz2_vdec_open_ex);
@@ -508,3 +559,4 @@ extern "C" void kz2_hle_register(void)
                          kz2_font_init_library_freetype_with_revision);
     ps3_hle_register_ctx(0x8A85674D, "_cellSpursLFQueuePushBody", kz2_lfqueue_push_body);
 }
+

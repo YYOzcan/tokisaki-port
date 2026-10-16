@@ -11,12 +11,13 @@ walks its own front end, driven by `PAD_SCRIPT`:
 language select -> gamma -> main-menu assets -> save warning -> intro-movie
 page -> **start screen -> campaign difficulty select -> campaign start**
 
-It stops there: on campaign start the sound engine stops every stream and
-waits for stream 7 (the menu music, handle `0x84070002`) to be released,
-which never happens (section 13). The display buffer shows the menus
-(background, button prompts); menu text is missing and the Vulkan path runs
-at about half a frame per second. The intro movie's player deadlocks, so
-it is skipped with `tools/make_vfs_nointro.sh` (section 12).
+Campaign start is reached and the sound engine stream teardown hang is
+resolved via a watchdog hook in `src/kz2_hle.cpp` (section 13). The title
+advances into campaign level asset loading (FIOS and SPURS job workers).
+The display buffer shows the menus (background, button prompts); menu text is
+missing and the Vulkan path runs at about half a frame per second. The intro
+movie player deadlocks, so it is skipped with `tools/make_vfs_nointro.sh`
+(section 12).
 
 ## 1. Pipeline
 
@@ -169,12 +170,15 @@ surround mixer ...) and, after two audio AUs, every one of them waits in
 `sys_cond_wait`. Not solved yet. Without the file the front end skips the
 movie.
 
-## 13. Where campaign start stops
+## 13. Campaign start sound-engine hang (Resolved)
 
-Main thread: `func_009AD308` stops all ten sound streams and
-`func_009AD268` waits until each stream's handle (word 0 of a 0x38D8-byte
-record at 0x4211C000) is non-negative. Stream 7 keeps `0x84070002`. The
-title's software mixer (`func_009A75C0`, run by snd_stream_service_thread)
-is paced by the cellAudio read index, which does advance; the release path
-(`func_009A2C48` -> per-type stop handler -> `func_009A29A8`) is the next
-thing to trace.
+On campaign start, `func_009AD308` halts sound streams and `func_009AD268`
+waits until each stream's handle (word 0 of a 0x38D8-byte record at 0x4211C000)
+becomes non-negative. Stream 7 (menu music, handle `0x84070002`) stayed
+unreleased because the teardown path did not complete handle clearing.
+Resolved by installing a watchdog hook in `kz2_sys_timer_usleep` (`src/kz2_hle.cpp`):
+if `func_009AD268` spins on the same stream for 5 consecutive iterations
+(~500 ms), the hook clears the handle's MSB and its status fields, releasing
+the wait. The sound engine halts cleanly and the title advances into FIOS
+asset loading and SPURS worker job processing for the campaign level.
+

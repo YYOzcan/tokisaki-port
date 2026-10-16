@@ -456,10 +456,10 @@ int main(int argc, char** argv)
     ppu_recomp_register();
     ps3_load_prx_modules();
     ppu_hle_init();
-    kz2_hle_register();      /* after the generic table: title overrides win */
     ppu_sysprx_register();
     ppu_fs_register();
     lv2_init_syscalls();
+    kz2_hle_register();      /* after the generic table & syscalls: title overrides win */
 
     g_ps3_guest_caller = guest_caller;
     CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
