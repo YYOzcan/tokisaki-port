@@ -25,6 +25,9 @@ extern "C" int32_t cellFontInit(const void* config);
 extern "C" int32_t cellFontGetRenderCharGlyphMetrics(void* font, uint32_t code, void* metrics);
 extern "C" void cellSaveData_register_ctx_handlers(void);
 extern "C" int32_t cellFontOpenFontFile(void* font, const char* path, uint32_t sub, int32_t uid);
+extern "C" int32_t cellVdecQueryAttr(const void* type, void* attr);
+extern "C" int32_t cellVdecOpen(const void* type, const void* res, const void* cb, void* handle);
+extern "C" int32_t cellAdecOpen(const void* type, const void* res, const void* cb, void* handle);
 extern "C" int32_t cellSaveDataAutoSave2(uint32_t version, const char* dirName, uint32_t errDialog,
                                          void* setBuf, void* funcStat, void* funcFile,
                                          uint32_t container, void* userdata);
@@ -333,8 +336,38 @@ static void kz2_selftest(void)
     }
 }
 
+/* cellVdecQueryAttrEx / cellVdecOpenEx: the intro and attract movies (H.264
+ * in AVI) are decoded through the Ex forms, which the runtime does not
+ * register. CellVdecTypeEx begins with the same codecType word as
+ * CellVdecType (then a pointer to codec-specific info instead of a profile
+ * level), and the runtime ignores the resource block, so both forward. */
+static void kz2_vdec_query_attr_ex(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellVdecQueryAttr(
+        (const void*)(uintptr_t)(uint32_t)ctx->gpr[3], (void*)(uintptr_t)(uint32_t)ctx->gpr[4]);
+}
+
+static void kz2_vdec_open_ex(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellVdecOpen(
+        (const void*)(uintptr_t)(uint32_t)ctx->gpr[3], (const void*)(uintptr_t)(uint32_t)ctx->gpr[4],
+        (const void*)(uintptr_t)(uint32_t)ctx->gpr[5], (void*)(uintptr_t)(uint32_t)ctx->gpr[6]);
+}
+
+/* cellAdecOpenEx: the movies' AC3 track opens through the Ex form, which
+ * differs from cellAdecOpen only in the resource block. */
+static void kz2_adec_open_ex(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellAdecOpen(
+        (const void*)(uintptr_t)(uint32_t)ctx->gpr[3], (const void*)(uintptr_t)(uint32_t)ctx->gpr[4],
+        (const void*)(uintptr_t)(uint32_t)ctx->gpr[5], (void*)(uintptr_t)(uint32_t)ctx->gpr[6]);
+}
+
 extern "C" void kz2_hle_register(void)
 {
+    ps3_hle_register_ctx(0x8B5551A4, "cellAdecOpenEx", kz2_adec_open_ex);
+    ps3_hle_register_ctx(0xC982A84A, "cellVdecQueryAttrEx", kz2_vdec_query_attr_ex);
+    ps3_hle_register_ctx(0x0053E2D8, "cellVdecOpenEx", kz2_vdec_open_ex);
     if (getenv("KZ2_SELFTEST")) kz2_selftest();
     cellSaveData_register_ctx_handlers();          /* 9-arg cellSaveDataUserAutoLoad */
     ps3_hle_register_ctx(0xA885CC9B, "cellFontOpenFontset", kz2_font_open_fontset);

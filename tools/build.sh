@@ -9,6 +9,7 @@ if [ ! -f "${ROOT}/build/build.ninja" ]; then
     cmake -S "${ROOT}" -B "${ROOT}/build" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-        -DPS3RECOMP_RSX_VULKAN=ON
+        -DPS3RECOMP_RSX_VULKAN=ON \
+        -DPS3RECOMP_FFMPEG_RUNTIME=ON   # cellVdec decodes the H.264 movies with the system FFmpeg
 fi
 nice -n 10 cmake --build "${ROOT}/build" -j "${BUILD_JOBS:-4}"
