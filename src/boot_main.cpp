@@ -5,9 +5,25 @@
  * ELF image, lifted function table, HLE NID handlers, lv2 syscalls, a frame
  * clock that drives vblank/flip and the RSX FIFO, then the entry OPD.
  *
- * Based on ps3recomp's templates/project/main.cpp and the Linux harness of
- * Kurtisone/twistedmetal (both MIT). Linux is the primary host here; the
- * Windows path follows the template.
+ * Derived from two MIT-licensed files (license texts: THIRD_PARTY_NOTICES.md,
+ * details: CREDITS.md):
+ *   - ps3recomp templates/project/main.cpp
+ *       Copyright (c) 2026 Ned Heller / sp00nznet
+ *     boot order, VFS root derivation, guest-callback hook, Windows VM path.
+ *   - Kurtisone/twistedmetal, branch linux/boot, src/boot_main.cpp
+ *       (by Kurtisone; repository licensed MIT, Copyright (c) 2026 Ned Heller / sp00nznet)
+ *     the POSIX frame clock, the 256 MB host stack for the guest main thread,
+ *     the Vulkan/null backend pick and the MAP_NORESERVE guest space.
+ * Added here for Killzone 2: PARAM.SFO title id, KZ2_PEEK / KZ2_DUMPAT
+ * memory probes, the POSIX crash report and the ftrace main-thread mark.
+ *
+ * About the "4 GB guest VM": the PPU addresses memory with 32-bit effective
+ * addresses, so every guest pointer is an offset into one host reservation
+ * the size of that space. It is a model of the address space (main memory at
+ * 0x00010000, RSX-mapped IO, the stacks at 0xD0000000, ...), not a claim that
+ * the console has 4 GB of RAM -- it has 256 MB XDR + 256 MB GDDR3. RPCS3 and
+ * ps3recomp both work this way. The kernel backs only the pages the title
+ * touches.
  *
  * Environment:
  *   PS3_VFS_ROOT   directory that holds PS3_GAME (default: derived from the ELF path)

@@ -5,9 +5,11 @@
 [![Target Platform](https://img.shields.io/badge/Target-PC%20(x86__64)-lightgrey.svg)]()
 
 > [!WARNING]
-> **⚠️ NOTICE / DUYURU:**
-> - **EN**: **EVERYTHING IN THIS REPOSITORY IS CURRENTLY A PLACEHOLDER / WIP!** It was put here solely to show active ongoing development and scaffold the recompilation foundation. As actual systems and modules are implemented, placeholders will be removed and updated. Do not treat this as a finished port.
-> - **TR**: **BU DEPODAKİ HER ŞEY BİR YER TUTUCUDUR (PLACEHOLDER)!** Sadece aktif olarak üzerinde çalışıldığını göstermek ve altyapı temellerini atmak amacıyla yapılmıştır. Üzerinde çalışıldıkça tüm bu yer tutucular teker teker kaldırılacaktır.
+> **Work in progress — this is not a playable port.**
+> The game boots its own engine, streams its data and renders its first offscreen frames, but nothing is shown on screen yet and it stops before the title menu. Status details below.
+> **Devam eden bir çalışma — oynanabilir bir port değildir.** Oyun kendi motorunu açıyor, verisini okuyor ve ilk ekran dışı karelerini çiziyor; ancak ekranda henüz görüntü yok ve başlık menüsünden önce duruyor.
+>
+> Built on [ps3recomp](https://github.com/sp00nznet/ps3recomp); the boot harness is adapted from [Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal). Developed with an AI coding agent. See [CREDITS.md](CREDITS.md).
 
 [English](#english) | [Türkçe](#türkçe)
 
@@ -17,10 +19,6 @@
 ## English
 
 Static recompilation project for **Killzone 2** (PlayStation 3) targeting native PC execution.
-
-> [!IMPORTANT]
-> ### 🛑 CURRENT STATE & PLACEHOLDER CLARIFICATION
-> **Everything currently in this repository is a placeholder.** This project was published to demonstrate active development and establish the initial scaffolding. These stubs, scaffolds, and experimental implementations **will be replaced and removed as active work progresses**.
 
 ### 📊 Project Status: boots, streams data, renders its first frames (pre-alpha)
 
@@ -50,16 +48,11 @@ Full engineering log: [docs/PROGRESS.md](docs/PROGRESS.md).
 - [ ] **Phase 5: Audio, input, game loop**
 - [ ] **Phase 6: Playability**
 
-### ⏳ Naming & Inspiration: Kurumi Tokisaki (時崎 狂三)
+### Name
+The repository is named after Kurumi Tokisaki (*Date A Live*), a character who commands time — a nod to bringing a 2009 game forward. The name is the only thing it borrows; the engineering is below.
 
-This project derives its name and philosophical inspiration from **Kurumi Tokisaki** (時崎 狂三), the iconic character from the *Date A Live* series.
-
-- **Temporal Manipulation and Translation (Zafkiel)**:
-  Kurumi commands **Zafkiel** (刻々帝), the Angel of Time, wielding mastery over past and future timelines. Tokisaki Port follows a parallel vision: liberating Killzone 2's binary from its 2009 entrapment within the complex **Cell Broadband Engine** architecture, bridging time via static recompilation to execute natively within modern C++20 standards on x86_64 host hardware.
-- **Clones and Concurrency (City of Devouring Time)**:
-  Kurumi's ability to summon and coordinate countless temporal clones perfectly mirrors the parallel dispatch of PlayStation 3's 6 user-accessible **SPU (Synergistic Processing Unit)** cores alongside the PPU onto modern high-core-count PC threads.
-- **Ruthless Precision and Timing**:
-  The asynchronous DMA queues, AltiVec/SPU vector instruction sets, and intricate memory barriers of the Cell architecture demand the exact same millisecond-grade precision as Kurumi's bullets traversing the clock dial.
+### Credits
+Most of what runs is other people's work: the **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** toolkit and runtime (Ned Heller / sp00nznet and contributors), and the Linux boot harness of **[Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal)**, both MIT. Bugs fixed in `patches/ps3recomp/` were first found by others; see **[CREDITS.md](CREDITS.md)** and **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**. This port is developed by YYOzcan with an AI coding agent (Claude); the reasoning behind every change is in [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ### Project Layout
 ```
@@ -79,7 +72,7 @@ Game files, the lifted C++ (`recompiled/`, `spu_recompiled/`) and loader output 
 ### Building (Linux)
 Requirements: clang, CMake ≥ 3.20, Ninja, Python ≥ 3.10, SDL2, Vulkan headers, glslang, zlib; a decrypted `EBOOT.ELF` in `game_dump/PS3_GAME/USRDIR/`.
 ```bash
-git submodule update --init
+git clone --recursive https://github.com/YYOzcan/tokisaki-port   # or: git submodule update --init
 tools/apply_patches.sh      # this port's ps3recomp fixes
 tools/lift.sh               # PPU: EBOOT.ELF -> recompiled/   (~1 min)
 tools/lift_spu.sh           # SPU: images, policy module, job modules -> spu_recompiled/
@@ -100,10 +93,6 @@ Diagnostics: `tools/snapshot.sh` (all thread stacks under gdb), `tools/sample.sh
 ## Türkçe
 
 **Killzone 2** (PlayStation 3) için geliştirilen, yerel PC çalıştırmasını hedefleyen statik yeniden derleme (static recompilation) projesidir.
-
-> [!IMPORTANT]
-> ### 🛑 MEVCUT DURUM VE YER TUTUCU (PLACEHOLDER) BİLGİLENDİRMESİ
-> **Bu depoda yer alan her şey şu an için bir yer tutucudur (placeholder).** Proje, yalnızca aktif olarak üzerinde çalışıldığını göstermek ve geliştirme temellerini atmak amacıyla yayımlanmıştır. Bu taslaklar ve kod parçaları **üzerinde fiilen çalışıldıkça teker teker kaldırılacak ve gerçek uygulamalarla değiştirilecektir**.
 
 ### 📊 Proje Durumu: açılıyor, veri akıtıyor, ilk karelerini çiziyor (ön-alfa)
 
@@ -131,21 +120,16 @@ Ayrıntılı mühendislik günlüğü: [docs/PROGRESS.md](docs/PROGRESS.md).
 - [ ] **Aşama 5: Ses, giriş, oyun döngüsü**
 - [ ] **Aşama 6: Oynanabilirlik**
 
-### ⏳ İsimlendirme ve İlham: Kurumi Tokisaki (時崎 狂三)
+### İsim
+Depo adını *Date A Live*'daki, zamanı yöneten karakter Kurumi Tokisaki'den alır — 2009'dan kalma bir oyunu bugüne taşımaya bir gönderme. Karakterden alınan tek şey isimdir.
 
-Bu proje, adını ve felsefi ilhamını *Date A Live* serisinin unutulmaz karakteri **Kurumi Tokisaki**'den (時崎 狂三) almaktadır.
-
-- **Zaman Manipülasyonu ve Zamansal Geçiş (Zafkiel)**:
-  Kurumi Tokisaki, zamanı bükebilen, geçmişe ve geleceğe hükmedebilen melek **Zafkiel**'in (刻々帝) efendisidir. Bu port projesi de aynı vizyonla hareket eder: 2009 yılında PlayStation 3'ün karmaşık **Cell Broadband Engine** mimarisine hapsolmuş olan Killzone 2 ikili kodunu (binary), statik yeniden derleme vasıtasıyla zamanın ötesine taşıyarak modern C++20 standartlarında yerel (native) x86_64 mimarisine dönüştürür.
-- **Klonlar ve Eşzamanlılık (City of Devouring Time)**:
-  Kurumi'nin kendi zaman çizelgelerinden çağırdığı çok sayıda klonunun senkronize çalışması; PlayStation 3'ün 6 adet **SPU (Synergistic Processing Unit)** çekirdeğinin ve PPU yapısının modern çok çekirdekli PC işlemcilerinde yüksek paralellikte koşturulması mimarisiyle doğrudan örtüşür.
-- **Kusursuz Hassasiyet ve Zamanlama**:
-  Cell mimarisinin asenkron DMA kuyrukları, AltiVec/SPU vektör yönergeleri ve karmaşık bellek bariyerleri; Kurumi'nin saat kadranı üzerindeki mermileri gibi milisaniyelik bir zamanlama hassasiyeti gerektirir.
+### Katkılar ve Lisanslar
+Çalışan kodun büyük kısmı başkalarının emeğidir: **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** araç seti ve çalışma zamanı (Ned Heller / sp00nznet ve katkıda bulunanlar) ile **[Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal)** projesinin Linux açılış iskeleti; ikisi de MIT lisanslıdır. `patches/ps3recomp/` içindeki hataları ilk bulanlar başkalarıdır. Ayrıntılar: **[CREDITS.md](CREDITS.md)**, **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**. Bu port YYOzcan tarafından bir yapay zekâ kodlama ajanı (Claude) ile geliştiriliyor; her değişikliğin gerekçesi [docs/PROGRESS.md](docs/PROGRESS.md) içinde.
 
 ### Derleme (Linux)
 Gerekenler: clang, CMake ≥ 3.20, Ninja, Python ≥ 3.10, SDL2, Vulkan başlıkları, glslang, zlib; `game_dump/PS3_GAME/USRDIR/` içinde şifresi çözülmüş `EBOOT.ELF`.
 ```bash
-git submodule update --init
+git clone --recursive https://github.com/YYOzcan/tokisaki-port   # veya: git submodule update --init
 tools/apply_patches.sh      # bu portun ps3recomp düzeltmeleri
 tools/lift.sh               # PPU çevirimi -> recompiled/
 tools/lift_spu.sh           # SPU çevirimi -> spu_recompiled/
