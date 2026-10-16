@@ -5,12 +5,13 @@ problems were met.
 
 ## Where it stands
 
-The title boots its own engine on Linux, streams and inflates its archive,
-and renders frames of its front-end background. It then idles: after loading
-the `svo.svobootstrap` lump it never asks for the next file, the SVML front
-end's `interface/svo/svml/en/kin/index.jsp`. The presented frame is black,
-because the full-screen pass that writes the display buffer samples the
-*other* display buffer, not the offscreen target the sky is drawn into.
+The title boots, streams and inflates its archive, runs its SPU jobs, and
+walks its own front end: language select -> gamma correction -> main-menu
+assets (interface, speech, 23 MB of music) -> save warning -> the intro
+movie page. The display buffer shows the menus (background and button
+prompts; text is still missing). Next walls: menu text, the intro FMV
+(cellVdec), and the Vulkan path's speed (~0.5 fps; the null backend runs the
+game logic at full speed).
 
 ## 1. Pipeline
 
@@ -96,8 +97,49 @@ title still being in its boot sequence.
   `Offline SVML` / `source:interface/svo/svml/`) never runs.
 * Pressing START/CROSS (`PAD_SCRIPT`) changes nothing.
 
-Next: a function-entry histogram of the main loop (`-DKZ2_FTRACE=ON`) to find
-the state the bootstrap is waiting in.
+Resolved in sections 8-11.
+
+## 8. SPU jobs actually run
+
+The WWS policy module finishes a job load in its SPU interrupt handler at
+LS 0xA2C, which builds a register save/restore stub at 0x3FEC0 and returns
+through 0xA84/0xA90/0xAD0. Nothing branches there statically, so the lift
+had no functions at those addresses; the handler ran in the fallback
+interpreter and the PM ended mid-handler. With them as `--extra-funcs` the
+audio jobs stream into LS 0x4000 and dispatch to their lifted overlays.
+
+## 9. The SVO browser could not parse a URL (patch 0004)
+
+Found by decompiling the chain with Ghidra (`tools/decompile.sh`) and
+following it in gdb: navigate -> page stack (0x0117E740) -> engine `Load`
+(`func_003AB808`, vtable slot 5) -> `FUN_003AA120` -> loader factory
+(`FUN_0039C164`), which returned NULL because no protocol handler accepted
+the parsed scheme -- it was empty. The URL parser copies the scheme with an
+inlined `lswi r5,r31,15; stswi r5,r11,15`, which the lifter emitted as
+`/* TODO */`. Implementing lswi/stswi (and four unsigned VMX ops left as
+TODO) let the browser load `index.jsp` and move on to language select.
+
+## 10. Frames stopped: an unhandled fence method (patch 0005)
+
+The streaming VRAM ring is fenced with NV4097 `0x1D74`
+TEXTURE_READ_SEMAPHORE_RELEASE on label 0x48. The runtime handled only the
+back-end form `0x1D70`, so the label froze and the ring allocator
+(`func_000461C0` / `func_00A45844`) waited forever.
+
+## 11. Two FIFO problems
+
+- The title parks the RSX on a self-JUMP in the middle of each frame and
+  patches it when the frame is complete; the walker resynced to `put` at
+  once and skipped the frame's tail, fence included, then looped over stale
+  segments. `GCM_PARK_GRACE_MS` waits for the patch (boot_main sets 3 s).
+- The title's mmapper heap (handed out upward from 0x11000000) grew across
+  the runtime's GCM window at 0x20000000; its allocator wrote strings over
+  the control register and `put` went odd. The window now lives at
+  0xE8000000 (`ppu_hle_inject_base`), the HLE scratch heap at 0xE9000000.
+
+Result: frames flow, the display buffer shows the language-select menu
+(`docs/media/first-menu-frame.png`), and the front end can be driven with
+`PAD_SCRIPT` into the main menu.
 
 ## Diagnostics added
 

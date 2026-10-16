@@ -6,8 +6,8 @@
 
 > [!WARNING]
 > **Work in progress — this is not a playable port.**
-> The game boots its own engine, streams its data and renders its first offscreen frames, but nothing is shown on screen yet and it stops before the title menu. Status details below.
-> **Devam eden bir çalışma — oynanabilir bir port değildir.** Oyun kendi motorunu açıyor, verisini okuyor ve ilk ekran dışı karelerini çiziyor; ancak ekranda henüz görüntü yok ve başlık menüsünden önce duruyor.
+> The game boots, streams its data, runs its SPU jobs and walks its menus up to the intro movie, but it is far from playable: menu text is missing, the Vulkan renderer runs at about half a frame per second, and gameplay has not been reached. Status details below.
+> **Devam eden bir çalışma — oynanabilir bir port değildir.** Oyun açılıyor, verisini okuyor, SPU işlerini çalıştırıyor ve menülerinde giriş videosuna kadar ilerliyor; ancak menü yazıları yok, Vulkan çizimi saniyede yarım kare civarında ve oynanışa ulaşılmadı.
 >
 > Built on [ps3recomp](https://github.com/sp00nznet/ps3recomp); the boot harness is adapted from [Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal). Developed with an AI coding agent. See [CREDITS.md](CREDITS.md).
 
@@ -31,11 +31,11 @@ Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.14.0, pinne
 | Build & link | **done** — ~118 MB native x86-64 binary (clang, ~3 min at -j8) |
 | Boot | CRT, TLS, SPURS ×2, FIOS, cellGcm 720p, display buffers/tiles/zcull, cellFont, cellSaveData, cellAudio, trophies |
 | Asset streaming | **works** — FIOS reads `data_ps3.psarc`; Edge Zlib requests are inflated on the host |
-| Rendering | the front-end background renders into its offscreen target (see below); the presented frame is still black |
-| Where it stops | after the `svo.svobootstrap` lump: the SVML front end (`interface/svo/svml/en/kin/index.jsp`) is never requested |
-| Input / audio / gameplay | not reached |
+| Rendering | menus reach the display buffer (background, button prompts); text missing; Vulkan path ~0.5 fps |
+| Front end | language select → gamma → main-menu assets → save warning → intro-movie page (driven with `PAD_SCRIPT`) |
+| Movies / gameplay | intro FMV (cellVdec) next; gameplay not reached |
 
-![First render: the front-end sky, pass 0 of frame 2410](docs/media/first-render-menu-sky.png)
+![Language-select menu in the display buffer](docs/media/first-menu-frame.png)
 
 Full engineering log: [docs/PROGRESS.md](docs/PROGRESS.md).
 
@@ -105,9 +105,9 @@ Diagnostics: `tools/snapshot.sh` (all thread stacks under gdb), `tools/sample.sh
 | Derleme | **tamam** — ~118 MB yerel x86-64 çalıştırılabilir dosya |
 | Açılış | CRT, TLS, 2×SPURS, FIOS, cellGcm 720p, ekran tamponları, cellFont, cellSaveData, cellAudio, kupalar |
 | Varlık akışı | **çalışıyor** — FIOS `data_ps3.psarc` okuyor; Edge Zlib istekleri host'ta açılıyor |
-| Grafik | menü arka planı offscreen hedefe çiziliyor; ekrana giden kare hâlâ siyah |
-| Durduğu yer | `svo.svobootstrap` lump'ından sonra SVML arayüzü (`index.jsp`) hiç istenmiyor |
-| Giriş / ses / oynanış | henüz ulaşılmadı |
+| Grafik | menüler ekran tamponuna ulaşıyor (arka plan, tuş simgeleri); yazılar eksik; Vulkan ~0,5 kare/sn |
+| Menüler | dil seçimi → gama → ana menü varlıkları → kayıt uyarısı → giriş videosu sayfası (`PAD_SCRIPT` ile) |
+| Video / oynanış | giriş videosu (cellVdec) sırada; oynanışa ulaşılmadı |
 
 Ayrıntılı mühendislik günlüğü: [docs/PROGRESS.md](docs/PROGRESS.md).
 
