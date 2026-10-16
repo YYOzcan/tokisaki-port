@@ -71,6 +71,7 @@ extern int32_t g_sys_process_exit_code;
 
 uint8_t* vm_base = nullptr;
 extern uint32_t ppu_vm_size;
+extern uint32_t ppu_hle_inject_base;          /* GCM labels / control register / offset tables */
 
 typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                     uint64_t, uint64_t, uint64_t, uint64_t);
@@ -382,6 +383,20 @@ int main(int argc, char** argv)
         fprintf(stderr, "ERROR: could not reserve the guest address space\n");
         return 1;
     }
+
+    /* The runtime's GCM window (labels, put/get/ref, IO offset tables) defaults
+     * to 0x20000000. Killzone 2 reserves its streaming heap with
+     * sys_mmapper_allocate_address, which this runtime hands out upward from
+     * 0x11000000, and the heap grows straight across 0x20000000: the title's
+     * allocator wrote strings and refcounts over the control register and
+     * `put` turned odd (0x13009). Nothing of the title's lives above the
+     * stacks (0xD0000000..0xE0000000), so the window goes there. */
+    ppu_hle_inject_base = 0xE8000000u;
+
+    /* Killzone 2 parks the RSX mid-frame and patches the park once the rest
+     * of the frame is built; give it time instead of skipping to `put`
+     * (patches/ps3recomp/0005, cellGcmSys.c). */
+    setenv("GCM_PARK_GRACE_MS", "3000", 0);
 
     uint32_t entry = ppu_load_elf(argv[1]);
     if (!entry) {

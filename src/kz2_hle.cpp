@@ -32,15 +32,16 @@ extern "C" int32_t cellSaveDataAutoSave2(uint32_t version, const char* dirName, 
 /* ---------------------------------------------------------------------------
  * Guest scratch memory for structures these handlers hand to the title.
  *
- * 0x2F000000 sits between the runtime's HLE inject window (0x20000000, GCM
- * labels / control register / offset tables, 0x8000 bytes) and the raw-SPU
- * windows at 0x30000000; Killzone 2 never maps anything there (its heaps come
- * from sys_memory at 0x40000000 and the stacks at 0xD0000000). Bump-allocated,
- * never freed -- only a handful of small objects are ever created.
+ * 0xE9000000 is above the guest stacks (0xD0000000..0xE0000000) and next to
+ * the runtime's GCM window, which boot_main.cpp moves to 0xE8000000. The
+ * title maps nothing up here: its mmapper heap grows upward from 0x11000000
+ * (and ran over the old 0x2F000000 home), sys_memory is at 0x40000000, RSX
+ * local memory at 0xC0000000. Bump-allocated, never freed -- only a handful
+ * of small objects are ever created.
  * -----------------------------------------------------------------------*/
 static uint32_t kz2_guest_alloc(uint32_t size, uint32_t align)
 {
-    static std::atomic<uint32_t> next{0x2F000000u};
+    static std::atomic<uint32_t> next{0xE9000000u};
     uint32_t cur = next.load(), ea;
     do {
         ea = (cur + align - 1) & ~(align - 1);

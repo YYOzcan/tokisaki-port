@@ -17,7 +17,7 @@ CMDS="$(mktemp)"
     echo "set pagination off"; echo "handle SIGPIPE nostop noprint"; echo "run"
     for _ in $(seq "${COUNT}"); do
         echo "echo ===SAMPLE===\\n"
-        echo "thread apply all bt 40"
+        echo "thread apply all bt 150"
         echo "continue"
     done
     echo "kill"
