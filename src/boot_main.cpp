@@ -169,10 +169,22 @@ static void frame_clock_loop(void)
     fprintf(stderr, "[rsx] %s backend init %s (%ux%u)\n", be.name,
             rsx_ok ? "OK" : "FAILED", w, h);
 
+    /* Present right after the drain that reached a flip. The drain stops at
+     * each flip, but a slow pass lets several vblank ticks pile up and each
+     * tick drains again: checking once per loop showed one flip in five. */
+    auto drain = [&]() {
+        if (!rsx_ok) return;
+        cellGcm_rsx_process_fifo();
+        if (cellGcm_take_flip_pending_synced()) {
+            be.present();
+            g_frames_presented.fetch_add(1);
+        }
+    };
+
     uint64_t next_tick = now_ms();
     for (;;) {
         Sleep(1);
-        if (rsx_ok) cellGcm_rsx_process_fifo();
+        drain();
         peek_tick();
         dumpat_tick();
         dumpfile_tick();
@@ -181,7 +193,7 @@ static void frame_clock_loop(void)
         int fired = 0;
         while ((int64_t)(now - next_tick) >= 0 && fired < 240) {
             cellGcm_request_tick();
-            if (rsx_ok) cellGcm_rsx_process_fifo();
+            drain();
             next_tick += 16;
             fired++;
         }
@@ -192,9 +204,15 @@ static void frame_clock_loop(void)
                 fprintf(stderr, "[rsx] window closed, exiting\n");
                 _exit(0);
             }
-            if (cellGcm_take_flip_pending_synced()) {
-                be.present();
-                g_frames_presented.fetch_add(1);
+            /* KZ2_FPS=1: presented frames per second, every 5 s. */
+            static const bool fps_log = getenv("KZ2_FPS") != nullptr;
+            static uint64_t fps_t0 = now;
+            static unsigned fps_n0 = 0;
+            if (fps_log && now - fps_t0 >= 5000) {
+                const unsigned n = g_frames_presented.load();
+                fprintf(stderr, "[fps] %.1f presented/s (%u total)\n",
+                        (n - fps_n0) * 1000.0 / (double)(now - fps_t0), n);
+                fps_t0 = now; fps_n0 = n;
             }
         }
     }
