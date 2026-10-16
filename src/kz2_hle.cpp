@@ -534,6 +534,22 @@ static int64_t kz2_sys_timer_usleep(ppu_context* ctx)
             }
         }
     }
+    if (caller_lr == 0x009A31B8) {
+        static int s_spin_teardown = 0;
+        s_spin_teardown++;
+        if (s_spin_teardown >= 5) {
+            const uint32_t list_ptr = (uint32_t)ctx->gpr[31];
+            if (list_ptr) {
+                const uint32_t head = vm_read32(list_ptr);
+                fprintf(stderr, "[kz2-sound] func_009A30F0 spinning in master teardown wait (spin=%d, head=0x%08X at 0x%08X), releasing voice list\n",
+                        s_spin_teardown, head, list_ptr);
+                vm_write32(list_ptr, 0);
+            }
+            s_spin_teardown = 0;
+            ctx->gpr[3] = 0;
+            return 0;
+        }
+    }
     return s_orig_sys_timer_usleep ? s_orig_sys_timer_usleep(ctx) : 0;
 }
 

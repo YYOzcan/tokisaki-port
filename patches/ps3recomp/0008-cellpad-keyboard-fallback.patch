@@ -1,0 +1,54 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index f2b4c11..e3d6dc0 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -357,6 +357,49 @@ static void pad_poll_sdl2(void)
+         s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
+         s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+     }
++
++    /* Keyboard fallback / overlay for port 0 */
++    SDL_PumpEvents();
++    const Uint8* keys = SDL_GetKeyboardState(NULL);
++    if (keys) {
++        u16 kbtns = 0;
++        if (keys[SDL_SCANCODE_RETURN] || keys[SDL_SCANCODE_KP_ENTER]) kbtns |= CELL_PAD_CTRL_START;
++        if (keys[SDL_SCANCODE_SPACE])                                 kbtns |= CELL_PAD_CTRL_CROSS;
++        if (keys[SDL_SCANCODE_ESCAPE] || keys[SDL_SCANCODE_BACKSPACE]) kbtns |= CELL_PAD_CTRL_CIRCLE;
++        if (keys[SDL_SCANCODE_TAB] || keys[SDL_SCANCODE_GRAVE])      kbtns |= CELL_PAD_CTRL_SELECT;
++        if (keys[SDL_SCANCODE_UP] || keys[SDL_SCANCODE_W])           kbtns |= CELL_PAD_CTRL_UP;
++        if (keys[SDL_SCANCODE_DOWN] || keys[SDL_SCANCODE_S])         kbtns |= CELL_PAD_CTRL_DOWN;
++        if (keys[SDL_SCANCODE_LEFT] || keys[SDL_SCANCODE_A])         kbtns |= CELL_PAD_CTRL_LEFT;
++        if (keys[SDL_SCANCODE_RIGHT] || keys[SDL_SCANCODE_D])        kbtns |= CELL_PAD_CTRL_RIGHT;
++        if (keys[SDL_SCANCODE_Q] || keys[SDL_SCANCODE_1])            kbtns |= CELL_PAD_CTRL_L1;
++        if (keys[SDL_SCANCODE_E] || keys[SDL_SCANCODE_3])            kbtns |= CELL_PAD_CTRL_R1;
++        if (keys[SDL_SCANCODE_R] || keys[SDL_SCANCODE_F])            kbtns |= CELL_PAD_CTRL_SQUARE;
++        if (keys[SDL_SCANCODE_T] || keys[SDL_SCANCODE_C])            kbtns |= CELL_PAD_CTRL_TRIANGLE;
++
++        if (!s_host_state[0].connected) {
++            s_host_state[0].connected = 1;
++            s_host_state[0].analog_lx = 128;
++            s_host_state[0].analog_ly = 128;
++            s_host_state[0].analog_rx = 128;
++            s_host_state[0].analog_ry = 128;
++            s_host_state[0].trigger_l2 = 0;
++            s_host_state[0].trigger_r2 = 0;
++            s_host_state[0].buttons = kbtns;
++        } else {
++            s_host_state[0].buttons |= kbtns;
++        }
++
++        if (kbtns & CELL_PAD_CTRL_UP)       s_host_state[0].press_up = 255;
++        if (kbtns & CELL_PAD_CTRL_DOWN)     s_host_state[0].press_down = 255;
++        if (kbtns & CELL_PAD_CTRL_LEFT)     s_host_state[0].press_left = 255;
++        if (kbtns & CELL_PAD_CTRL_RIGHT)    s_host_state[0].press_right = 255;
++        if (kbtns & CELL_PAD_CTRL_CROSS)    s_host_state[0].press_cross = 255;
++        if (kbtns & CELL_PAD_CTRL_CIRCLE)   s_host_state[0].press_circle = 255;
++        if (kbtns & CELL_PAD_CTRL_SQUARE)   s_host_state[0].press_square = 255;
++        if (kbtns & CELL_PAD_CTRL_TRIANGLE) s_host_state[0].press_triangle = 255;
++        if (kbtns & CELL_PAD_CTRL_L1)       s_host_state[0].press_l1 = 255;
++        if (kbtns & CELL_PAD_CTRL_R1)       s_host_state[0].press_r1 = 255;
++    }
+ }
+ 
+ static void pad_init_backend(void)

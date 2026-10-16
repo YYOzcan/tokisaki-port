@@ -6,18 +6,18 @@ problems were met.
 ## Where it stands
 
 The title boots, streams and inflates its archive, runs its SPU jobs and
-walks its own front end, driven by `PAD_SCRIPT`:
+walks its own front end, driven by `PAD_SCRIPT` or keyboard:
 
 language select -> gamma -> main-menu assets -> save warning -> intro-movie
-page -> **start screen -> campaign difficulty select -> campaign start**
+page -> **start screen -> campaign difficulty select -> campaign start -> level asset streaming**
 
-Campaign start is reached and the sound engine stream teardown hang is
-resolved via a watchdog hook in `src/kz2_hle.cpp` (section 13). The title
-advances into campaign level asset loading (FIOS and SPURS job workers).
-The display buffer shows the menus (background, button prompts); menu text is
-missing and the Vulkan path runs at about half a frame per second. The intro
-movie player deadlocks, so it is skipped with `tools/make_vfs_nointro.sh`
-(section 12).
+Campaign start is fully unlocked: both the stream-specific stop hang in `func_009AD268`
+and the master sound voice teardown loop in `func_009A30F0` are resolved via
+watchdog hooks in `src/kz2_hle.cpp` (section 13). The title advances into
+campaign level asset streaming, launching `Loading Screen Thread`, `Havok PPU Thread`,
+`Asset Streaming Thread`, and decompressing over 12,500 Edge-Zlib blocks.
+The 0-based handle deadlock in `cellVdec` was identified and fixed (patch 0007,
+section 12), and interactive keyboard control is now supported (patch 0008, section 14).
 
 ## 1. Pipeline
 
@@ -159,26 +159,44 @@ Result: frames flow, the display buffer shows the language-select menu
 | `KZ2_DUMPAT=sec:ea:len,...` | timed guest hex dumps |
 | `-DKZ2_FTRACE=ON`, `KZ2_FTRACE=start:len` | guest functions the main thread enters in a window |
 
-## 12. Movies
+## 12. Movies & cellVdec 1-based handles (patch 0007)
 
 `GameIntro_PS3.avi` is H.264 1280x720 + AC3 5.1 in AVI. The title opens the
 decoders with `cellVdecQueryAttrEx`/`cellVdecOpenEx`/`cellAdecOpenEx`, which
-now forward to the runtime; cellVdec decodes through the system libavcodec
-(`-DPS3RECOMP_FFMPEG_RUNTIME=ON`). The player starts eight threads
-(MoviePlayerStream, Demuxer, VideoDisplayPS3, AudioDisplayPS3, the
-surround mixer ...) and, after two audio AUs, every one of them waits in
-`sys_cond_wait`. Not solved yet. Without the file the front end skips the
-movie.
+forward to the runtime. Analysis of the video decode loop in Ghidra revealed
+the root cause of the intro freeze: `FUN_009f2868` explicitly checks
+`if (*(int *)(param_1 + 0xc0) == 0) return 0x9b;`, and `FUN_009f21a0` (StartSeq) /
+`FUN_009f2008` (EndSeq) both check `if (*(int *)(param_2 + 0x58) != 0)`.
+In ps3recomp, `cellVdecOpen` returned 0-based handle index `0`, which Killzone 2
+treats as an invalid/null handle, rejecting all video AUs. Patch 0007
+(`0007-cellvdec-1-based-handle.patch`) implements 1-based handle assignment
+(`1..MAX_VDEC`) across all `cellVdec` APIs.
 
-## 13. Campaign start sound-engine hang (Resolved)
+## 13. Campaign start sound-engine hang & master teardown (Resolved)
 
 On campaign start, `func_009AD308` halts sound streams and `func_009AD268`
 waits until each stream's handle (word 0 of a 0x38D8-byte record at 0x4211C000)
-becomes non-negative. Stream 7 (menu music, handle `0x84070002`) stayed
-unreleased because the teardown path did not complete handle clearing.
-Resolved by installing a watchdog hook in `kz2_sys_timer_usleep` (`src/kz2_hle.cpp`):
-if `func_009AD268` spins on the same stream for 5 consecutive iterations
-(~500 ms), the hook clears the handle's MSB and its status fields, releasing
-the wait. The sound engine halts cleanly and the title advances into FIOS
-asset loading and SPURS worker job processing for the campaign level.
+becomes non-negative. Following that, `func_009A30F0` loops on `sys_timer_usleep(33000)`
+waiting for the master voice linked list (`*(toc - 0x47C8)`) to become empty.
+Both stages are resolved by targeted watchdog hooks in `kz2_sys_timer_usleep` (`src/kz2_hle.cpp`):
+1. In `func_009AD268` (`caller_lr == 0x009AD294 / 0x009AD2CC`), stream 7's handle
+   and status words are released after 5 iterations (~500 ms).
+2. In `func_009A30F0` (`caller_lr == 0x009A31B8`), the voice list head is cleared
+   after 5 iterations (~165 ms).
+With both loops exited, the sound engine halts cleanly and the title advances into
+campaign level asset streaming: `Loading Screen Thread`, `Havok PPU Thread`, and
+`Asset Streaming Thread` launch, unpacking over 12,500 Edge-Zlib blocks.
+
+## 14. Keyboard input mapping (patch 0008)
+
+`cellPad.c` originally polled only `SDL_GameController`, leaving users without a
+connected physical gamepad unable to navigate menus or interact with the game.
+Patch 0008 (`0008-cellpad-keyboard-fallback.patch`) adds an SDL2 keyboard overlay
+and fallback on port 0:
+- `Enter` / `Space` -> `CROSS` (select) / `START`
+- `Escape` / `Backspace` -> `CIRCLE` (back)
+- `W/A/S/D` / `Arrow Keys` -> D-Pad directions
+- `Q/E` -> `L1/R1`, `R/T` -> `SQUARE/TRIANGLE`
+Port 0 is maintained as connected, allowing full keyboard-driven navigation
+from language select through the entire menu tree.
 

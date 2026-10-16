@@ -7,9 +7,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SECS="${1:-20}"
 mkdir -p "${ROOT}/run/vfs" "${ROOT}/run/hdd0" "${ROOT}/logs"
 [ -e "${ROOT}/run/vfs/PS3_GAME" ] || ln -s "${ROOT}/game_dump/PS3_GAME" "${ROOT}/run/vfs/PS3_GAME"
-export PS3_VFS_ROOT="${PS3_VFS_ROOT:-${ROOT}/run/vfs}" PS3_HDD0_ROOT="${ROOT}/run/hdd0"
-export PS3_DEV_FLASH="${PS3_DEV_FLASH:-${HOME}/.config/rpcs3/dev_flash}"
+if [ -z "${PS3_VFS_ROOT:-}" ]; then
+    if [ -d "${ROOT}/run/vfs_nointro" ]; then
+        export PS3_VFS_ROOT="${ROOT}/run/vfs_nointro"
+    else
+        export PS3_VFS_ROOT="${ROOT}/run/vfs"
+    fi
+fi
+export PS3_HDD0_ROOT="${ROOT}/run/hdd0"
 export KZ2_NO_CRASH_HANDLER=1
+export PAD_SCRIPT="${PAD_SCRIPT:-}"
+export KZ2_RSX="${KZ2_RSX:-null}"
 ( sleep "${SECS}"; pkill -INT -x killzone2; sleep 8; pkill -INT -x killzone2 ) &
 gdb -q -batch -ex "set pagination off" -ex "handle SIGPIPE nostop noprint" \
     -ex run -ex "thread apply all bt 25" -ex "echo ===== SECOND SNAPSHOT =====\n" -ex continue -ex "thread apply all bt 25" -ex kill \
