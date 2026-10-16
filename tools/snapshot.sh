@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SECS="${1:-20}"
 mkdir -p "${ROOT}/run/vfs" "${ROOT}/run/hdd0" "${ROOT}/logs"
 [ -e "${ROOT}/run/vfs/PS3_GAME" ] || ln -s "${ROOT}/game_dump/PS3_GAME" "${ROOT}/run/vfs/PS3_GAME"
-export PS3_VFS_ROOT="${ROOT}/run/vfs" PS3_HDD0_ROOT="${ROOT}/run/hdd0"
+export PS3_VFS_ROOT="${PS3_VFS_ROOT:-${ROOT}/run/vfs}" PS3_HDD0_ROOT="${ROOT}/run/hdd0"
 export PS3_DEV_FLASH="${PS3_DEV_FLASH:-${HOME}/.config/rpcs3/dev_flash}"
 export KZ2_NO_CRASH_HANDLER=1
 ( sleep "${SECS}"; pkill -INT -x killzone2; sleep 8; pkill -INT -x killzone2 ) &

@@ -5,13 +5,18 @@ problems were met.
 
 ## Where it stands
 
-The title boots, streams and inflates its archive, runs its SPU jobs, and
-walks its own front end: language select -> gamma correction -> main-menu
-assets (interface, speech, 23 MB of music) -> save warning -> the intro
-movie page. The display buffer shows the menus (background and button
-prompts; text is still missing). Next walls: menu text, the intro FMV
-(cellVdec), and the Vulkan path's speed (~0.5 fps; the null backend runs the
-game logic at full speed).
+The title boots, streams and inflates its archive, runs its SPU jobs and
+walks its own front end, driven by `PAD_SCRIPT`:
+
+language select -> gamma -> main-menu assets -> save warning -> intro-movie
+page -> **start screen -> campaign difficulty select -> campaign start**
+
+It stops there: on campaign start the sound engine stops every stream and
+waits for stream 7 (the menu music, handle `0x84070002`) to be released,
+which never happens (section 13). The display buffer shows the menus
+(background, button prompts); menu text is missing and the Vulkan path runs
+at about half a frame per second. The intro movie's player deadlocks, so
+it is skipped with `tools/make_vfs_nointro.sh` (section 12).
 
 ## 1. Pipeline
 
@@ -152,3 +157,24 @@ Result: frames flow, the display buffer shows the language-select menu
 | `KZ2_PEEK=ea,...` | print a guest word and the word at +8 of what it points to, every second |
 | `KZ2_DUMPAT=sec:ea:len,...` | timed guest hex dumps |
 | `-DKZ2_FTRACE=ON`, `KZ2_FTRACE=start:len` | guest functions the main thread enters in a window |
+
+## 12. Movies
+
+`GameIntro_PS3.avi` is H.264 1280x720 + AC3 5.1 in AVI. The title opens the
+decoders with `cellVdecQueryAttrEx`/`cellVdecOpenEx`/`cellAdecOpenEx`, which
+now forward to the runtime; cellVdec decodes through the system libavcodec
+(`-DPS3RECOMP_FFMPEG_RUNTIME=ON`). The player starts eight threads
+(MoviePlayerStream, Demuxer, VideoDisplayPS3, AudioDisplayPS3, the
+surround mixer ...) and, after two audio AUs, every one of them waits in
+`sys_cond_wait`. Not solved yet. Without the file the front end skips the
+movie.
+
+## 13. Where campaign start stops
+
+Main thread: `func_009AD308` stops all ten sound streams and
+`func_009AD268` waits until each stream's handle (word 0 of a 0x38D8-byte
+record at 0x4211C000) is non-negative. Stream 7 keeps `0x84070002`. The
+title's software mixer (`func_009A75C0`, run by snd_stream_service_thread)
+is paced by the cellAudio read index, which does advance; the release path
+(`func_009A2C48` -> per-type stop handler -> `func_009A29A8`) is the next
+thing to trace.
