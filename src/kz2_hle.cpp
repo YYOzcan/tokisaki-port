@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 
 #include <zlib.h>
 
@@ -252,8 +253,88 @@ static void kz2_savedata_user_auto_save(ppu_context* ctx)
         (uint32_t)ctx->gpr[10], (void*)(uintptr_t)userdata);
 }
 
+/* ---------------------------------------------------------------------------
+ * KZ2_SELFTEST=1: call lifted guest libc routines on known inputs before the
+ * title starts, and compare with the host's answer. A lifter bug in a string
+ * routine corrupts everything built on it silently; this names it.
+ * -----------------------------------------------------------------------*/
+static uint32_t kz2_put_str(const char* s)
+{
+    uint32_t ea = kz2_guest_alloc((uint32_t)strlen(s) + 1, 16);
+    memcpy(vm_base + ea, s, strlen(s) + 1);
+    return ea;
+}
+
+static uint32_t kz2_call2(void (*fn)(ppu_context*), uint32_t a, uint32_t b)
+{
+    static uint32_t stack = 0;
+    if (!stack) stack = kz2_guest_alloc(0x10000, 0x100) + 0xFF00;
+    ppu_context c;
+    memset(&c, 0, sizeof c);
+    c.gpr[1] = stack;
+    c.gpr[2] = 0x00EB2958;       /* module TOC */
+    c.gpr[3] = a;
+    c.gpr[4] = b;
+    fn(&c);
+    return (uint32_t)c.gpr[3];
+}
+
+static uint32_t kz2_call3(void (*fn)(ppu_context*), uint32_t a, uint32_t b, uint32_t c3)
+{
+    static uint32_t stack = 0;
+    if (!stack) stack = kz2_guest_alloc(0x10000, 0x100) + 0xFF00;
+    ppu_context c;
+    memset(&c, 0, sizeof c);
+    c.gpr[1] = stack; c.gpr[2] = 0x00EB2958;
+    c.gpr[3] = a; c.gpr[4] = b; c.gpr[5] = c3;
+    fn(&c);
+    return (uint32_t)c.gpr[3];
+}
+
+static void kz2_selftest_url(void)
+{
+    const uint32_t url  = kz2_put_str("file:///kin/index.jsp");
+    const uint32_t base = kz2_guest_alloc(0x400, 16);
+    for (int which = 0; which < 2; which++) {
+        const uint32_t out = kz2_guest_alloc(0x400, 16);
+        uint32_t rc = which ? kz2_call3(func_0039C230, out, base, url)
+                            : kz2_call3(func_0039BDB0, out, base, url);
+        fprintf(stderr, "[selftest] %s(file:///kin/index.jsp) rc=%u scheme='%s' host/path='%s' port=%u\n",
+                which ? "parse" : "parse_abs", rc, (char*)(vm_base + out),
+                (char*)(vm_base + out + 0x10), vm_read16(out + 0x90));
+        fprintf(stderr, "[selftest]   out:");
+        for (int o = 0; o < 0x40; o += 4) fprintf(stderr, " %08X", vm_read32(out + o));
+        fprintf(stderr, "\n");
+    }
+}
+
+static void kz2_selftest(void)
+{
+    kz2_selftest_url();
+    const char* urls[] = { "file:///kin/index.jsp", "http://x/y", "abc:def", "nocolon" };
+    for (const char* u : urls) {
+        uint32_t s = kz2_put_str(u);
+        for (char ch : { ':', '/', 'j', 'z' }) {
+            uint32_t got = kz2_call2(func_007AE780, s, (uint32_t)(uint8_t)ch);
+            const char* want = strchr(u, ch);
+            uint32_t want_ea = want ? s + (uint32_t)(want - u) : 0;
+            fprintf(stderr, "[selftest] strchr(\"%s\", '%c') = 0x%08X want 0x%08X %s\n",
+                    u, ch, got, want_ea, got == want_ea ? "ok" : "MISMATCH");
+        }
+        for (const char* needle : { "://", ":", "//", "jsp" }) {
+            uint32_t n = kz2_put_str(needle);
+            uint32_t got = kz2_call2(func_007AF780, s, n);
+            const char* want = strstr(u, needle);
+            uint32_t want_ea = want ? s + (uint32_t)(want - u) : 0;
+            fprintf(stderr, "[selftest] strstr(\"%s\", \"%s\") = 0x%08X want 0x%08X %s\n",
+                    u, needle, got, want_ea, got == want_ea ? "ok" : "MISMATCH");
+        }
+    }
+}
+
 extern "C" void kz2_hle_register(void)
 {
+    if (getenv("KZ2_SELFTEST")) kz2_selftest();
     cellSaveData_register_ctx_handlers();          /* 9-arg cellSaveDataUserAutoLoad */
     ps3_hle_register_ctx(0xA885CC9B, "cellFontOpenFontset", kz2_font_open_fontset);
     ps3_hle_register_ctx(0x52AAC4FA, "cellSaveDataUserAutoSave", kz2_savedata_user_auto_save);

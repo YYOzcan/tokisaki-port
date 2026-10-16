@@ -1,0 +1,51 @@
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 66c65e5..7701f4f 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -3055,6 +3055,46 @@ class PPULifter:
+                     f"for(int i=0;i<4;i++) d[i]=(int32_t)a[4*i]*(int32_t)ub[4*i]+(int32_t)a[4*i+1]*(int32_t)ub[4*i+1]"
+                     f"+(int32_t)a[4*i+2]*(int32_t)ub[4*i+2]+(int32_t)a[4*i+3]*(int32_t)ub[4*i+3]+cc[i]; }}")
+ 
++        # Load/store string word immediate. Killzone 2's compiler inlines short
++        # fixed-size copies as `lswi r5,rA,15; stswi r5,rB,15` -- the URL
++        # parser copies the scheme this way, so emitting these as TODO left
++        # every parsed scheme empty. Bytes fill registers from rD upward, four
++        # per register, most significant byte first in the low word (the high
++        # word is cleared), wrapping from r31 to r0; NB = 0 means 32.
++        if mn in ("lswi", "stswi"):
++            rt, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
++            nb = int(ops[2], 0) or 32
++            ea = "0" if ra == 0 else f"(uint32_t)ctx->gpr[{ra}]"
++            if mn == "lswi":
++                return (f"{{ uint32_t ea = {ea}; int r = {rt} - 1; "
++                        f"for (int i = 0; i < {nb}; i++) {{ "
++                        f"if ((i & 3) == 0) {{ r = (r + 1) & 31; ctx->gpr[r] = 0; }} "
++                        f"ctx->gpr[r] |= (uint64_t)vm_read8(ea + i) << (24 - 8 * (i & 3)); }} }}")
++            return (f"{{ uint32_t ea = {ea}; int r = {rt} - 1; "
++                    f"for (int i = 0; i < {nb}; i++) {{ "
++                    f"if ((i & 3) == 0) r = (r + 1) & 31; "
++                    f"vm_write8(ea + i, (uint8_t)(ctx->gpr[r] >> (24 - 8 * (i & 3)))); }} }}")
++
++        # VMX unsigned forms the integer handlers above do not cover; lane
++        # indexing follows the neighbouring signed/halfword handlers.
++        if mn == "vmsumuhm":
++            vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:]); vc = int(ops[3][1:])
++            return (f"{{ uint16_t* a=(uint16_t*)&ctx->vr[{va}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
++                    f"uint32_t* c=(uint32_t*)&ctx->vr[{vc}]; uint32_t r[4]; "
++                    f"for(int i=0;i<4;i++) r[i]=c[i]+(uint32_t)a[i*2]*(uint32_t)b[i*2]+(uint32_t)a[i*2+1]*(uint32_t)b[i*2+1]; "
++                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
++        if mn == "vsubuws":
++            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
++            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
++                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; uint32_t r[4]; "
++                    f"for(int i=0;i<4;i++) r[i]=a[i]>b[i]?a[i]-b[i]:0u; memcpy(d, r, 16); }}")
++        if mn in ("vmuloub", "vmuleub"):
++            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
++            k = 1 if mn == "vmuloub" else 0
++            return (f"{{ uint8_t* a=(uint8_t*)&ctx->vr[{va}]; uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
++                    f"uint16_t r[8]; for(int i=0;i<8;i++) r[i]=(uint16_t)a[2*i+{k}]*(uint16_t)b[2*i+{k}]; "
++                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
++
+         # Merge high halfword / low halfword (vmrghh, vmrglh — already in vmrg* handler above)
+ 
+         # ------- Default: emit as comment -------
