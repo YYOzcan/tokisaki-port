@@ -247,7 +247,7 @@ catches up rarely shows: the menus rendered ~200 frames a second and presented
 one every few seconds. A flip the drain decoded now presents at once, checked
 after every drain, not once per clock loop.
 
-## 17. The first physics step (open)
+## 17. The first physics step
 
 With loading past the job manager, the main thread reaches
 `TtPhysicsWorld_Update` (`func_004D9BD0`) and waits in `func_004EED70` for the
@@ -271,3 +271,28 @@ argument points to), and whether the SPU-capable jobs are ever queued.
 Diagnostics (patch 0011): `KZ2_DUMPAT` accepts `<sec>:T<k>+<off>:<len>`, an
 address relative to word k of the last `cellSpursCreateTask` argument;
 `SPURS_TASK_DELAY_MS` delays a task's start.
+
+### Resolved (patch 0012)
+
+Two runtime bugs, found with the new `KZ2_THREADS` / `R<tid>.<reg>` dumps and
+`eu-stack` on a live run (`KZ2_ALLOW_PTRACE=1`):
+
+1. **Taskset arguments were dropped.** `_cellSpursTasksetAttributeInitialize`
+   discarded its `args`, and `cellSpursCreateTasksetWithAttribute` ignored the
+   attribute, so every task got 0 in r4's preferred doubleword. Havok's
+   taskset passes `0x00C42A80_00C59980` there: the second word is the ELF its
+   job task switches to when the queue holds jobs for the other Havok ELF
+   (the task's `0x17610` ELF loader returned `CELL_SPURS_TASK_ERROR_INVAL` on
+   address 0). With the argument, the physics steps run, alternating the two
+   ELFs (`0xC42A80`, `0xCAB980`).
+2. **Tasks started twice.** The taskset exit scheduler starts any enabled,
+   ready task it does not see running; a task created by the PPU was marked
+   running only once its host thread got going, and `cellSpursCreateTask`
+   published its ready bit before that. Killzone 2's `imogen` tasks
+   (ELF `0xD83280`) ran 49 times for 39 creations, each run decrementing the
+   frame's job counter at `0x235BB9D0`; it reached -28 and the main thread
+   (`func_005573A0`) waited for 0 forever. Now marked running before the task
+   is registered.
+
+The main thread now reaches the renderer (`0x48238`); frames are still not
+presented after the level loads.

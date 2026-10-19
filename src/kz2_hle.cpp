@@ -360,6 +360,32 @@ static void kz2_font_generate_char_glyph(ppu_context* ctx)
 static void kz2_font_delete_glyph(ppu_context* ctx) { ctx->gpr[3] = 0; }
 
 /* ---------------------------------------------------------------------------
+ * SPURS task exit-code containers (Havok's hkSpuUtil sets one on every task).
+ * Not implemented by the runtime; logged here while the task-exit protocol
+ * is being worked out. CellSpursTaskExitCode is 128 bytes.
+ * -----------------------------------------------------------------------*/
+static volatile uint32_t s_kz2_exitcode_ea;
+extern "C" uint32_t kz2_last_exitcode_container(void) { return s_kz2_exitcode_ea; }
+
+static void kz2_task_exitcode_initialize(ppu_context* ctx)
+{
+    const uint32_t ea = (uint32_t)ctx->gpr[3];
+    if (ea) for (uint32_t o = 0; o < 128; o += 4) vm_write32(ea + o, 0);
+    s_kz2_exitcode_ea = ea;
+    static int n = 0;
+    if (n++ < 8) fprintf(stderr, "[kz2] cellSpursTaskExitCodeInitialize(0x%08X)\n", ea);
+    ctx->gpr[3] = 0;
+}
+
+static void kz2_task_attr_set_exitcode(ppu_context* ctx)
+{
+    const uint32_t attr = (uint32_t)ctx->gpr[3], ea = (uint32_t)ctx->gpr[4];
+    static int n = 0;
+    if (n++ < 8) fprintf(stderr, "[kz2] cellSpursTaskAttributeSetExitCodeContainer(attr=0x%08X, 0x%08X)\n", attr, ea);
+    ctx->gpr[3] = 0;
+}
+
+/* ---------------------------------------------------------------------------
  * cellSaveDataUserAutoSave: nine arguments
  *
  * (version, userId, dirName, errDialog, setBuf, funcStat, funcFile, container,
@@ -565,6 +591,8 @@ extern "C" void kz2_hle_register(void)
     cellSaveData_register_ctx_handlers();          /* 9-arg cellSaveDataUserAutoLoad */
     ps3_hle_register_ctx(0xA885CC9B, "cellFontOpenFontset", kz2_font_open_fontset);
     ps3_hle_register_ctx(0xC17259DE, "cellFontGenerateCharGlyph", kz2_font_generate_char_glyph);
+    ps3_hle_register_ctx(0x34552FA6, "cellSpursTaskExitCodeInitialize", kz2_task_exitcode_initialize);
+    ps3_hle_register_ctx(0xA121A224, "cellSpursTaskAttributeSetExitCodeContainer", kz2_task_attr_set_exitcode);
     ps3_hle_register_ctx(0xD62F5D76, "cellFontDeleteGlyph", kz2_font_delete_glyph);
     ps3_hle_register_ctx(0x52AAC4FA, "cellSaveDataUserAutoSave", kz2_savedata_user_auto_save);
     ps3_hle_register_ctx(0xD8EAEE9F, "cellFontGetCharGlyphMetrics",

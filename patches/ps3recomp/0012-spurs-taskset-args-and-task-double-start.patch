@@ -1,0 +1,200 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 225acc1..f379400 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -786,12 +786,32 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+     return CELL_OK;
+ }
+ 
++/* CellSpursTasksetAttribute, big-endian guest layout (as libsre writes it):
++ *   +0x00 revision  +0x04 sdk version  +0x08 u64 args  +0x10 u8 priority[8]
++ *   +0x18 max contention  +0x1C name  +0x20 taskset size  +0x24 clear-LS */
++#define CSTA_ARGS     0x08
++#define CSTA_PRIORITY 0x10
++#define CSTA_MAXCONT  0x18
++
+ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
+                                         CellSpursTaskset* taskset,
+                                         const CellSpursTasksetAttribute* attr)
+ {
+-    (void)attr;
+-    return cellSpursCreateTaskset(spurs, taskset, 0, NULL, 0);
++    /* The taskset argument is what every task of the set receives in r4's
++     * preferred doubleword. Dropping it (args 0) broke Havok on Killzone 2:
++     * its SPU job task switches ELF to the address it finds there and failed
++     * with CELL_SPURS_TASK_ERROR_INVAL, leaving the physics step's SPU jobs
++     * unprocessed. */
++    const uint32_t attr_ea = (uint32_t)(uintptr_t)attr;
++    u64 args = 0;
++    u32 maxc = 0;
++    if (attr_ea) {
++        args = vm_read64(attr_ea + CSTA_ARGS);
++        maxc = vm_read32(attr_ea + CSTA_MAXCONT);
++    }
++    printf("[cellSpurs] CreateTasksetWithAttribute(attr=0x%08X) args=0x%llX maxContention=%u\n",
++           attr_ea, (unsigned long long)args, maxc);
++    return cellSpursCreateTaskset(spurs, taskset, args, NULL, maxc);
+ }
+ 
+ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
+@@ -930,6 +950,11 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+             /* Register the task in the REAL BE taskset: writes task_info[slot]
+              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
+              * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
++            /* Running BEFORE ready: the exit scheduler starts any enabled,
++             * ready task it does not see running, and this one is about to be
++             * dispatched by us (see spu_taskset_mark_running). */
++            { extern void spu_taskset_mark_running(uint32_t, uint32_t);
++              spu_taskset_mark_running(taskset_ea, i); }
+             spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
+                                    (uint64_t)context_ea, task_arg, task_lsp);
+             /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
+@@ -1146,12 +1171,21 @@ s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
+                                          u32 revision, u32 sdkVersion, u64 argTaskset,
+                                          u64 priority, u32 maxContention)
+ {
+-    (void)sdkVersion; (void)argTaskset; (void)priority; (void)maxContention;
+     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
++    const uint32_t attr_ea = (uint32_t)(uintptr_t)attr;
+     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
+     memset(attr, 0, sizeof(CellSpursTasksetAttribute));
+-    attr->revision = revision ? revision : 1;
+-    printf("[cellSpurs] _TasksetAttributeInitialize(rev=%u)\n", revision);
++    /* Guest big-endian layout (see CSTA_* above): the create call reads the
++     * argument and contention back from here. */
++    vm_write32(attr_ea + 0x00, revision ? revision : 1);
++    vm_write32(attr_ea + 0x04, sdkVersion);
++    vm_write64(attr_ea + CSTA_ARGS, argTaskset);
++    if ((uint32_t)priority)
++        for (u32 i = 0; i < 8; i++)
++            vm_write8(attr_ea + CSTA_PRIORITY + i, vm_read8((uint32_t)priority + i));
++    vm_write32(attr_ea + CSTA_MAXCONT, maxContention);
++    printf("[cellSpurs] _TasksetAttributeInitialize(rev=%u args=0x%llX maxContention=%u)\n",
++           revision, (unsigned long long)argTaskset, maxContention);
+     return CELL_OK;
+ }
+ 
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index bf75dc8..73a8e2b 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -853,6 +853,16 @@ extern "C" void ppu_report_guest_lrs(void)
+         fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
+                 (unsigned)c->thread_id, (uint32_t)c->lr,
+                 (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
++        /* PPU_REPORT_REGS=1: the argument and callee-saved registers too --
++         * for a thread parked in a syscall they name the object it waits on. */
++        { static int rr = -1; if (rr < 0) rr = getenv("PPU_REPORT_REGS") ? 1 : 0;
++          if (rr) {
++            fprintf(stderr, "[WATCHDOG]     r3-r12:");
++            for (int k = 3; k <= 12; k++) fprintf(stderr, " %08X", (uint32_t)c->gpr[k]);
++            fprintf(stderr, "\n[WATCHDOG]     r24-r31:");
++            for (int k = 24; k <= 31; k++) fprintf(stderr, " %08X", (uint32_t)c->gpr[k]);
++            fprintf(stderr, "\n");
++          } }
+         /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
+          * targets. lr cannot see those (bctrl does not write it), so for a
+          * thread looping on a vtable call the ring is the only record of where
+@@ -864,6 +874,18 @@ extern "C" void ppu_report_guest_lrs(void)
+     fflush(stderr);
+ }
+ 
++/* A guest thread's register by guest tid (diagnostics; unlocked read).
++ * Returns 0 when no registered thread has that tid. */
++extern "C" uint64_t ppu_guest_reg(unsigned tid, unsigned reg)
++{
++    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
++    for (long i = n - 1; i >= 0; i--) {
++        ppu_context* c = g_resv_ctxs[i];
++        if (c && (unsigned)c->thread_id == tid && reg < 32) return c->gpr[reg];
++    }
++    return 0;
++}
++
+ /* Break every reservation on ea's word (real-PPC granule semantics on a store).
+  * Best-effort/unlocked: the break is a single word write; a concurrent stwcx
+  * recheck reads reserve_addr under its slot lock and the value-CAS backstops the
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index b6ece1f..70a6dd3 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -425,6 +425,19 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+             fprintf(stderr, "[atomcnt] %llu atomic ops; last cmd=0x%X ea=0x%08X\n",
+                     (unsigned long long)s_n, cmd, ea);
+           s_lastea = ea; } } }
++    /* SPU_ATOM_WATCH=<hex ea>: every atomic command on that 128-byte line,
++     * with the watched word's current value, image, job overlay and pc. */
++    { static int64_t s_aw = -2;
++      if (s_aw == -2) { const char* e = getenv("SPU_ATOM_WATCH"); s_aw = e ? (int64_t)strtoul(e, 0, 16) : -1; }
++      if (s_aw >= 0 && (ea & ~127u) == ((uint32_t)s_aw & ~127u)) {
++          static int n = 0;
++          if (n++ < 2000) {
++              const uint8_t* m = vm_base + (uint32_t)s_aw;
++              fprintf(stderr, "[atomwatch] cmd=0x%02X ea=0x%08X word=%02X%02X%02X%02X img=%d ovl=%d pc=0x%05X\n",
++                      cmd, ea, m[0], m[1], m[2], m[3], ctx->image_id, ctx->resident_ovl,
++                      (unsigned)(ctx->pc & SPU_LS_MASK));
++          }
++      } }
+     /* SPU_ATOMTRACE=1 keeps the old 40-line cap; =<N> raises it. A busy image
+      * (FMOD) exhausts 40 before a quieter one issues its first atomic, which
+      * reads as "that image never does atomics" when it simply never got a line. */
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index ade371c..f1b18f5 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -372,9 +372,16 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
+  * Taskset layout: bitsets of 16 bytes at +0x10 ready, +0x20 pending,
+  * +0x30 enabled (task 0 = MSB of byte 0); task_info[t] at +0x80 + 0x30*t with
+  * the ELF EA at +0x14 and the context save EA at +0x1C. */
++#if defined(_MSC_VER)
++#define SPU_THREAD_LOCAL_WL __declspec(thread)
++#else
++#define SPU_THREAD_LOCAL_WL _Thread_local
++#endif
+ #define TS_TRACK 8
+ static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
+ static volatile LONG s_ts_lock;
++/* Set while spu_taskset_task_exited dispatches under ts_lock (see below). */
++static SPU_THREAD_LOCAL_WL int s_ts_dispatch_locked;
+ static uint8_t* ts_running(uint32_t taskset_ea)
+ {
+     for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return s_ts_run[i].running;
+@@ -394,6 +401,13 @@ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
+     ts_unlock();
+ }
+ 
++/* For cellSpursCreateTask: claim the task as running before its ready bits
++ * become visible to the exit scheduler. */
++void spu_taskset_mark_running(uint32_t taskset_ea, uint32_t taskid)
++{
++    spu_taskset_mark(taskset_ea, taskid, 1);
++}
++
+ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+ {
+     extern uint8_t* vm_base;
+@@ -425,7 +439,9 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                         "(after task %u exited)\n", t, taskset_ea, elf, done_task);
+         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
++        s_ts_dispatch_locked = 1;        /* running bit already set, ts_lock held */
+         spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
++        s_ts_dispatch_locked = 0;
+     }
+     ts_unlock();
+ }
+@@ -1226,6 +1242,14 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+      * tasks that made both run task 1's descriptor. */
+     { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+       j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
++    /* Mark the task running NOW, not when its host thread gets going: in
++     * between, another task of the set could exit, and the exit scheduler
++     * (spu_taskset_task_exited) would see this one enabled, ready and not
++     * running and start it a second time. Killzone 2's imogen tasks ran 49
++     * times for 39 creations that way, each run decrementing the frame's job
++     * counter once more -- it reached -28 and the main thread waited forever
++     * for it to come back to 0. */
++    if (!s_ts_dispatch_locked) spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
+      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
+      * async SPU thread reading it later would race the PPU stack. word1 is

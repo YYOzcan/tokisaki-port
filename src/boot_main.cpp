@@ -39,6 +39,9 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include <cstdlib>
 #include <cstring>
 
@@ -158,6 +161,9 @@ static uint64_t now_ms(void)
 static void peek_tick(void);
 static void dumpat_tick(void);
 static void dumpfile_tick(void);
+extern "C" uint64_t ppu_guest_reg(unsigned tid, unsigned reg);
+static void threads_tick(void);
+static void hkwake_tick(void);
 
 /* Drain the FIFO about every millisecond, deliver 60 Hz vblank ticks on the
  * guest thread (cellGcm_request_tick), and present on the guest's flip once
@@ -192,6 +198,8 @@ static void frame_clock_loop(void)
         peek_tick();
         dumpat_tick();
         dumpfile_tick();
+        threads_tick();
+        hkwake_tick();
 
         const uint64_t now = now_ms();
         int fired = 0;
@@ -247,6 +255,62 @@ static void peek_tick(void)
 
 /* KZ2_DUMPAT=<sec>:<ea>:<len>[,...]: hex-dump guest memory once, <sec>
  * seconds after the frame clock starts. */
+/* KZ2_THREADS=<sec>[,<sec>...]: print every guest thread's lr and registers. */
+extern "C" void ppu_report_guest_lrs(void);
+extern "C" uint64_t ppu_guest_reg(unsigned tid, unsigned reg);
+static void threads_tick(void)
+{
+    static const char* spec = getenv("KZ2_THREADS");
+    static uint64_t t0 = 0;
+    static bool done[8];
+    if (!spec) return;
+    if (!t0) t0 = now_ms();
+    char buf[128];
+    strncpy(buf, spec, sizeof buf - 1);
+    buf[sizeof buf - 1] = 0;
+    int i = 0;
+    for (char* tok = strtok(buf, ","); tok && i < 8; tok = strtok(nullptr, ","), i++) {
+        const unsigned sec = (unsigned)strtoul(tok, nullptr, 0);
+        if (done[i] || now_ms() - t0 < sec * 1000ull) continue;
+        done[i] = true;
+        setenv("PPU_REPORT_REGS", "1", 0);
+        fprintf(stderr, "[threads] t=%us\n", sec);
+        ppu_report_guest_lrs();
+    }
+}
+
+/* KZ2_HKWAKE=<sec>:<tid> -- DIAGNOSTIC: release the semaphore guest thread
+ * <tid> sleeps on in func_00803758 (r31 = semaphore object: +4 -> word, +8 =
+ * event queue), the way the SPU side releases one (count +1, waiters -1, one
+ * event). Tests whether the stall is a missed wake-up. */
+extern "C" int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
+                                          uint64_t data1, uint64_t data2, uint64_t data3);
+static void hkwake_tick(void)
+{
+    static const char* spec = getenv("KZ2_HKWAKE");
+    static uint64_t t0 = 0;
+    static bool done = false;
+    if (!spec || done) return;
+    if (!t0) t0 = now_ms();
+    unsigned sec = 0, tid = 0;
+    if (sscanf(spec, "%u:%u", &sec, &tid) != 2) { done = true; return; }
+    if (now_ms() - t0 < sec * 1000ull) return;
+    done = true;
+    const uint32_t obj  = (uint32_t)ppu_guest_reg(tid, 31);
+    const uint32_t wptr = __builtin_bswap32(*(uint32_t*)(vm_base + obj + 4));
+    const uint32_t q    = __builtin_bswap32(*(uint32_t*)(vm_base + obj + 8));
+    uint32_t* w = (uint32_t*)(vm_base + wptr);
+    const uint32_t before = __builtin_bswap32(*w);
+    if ((before >> 16 & 0xFF) == 0) {
+        fprintf(stderr, "[hkwake] obj=0x%08X word=0x%08X: no waiter\n", obj, before);
+        return;
+    }
+    *w = __builtin_bswap32(before + 1 - 0x10000);
+    const int rc = sys_event_queue_push_by_id(q, 0xFFFFFFFF53505501ull, 0, (uint64_t)(before >> 24) << 32, 0);
+    fprintf(stderr, "[hkwake] obj=0x%08X word 0x%08X -> 0x%08X, event to queue %u rc=%d\n",
+            obj, before, __builtin_bswap32(*w), q, rc);
+}
+
 static void dumpat_tick(void)
 {
     static const char* spec = getenv("KZ2_DUMPAT");
@@ -260,11 +324,29 @@ static void dumpat_tick(void)
     int i = 0;
     for (char* tok = strtok(buf, ","); tok && i < 16; tok = strtok(nullptr, ","), i++) {
         unsigned sec = 0, ea = 0, len = 0, tk = 0, off = 0;
-        /* <sec>:T<k>+<off>:<len> dumps relative to word k of the last
-         * cellSpursCreateTask argument (heap addresses move between runs). */
-        if (sscanf(tok, "%u:T%u+%x:%x", &sec, &tk, &off, &len) == 4 && tk < 4)
-            ea = g_spurs_last_task_arg[tk] + off;
-        else if (sscanf(tok, "%u:%x:%x", &sec, &ea, &len) != 3) continue;
+        /* <sec>:T<k>[>p1>p2...]+<off>:<len> dumps relative to word k of the
+         * last cellSpursCreateTask argument (heap addresses move between
+         * runs); each >p follows the pointer stored at the current address + p. */
+        unsigned rtid = 0, rreg = 0;
+        const bool by_reg = sscanf(tok, "%u:R%u.%u", &sec, &rtid, &rreg) == 3;
+        if (by_reg || (sscanf(tok, "%u:T%u", &sec, &tk) == 2 && tk < 4)) {
+            const char* q;
+            if (by_reg) {
+                /* R<tid>.<reg>: a guest thread's register as the base */
+                ea = (uint32_t)ppu_guest_reg(rtid, rreg);
+                q = strchr(strchr(tok, 'R'), '.') + 1;
+                while (*q >= '0' && *q <= '9') q++;
+            } else {
+                q = strchr(tok, 'T') + 2;
+                ea = g_spurs_last_task_arg[tk];
+            }
+            while (*q == '>') {
+                const unsigned p = (unsigned)strtoul(q + 1, (char**)&q, 16);
+                ea = __builtin_bswap32(*(uint32_t*)(vm_base + ea + p));
+            }
+            if (sscanf(q, "+%x:%x", &off, &len) != 2) continue;
+            ea += off;
+        } else if (sscanf(tok, "%u:%x:%x", &sec, &ea, &len) != 3) continue;
         if (done[i]) continue;
         if (now_ms() - t0 < sec * 1000ull) continue;
         done[i] = true;
@@ -414,6 +496,13 @@ static void guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2,
 
 int main(int argc, char** argv)
 {
+#if defined(__linux__)
+    /* KZ2_ALLOW_PTRACE=1: let any process of this user attach (eu-stack, gdb -p)
+     * under yama ptrace_scope=1, so a stalled run can be inspected without
+     * starting it under a debugger, which is too slow to reach the stall. */
+    if (getenv("KZ2_ALLOW_PTRACE")) prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+#endif
+
     if (argc < 2) {
         printf("usage: %s <EBOOT.ELF>\n", argv[0]);
         return 2;
