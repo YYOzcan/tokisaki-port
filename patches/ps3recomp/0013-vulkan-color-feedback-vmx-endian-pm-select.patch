@@ -367,6 +367,74 @@ index 7f1ffc9..e893d5d 100644
        if (getenv("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
            fprintf(stderr, "        from %s\n", g_fd_path[fd]);
        if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index c7070e7..1f53b35 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -768,6 +768,7 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
+  * work was posted. spu_coh_is_reserved reads a global that stays zero until an
+  * SPU reserves its first line, so an ordinary store pays one branch. */
+ extern "C" int  spu_coh_is_reserved(uint32_t addr);
++extern "C" int  spu_coh_armed(void);
+ extern "C" void spu_lockline_lock(void);
+ extern "C" void spu_lockline_unlock(void);
+ extern "C" void spu_coh_notify_write(uint32_t addr);
+@@ -961,7 +962,14 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
+      * notify: the same serialization the coherent stores use, so a PPU commit
+      * cannot land inside an SPU PUTLLC's compare/commit window (nor the
+      * reverse), and the reserving SPU gets its lost-reservation event. */
+-    int coh = spu_coh_is_reserved((uint32_t)ea);
++    /* Take the lock-line lock whenever SPU reservations are tracked, and
++     * look the reservation up under it: checking first and locking only for a
++     * reserved line left a window in which an SPU could GETLLAR the line,
++     * pass its PUTLLC compare, and then overwrite this CAS with its stale
++     * 128-byte image (Havok's PPU/SPU semaphore lost waiters that way). */
++    const int coh_lock = spu_coh_armed();
++    if (coh_lock) spu_lockline_lock();
++    int coh = coh_lock && spu_coh_is_reserved((uint32_t)ea);
+     /* SPU_PUTLLC_WHY=1: count PPU commits that land on a line an SPU has
+      * reserved. If an SPU's PUTLLC never succeeds for "no reservation", the
+      * PPU hammering the same 128-byte line is one of only two agents that can
+@@ -972,13 +980,10 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
+             if ((++n % 100000) == 1)
+                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
+                         n, (uint32_t)ea & ~127u); } }
+-    if (coh) spu_lockline_lock();
+     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
+                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+-    if (coh) {
+-        if (ok) spu_coh_notify_write((uint32_t)ea);
+-        spu_lockline_unlock();
+-    }
++    if (coh && ok) spu_coh_notify_write((uint32_t)ea);
++    if (coh_lock) spu_lockline_unlock();
+     if (ok) ppu_resv_break(ea);
+     resv_unlock(L);
+     /* PPU_CASWATCH=<hex ea>: log successful stwcx. on that 128-byte line.
+@@ -1042,13 +1047,17 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
+     volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a 16-byte-block slot */
+     resv_lock(L);
+     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
+-    int coh = spu_coh_is_reserved((uint32_t)ea);
+-    if (coh) spu_lockline_lock();
++    /* Take the lock-line lock whenever SPU reservations are tracked, and
++     * look the reservation up under it: checking first and locking only for a
++     * reserved line left a window in which an SPU could GETLLAR the line,
++     * pass its PUTLLC compare, and then overwrite this CAS with its stale
++     * 128-byte image (Havok's PPU/SPU semaphore lost waiters that way). */
++    const int coh_lock = spu_coh_armed();
++    if (coh_lock) spu_lockline_lock();
++    int coh = coh_lock && spu_coh_is_reserved((uint32_t)ea);
+     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+-    if (coh) {
+-        if (ok) spu_coh_notify_write((uint32_t)ea);
+-        spu_lockline_unlock();
+-    }
++    if (coh && ok) spu_coh_notify_write((uint32_t)ea);
++    if (coh_lock) spu_lockline_unlock();
+     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
+     resv_unlock(L);
+     if (ok && g_ww_lo && (uint32_t)ea + 4u >= g_ww_lo && (uint32_t)ea < g_ww_hi) {
 diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
 index db9ea00..f502d5f 100644
 --- a/runtime/ppu/ppu_sysprx.cpp
@@ -502,6 +570,33 @@ index 49567d6..963d660 100644
              ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
              return;
          }
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 923d8bd..6ea4cc2 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -167,6 +167,10 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
+     spu_lockline_unlock();
+ }
+ 
++/* Whether any SPU reservation tracking is live (a cheap pre-check for callers
++ * that must serialize with PUTLLC). */
++int spu_coh_armed(void) { return s_coh_armed; }
++
+ int spu_coh_is_reserved(uint32_t addr)
+ {
+     if (!s_coh_armed) return 0;
+diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
+index ca76ccd..74f7b77 100644
+--- a/runtime/spu/spu_coherency.h
++++ b/runtime/spu/spu_coherency.h
+@@ -54,6 +54,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
+ /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
+  * lookup guarded by a global that is zero until the first GETLLAR. */
+ int spu_coh_is_reserved(uint32_t addr);
++int spu_coh_armed(void);
+ 
+ /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
+  * whose live reservation covers it, drop that reservation, and wake the host
 diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
 index 9820cc2..88441ae 100644
 --- a/runtime/spu/spu_dma.h

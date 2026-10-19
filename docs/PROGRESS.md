@@ -575,3 +575,22 @@ Result: the Intruder dropship interior of the Corinth River intro, with its
 subtitles (`docs/media/in-level-intruder-first-image.png`), at ~1.6-2.3
 presented frames/s. The tint is still off (no atmosphere grading) and some
 runs still stall in the Havok step (section 20b).
+
+## 29. The Havok stall: a PPU CAS racing an SPU PUTLLC
+
+The physics step stalled in about half the runs: the main thread waits on
+an hkSemaphore (`func_00803590`), the Havok PPU worker in
+`func_00803758`, Havok's PPU/SPU semaphore -- one word, low 16 bits the
+count, the upper bits the number of waiters. A PPU waiter adds itself with
+`lwarx`/`stwcx.` and sleeps on an event queue; the SPU releaser increments
+the count with GETLLAR/PUTLLC and sends an event only if it sees a waiter.
+
+`ppu_stwcx32` asked "does an SPU hold a reservation on this line?" before
+taking the lock-line lock, and took the lock only if so. An SPU could
+GETLLAR the line right after that check, pass its PUTLLC compare under the
+lock, and commit its 128-byte image over the PPU's CAS -- losing the waiter
+the PPU had just added, so the SPU never sent the event. `stwcx.`/`stdcx.`
+now take the lock-line lock whenever reservations are tracked and look the
+reservation up under it. Four runs after the change, none stalled in
+physics (three ran in the level throughout; one hit the frame-park wait of
+section 20).
