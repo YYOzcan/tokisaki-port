@@ -51,7 +51,19 @@ Full engineering log: [docs/PROGRESS.md](docs/PROGRESS.md).
 ### Name
 The repository is named after Kurumi Tokisaki (*Date A Live*), a character who commands time — a nod to bringing a 2009 game forward. The name is the only thing it borrows; the engineering is below.
 
-### Credits
+#
+### Play in a window / Pencerede oynatma
+
+```
+tools/play.sh
+```
+
+Enter = START, Space = Cross, Esc = Circle, arrow keys = D-pad, R/F = Square,
+T/C = Triangle, Q/E = L1/R1, Tab = SELECT; an SDL game controller also works.
+The game currently runs through the menus to campaign start and stops at the
+first physics step of the level.
+
+## Credits
 Most of what runs is other people's work: the **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** toolkit and runtime (Ned Heller / sp00nznet and contributors), and the Linux boot harness of **[Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal)**, both MIT. Bugs fixed in `patches/ps3recomp/` were first found by others; see **[CREDITS.md](CREDITS.md)** and **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**. This port is developed by YYOzcan with an AI coding agent (Claude); the reasoning behind every change is in [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ### Project Layout

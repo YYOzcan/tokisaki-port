@@ -39,3 +39,4 @@ logs/
 .venv/
 build*/
 gamedata/
+run_test/
