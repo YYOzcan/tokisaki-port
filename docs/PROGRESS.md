@@ -475,3 +475,30 @@ With the faster helpers the level runs: in-level frames are presented at
 its subtitles ("ISA. Attention! Attention! Prepare for Air Operations.").
 The image itself is still horizontal streaks (`docs/media/first-in-level-frame.png`):
 the in-level renderer's surfaces are not decoded right yet.
+
+## 25. The in-level image: G-buffer right, post chain wrong
+
+Pass dumps of a Corinth River intro frame (the Intruder dropship's interior):
+the deferred renderer's G-buffer (2560x720, i.e. 1280x720 at 2x MSAA, four
+targets: albedo, light accumulation, normals, depth/position) and the lit
+scene come out right (`docs/media/in-level-gbuffer-albedo-and-lit.png`).
+What reaches the display does not:
+
+- The base layer is black. The display copy (`pipe 113`) reads the colour
+  grading pass's output, and that pass (`pipe 112`) takes its final colour
+  from a 64x64 A8R8G8B8 LUT in main memory (IO `0x08A21D80`, EA
+  `0x23721D80`) that is all zero. Nothing writes it but one `memset`: no SPU
+  DMA, no lifted PPU store, no NV0039 copy (KZ2 sends no methods on
+  subchannels 1-6). The fill must come through a host-side path the watches
+  do not see -- an Edge Zlib inflate or another HLE copy.
+- On top of it the SPU post chain's output (jm_post, 640x360 at EA
+  `0x41A7D200`) is horizontal streaks (`docs/media/spu-post-output-640x360.png`):
+  rows keep their vertical structure, detail along a row is lost. The SPU
+  helpers pass upstream's tests at x86-64-v3, so this is in the jobs or
+  their DMA, not in shufb/fa/fma.
+
+Also fixed: the Vulkan engine backend now accepts R32F, RGBA32F and RG16F
+colour targets (the exposure chain renders luminance into 320x180 X32
+surfaces; they were dropped as "not supported yet"). The pass log shows, for
+every main-memory texture, its EA, first bytes and how much of its first
+4 KB is nonzero.
