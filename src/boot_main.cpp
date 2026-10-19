@@ -87,6 +87,7 @@ int  cellGcm_take_flip_pending_synced(void);
 extern volatile unsigned g_spurs_pm_cur_wid, g_spurs_pm_cur_lane;   /* spurs_policy.c */
 extern volatile unsigned long long g_spurs_pm_cur_since;
 extern volatile uint32_t g_spurs_last_task_arg[4];                   /* cellSpurs.c */
+uint32_t cellGcm_fifo_walker_get(void);                              /* cellGcmSys.c */
 unsigned long long ps3_ms_now(void);
 void cellGcm_rsx_process_fifo(void);
 
@@ -274,7 +275,10 @@ static void threads_tick(void)
         if (done[i] || now_ms() - t0 < sec * 1000ull) continue;
         done[i] = true;
         setenv("PPU_REPORT_REGS", "1", 0);
-        fprintf(stderr, "[threads] t=%us\n", sec);
+        const uint32_t g = cellGcm_fifo_walker_get();
+        fprintf(stderr, "[threads] t=%us fifo get=0x%08X word=0x%08X put=0x%08X\n", sec, g,
+                __builtin_bswap32(*(uint32_t*)(vm_base + 0x40300000u + g)),
+                __builtin_bswap32(*(uint32_t*)(vm_base + 0xE8002000u)));
         ppu_report_guest_lrs();
     }
 }
@@ -534,7 +538,12 @@ int main(int argc, char** argv)
     /* Killzone 2 parks the RSX mid-frame and patches the park once the rest
      * of the frame is built; give it time instead of skipping to `put`
      * (patches/ps3recomp/0005, cellGcmSys.c). */
-    setenv("GCM_PARK_GRACE_MS", "3000", 0);
+    /* Killzone 2 always patches its mid-frame parks eventually, and the real RSX
+     * waits on a park for as long as it takes. A finite grace dropped frame
+     * remainders whenever a frame took longer than it (loading, first use of a
+     * shader), and the renderer then waited forever for a label released
+     * there. 10 minutes is "never" for practical purposes. */
+    setenv("GCM_PARK_GRACE_MS", "600000", 0);
 
     uint32_t entry = ppu_load_elf(argv[1]);
     if (!entry) {

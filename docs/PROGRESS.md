@@ -334,3 +334,19 @@ duplicate insert. A gentler watchdog (clear only `+0x1B4`) is behind
 `KZ2_GENTLE_SOUND_WATCHDOG=1`; it does not get the stop through yet.
 
 Next stall: during level load, main thread at lr `0x3BF72C`.
+
+## 20. In the level: render passes park on sub-buffers (open)
+
+With the park grace raised to 10 minutes (boot_main: KZ2 always patches its
+parks; a finite grace skipped frame remainders whenever a frame took longer
+than it), the loading screen runs and the first in-level frames are built.
+The next stall varies between runs but has one shape: the FIFO walker sits
+on a self-JUMP park that a render pass inserted (`func_0053E930` ->
+`func_0038E120`, e.g. IO `0x1A4A64C`, reached through a CALL from the frame
+block), and the main thread waits for GCM label 0x4B (released after that
+CALL) or for a `jm_gfx` ticket. Nothing patches those parks; the commands
+after them are already written. The patcher is presumably the job the pass
+hands its work to (`jm_gfx`, Edge geometry); its tickets complete, but its
+command list still holds job descriptors (`00800001 406ABC00` ...).
+
+`KZ2_THREADS` now also prints the FIFO walker position (patch 0014).
