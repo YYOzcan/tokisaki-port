@@ -35,7 +35,7 @@ Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.14.0, pinne
 | Front end | language select → gamma → main menu → save warning → start screen → campaign difficulty → campaign start (driven with `PAD_SCRIPT`) |
 | Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); campaign start sound teardown hang resolved; advances to level asset loading; gameplay not reached |
 
-![Welcome screen, presented by the Vulkan backend: text renders, some letters still missing](docs/media/welcome-screen-first-text.png)
+![Campaign loading screen: Corinth River with the mission briefing](docs/media/corinth-river-loading.png)
 
 Full engineering log: [docs/PROGRESS.md](docs/PROGRESS.md).
 

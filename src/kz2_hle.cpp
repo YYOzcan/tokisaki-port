@@ -535,6 +535,8 @@ static lv2_syscall_fn s_orig_sys_timer_usleep = nullptr;
 static int64_t kz2_sys_timer_usleep(ppu_context* ctx)
 {
     const uint32_t caller_lr = (uint32_t)ctx->lr;
+    static const bool off = getenv("KZ2_NO_SOUND_WATCHDOG") != nullptr;
+    if (off) return s_orig_sys_timer_usleep ? s_orig_sys_timer_usleep(ctx) : 0;
     if (caller_lr == 0x009AD294 || caller_lr == 0x009AD2CC) {
         static int s_spin_count[16] = {0};
         const uint32_t stream_idx = (uint32_t)ctx->gpr[29];
@@ -549,10 +551,26 @@ static int64_t kz2_sys_timer_usleep(ppu_context* ctx)
                     const uint32_t h = vm_read32(rec_ea);
                     fprintf(stderr, "[kz2-sound] stream %u spinning in stop wait (spin=%d, handle=0x%08X at 0x%08X), releasing\n",
                             stream_idx, s_spin_count[stream_idx], h, rec_ea);
-                    vm_write32(rec_ea + 0x00, h & 0x7FFFFFFF);
-                    vm_write32(rec_ea + 0x04, 0);
-                    vm_write32(rec_ea + 0x1B0, 0);
-                    vm_write32(rec_ea + 0x1C0, 0);
+                    /* Let the stream service thread finish the stop itself:
+                     * it holds off while +0x1B4 (reads in flight) is set and
+                     * no completion arrives. Clearing just that flag sends it
+                     * down its own stop path (func_009B2B98), which releases
+                     * the stream's voices properly. The old version forged
+                     * the handle and status instead, and the master teardown
+                     * then needed the voice list cleared by hand, which
+                     * corrupted it (double insert -> fatal loop in
+                     * func_009A21D0, now neutralised by tools/postlift_fixups.py).
+                     * The gentle variant does not get the stop through yet, so
+                     * it is opt-in: KZ2_GENTLE_SOUND_WATCHDOG=1. */
+                    static const bool old_wd = getenv("KZ2_GENTLE_SOUND_WATCHDOG") == nullptr;
+                    if (old_wd) {
+                        vm_write32(rec_ea + 0x00, h & 0x7FFFFFFF);
+                        vm_write32(rec_ea + 0x04, 0);
+                        vm_write32(rec_ea + 0x1B0, 0);
+                        vm_write32(rec_ea + 0x1C0, 0);
+                    } else {
+                        vm_write32(rec_ea + 0x1B4, 0);
+                    }
                     s_spin_count[stream_idx] = 0;
                     ctx->gpr[3] = 0;
                     return 0;
@@ -560,7 +578,8 @@ static int64_t kz2_sys_timer_usleep(ppu_context* ctx)
             }
         }
     }
-    if (caller_lr == 0x009A31B8) {
+    static const bool no_voice = getenv("KZ2_GENTLE_SOUND_WATCHDOG") != nullptr;
+    if (caller_lr == 0x009A31B8 && !no_voice) {
         static int s_spin_teardown = 0;
         s_spin_teardown++;
         if (s_spin_teardown >= 5) {

@@ -297,7 +297,7 @@ Two runtime bugs, found with the new `KZ2_THREADS` / `R<tid>.<reg>` dumps and
 The main thread now reaches the renderer (`0x48238`); frames are still not
 presented after the level loads.
 
-## 18. Next stall: GCM label 75 (open)
+## 18. GCM label 75: frames skipped at mid-frame parks (patch 0013)
 
 After the physics steps run, the main thread waits in `func_00048208`
 (called from `func_00530AC8` at 0x532240) for GCM label 0x4B
@@ -307,3 +307,30 @@ blocks dumped at the stall (only the 0x480 texture-read fences), so the label
 is written elsewhere -- an SPU job or another command buffer. Writers of
 `obj+0x178` include `func_0019226C` and `func_001E704C`; next step is to see
 which one ran last and what it emits.
+
+**Resolved.** The release exists (NV406E semaphore offset 0x4B0, value 1, at
+IO 0x6F1DC, in the remainder segment a frame reaches only after its park at
++0x2DC is patched). The FIFO walker's "stuck-get" watchdog resynced to `put`
+after eight passes with `get` unchanged -- a few milliseconds -- which also
+fired on every self-JUMP park and skipped the remainders, bypassing the
+park grace. It now leaves parks to the park logic. With it the campaign's
+loading screen renders (`docs/media/corinth-river-loading.png`: CORINTH RIVER
+with the mission briefing typing out) at ~20 presented frames/s.
+
+Also in 0013: `RSX_LABEL_WATCH=<offset>` logs FIFO commands targeting a
+label; `SPURS_LANE_ROTATE=1` dispatches single-SPU workloads on alternating
+SPU lanes (an experiment, see section 19).
+
+## 19. Sound teardown at campaign start (workaround)
+
+The menu-music stream (7) never finishes stopping: its record stays
+"stopping" with reads in flight (`+0x1B4`) and no completion. The audio WWS
+job list (`0x1064600`) shows lane 1 participating but never advancing, which
+may be related. The watchdog in `src/kz2_hle.cpp` still forges the stop and
+clears the voice list; the double voice release that caused afterwards made
+`func_009A21D0` take its fatal `b .` path. `tools/postlift_fixups.py` (run by
+`tools/lift.sh`) now patches that path in the generated C to skip the
+duplicate insert. A gentler watchdog (clear only `+0x1B4`) is behind
+`KZ2_GENTLE_SOUND_WATCHDOG=1`; it does not get the stop through yet.
+
+Next stall: during level load, main thread at lr `0x3BF72C`.

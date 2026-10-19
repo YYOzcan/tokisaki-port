@@ -1,0 +1,81 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index f379400..b649f78 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1756,7 +1756,23 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                 const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
+                 uint32_t sz = s_workloads[wid].sizePm;
+                 if (maxcont <= 1) {
+-                    spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
++                    /* One SPU at a time, but not always the same one. A WWS job
++                     * list marks every SPU of the instance as a participant
++                     * (its per-SPU progress lanes start at 0, not FFFF), and a
++                     * ticket completes only when each lane has caught up -- on
++                     * hardware the workload lands on both SPUs over time. Always
++                     * dispatching SPU 0 left lane 1 at 0: Killzone 2's audio job
++                     * list stopped at its second ticket and the menu-music
++                     * stream could never be stopped. Rotating alone did not
++                     * advance lane 1 there, so it is opt-in for now:
++                     * SPURS_LANE_ROTATE=1. */
++                    static int no_rot = -1;
++                    if (no_rot < 0) no_rot = getenv("SPURS_LANE_ROTATE") ? 0 : 1;
++                    static u32 s_rot[MAX_SPURS_INST][16];
++                    const int slot = (int)(si - s_inst);
++                    u32 lane = 0;
++                    if (!no_rot && si->nspus > 1) lane = s_rot[slot][wid]++ % si->nspus;
++                    spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, lane);
+                 } else {
+                     /* Run the workload's virtual SPUs CONCURRENTLY (see
+                      * spurs_pm_worker): each lane advances in parallel so the
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 2e41f7f..442840c 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1827,6 +1827,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
+                     { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
+                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
++                    { static long lw = -2; if (lw == -2) { const char* e = getenv("RSX_LABEL_WATCH"); lw = e ? (long)strtoul(e, 0, 16) : -1; }
++                      if (lw >= 0 && ((m == 0x64u && v == (u32)lw) || (m != 0x64u && s_sema_offset == (u32)lw))) {
++                          static int n = 0; if (n++ < 64)
++                              fprintf(stderr, "[labelwatch] NV406E m=0x%02X v=0x%08X at get=0x%08X\n", m, v, s_fifo_getoff); } }
+                     if (m == 0x64u)      s_sema_offset = v;
+                     else if (m == 0x6Cu) vm_write32(la, v);
+                     else if (m == 0x68u && vm_read32(la) != v) {
+@@ -2032,8 +2036,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
+           }
+       } else burned = 0; }
+ 
++    /* ...but not on a self-JUMP park: the park path above owns that wait
++     * (GCM_PARK_GRACE_MS). Eight passes is a few milliseconds, so this
++     * watchdog resynced off every mid-frame park before the title patched it
++     * and dropped the frame's remainder. Killzone 2 releases GCM label 0x4B
++     * from there (NV406E semaphore at IO 0x6F1DC) and its renderer waited for
++     * that label forever. */
++    int at_park = 0;
++    { u32 pea = gcm_io2ea(s_fifo_getoff);
++      if (pea) { u32 w = vm_read32(pea);
++                 at_park = ((w & 0xE0000003u) == 0x20000000u && (w & 0x1FFFFFFCu) == s_fifo_getoff); } }
+     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
+-      if (s_fifo_getoff == last && s_fifo_getoff != put) {
++      if (at_park) { stuck = 0; last = s_fifo_getoff; }
++      else if (s_fifo_getoff == last && s_fifo_getoff != put) {
+           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
+                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
+       } else { stuck = 0; last = s_fifo_getoff; } }
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index aec0497..f753dd0 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -353,6 +353,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+     if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
+ 
+     { static u32 s_sem_off = 0;
++      { static long lw = -2; if (lw == -2) { const char* e = getenv("RSX_LABEL_WATCH"); lw = e ? (long)strtoul(e, 0, 16) : -1; }
++        if (lw >= 0 && ((method == 0x1D6C && data == (u32)lw) ||
++                        ((method == 0x1D70 || method == 0x1D74) && s_sem_off == (u32)lw))) {
++            static int n = 0; if (n++ < 64)
++                fprintf(stderr, "[labelwatch] NV4097 m=0x%04X v=0x%08X\n", method, data); } }
+       if (method == 0x1D6C) { s_sem_off = data; return 0; }
+       if (method == 0x1D70) {
+         extern void vm_write32(uint32_t a, uint32_t v);

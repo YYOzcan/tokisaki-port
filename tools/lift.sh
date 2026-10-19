@@ -32,3 +32,4 @@ rm -f "${ROOT}"/recompiled/ppu_recomp_*.cpp
     -j "${LIFT_JOBS:-8}" \
     -o "${ROOT}/recompiled/"
 grep -ho "^void func_[0-9A-F]*(" "${ROOT}"/recompiled/ppu_recomp_*.cpp | sed "s/void func_//; s/(//" | sort -u > "${ROOT}/out/lifted_funcs.txt"
+"${PY}" -I "${ROOT}/tools/postlift_fixups.py"   # source fixups to the generated C (see the script)
