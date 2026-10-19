@@ -162,6 +162,7 @@ static uint64_t now_ms(void)
 static void peek_tick(void);
 static void dumpat_tick(void);
 static void dumpfile_tick(void);
+static void wws_tick(void);
 extern "C" uint64_t ppu_guest_reg(unsigned tid, unsigned reg);
 static void threads_tick(void);
 static void hkwake_tick(void);
@@ -199,6 +200,7 @@ static void frame_clock_loop(void)
         peek_tick();
         dumpat_tick();
         dumpfile_tick();
+        wws_tick();
         threads_tick();
         hkwake_tick();
 
@@ -379,6 +381,53 @@ static void dumpfile_tick(void)
     FILE* f = fopen(path, "wb");
     if (f) { fwrite(vm_base + ea, 1, len, f); fclose(f); }
     fprintf(stderr, "[dumpfile] 0x%08X+0x%X -> %s\n", ea, len, path);
+}
+
+/* KZ2_WWS_DUMP=<sec>:<list hdr ea>[,...]: walk a WWS job list once -- header
+ * rows, then the command words (runs of the same command collapsed), and for
+ * every `00000002 <ea>` entry the 16 bytes at <ea>, which looks like the
+ * dependency it waits on. */
+static void wws_tick(void)
+{
+    static const char* spec = getenv("KZ2_WWS_DUMP");
+    static uint64_t t0 = 0;
+    static bool done[8];
+    if (!spec) return;
+    if (!t0) t0 = now_ms();
+    auto be32 = [](uint32_t ea) { return __builtin_bswap32(*(uint32_t*)(vm_base + ea)); };
+    char buf[256];
+    strncpy(buf, spec, sizeof buf - 1);
+    buf[sizeof buf - 1] = 0;
+    int i = 0;
+    for (char* tok = strtok(buf, ","); tok && i < 8; tok = strtok(nullptr, ","), i++) {
+        unsigned sec = 0, hdr = 0;
+        if (done[i] || sscanf(tok, "%u:%x", &sec, &hdr) != 2) continue;
+        if (now_ms() - t0 < sec * 1000ull) continue;
+        done[i] = true;
+        const uint32_t n = be32(hdr + 0x2C), list = be32(hdr + 0x3C);
+        fprintf(stderr, "[wws] t=%us list 0x%08X: %u entries at 0x%08X\n", sec, hdr, n, list);
+        for (uint32_t r = 0; r < 4; r++)
+            fprintf(stderr, "[wws]   row %u: %08X %08X %08X %08X\n", r, be32(hdr + 0x40 + 16 * r),
+                    be32(hdr + 0x44 + 16 * r), be32(hdr + 0x48 + 16 * r), be32(hdr + 0x4C + 16 * r));
+        uint32_t run_cmd = 0xFFFFFFFFu, run_start = 0, run_len = 0;
+        auto flush = [&]() {
+            if (run_len) fprintf(stderr, "[wws]   %04X..%04X cmd %08X x%u\n", run_start,
+                                 run_start + run_len - 1, run_cmd, run_len);
+            run_len = 0;
+        };
+        for (uint32_t k = 0; k < n && k < 0x1000; k++) {
+            const uint32_t c = be32(list + 8 * k), a = be32(list + 8 * k + 4);
+            if (c == 2) {
+                flush();
+                fprintf(stderr, "[wws]   %04X guard @%08X: %08X %08X %08X %08X\n", k, a,
+                        be32(a), be32(a + 4), be32(a + 8), be32(a + 12));
+                continue;
+            }
+            if (c != run_cmd) { flush(); run_cmd = c; run_start = k; }
+            run_len++;
+        }
+        flush();
+    }
 }
 
 static DWORD WINAPI frame_clock(LPVOID)

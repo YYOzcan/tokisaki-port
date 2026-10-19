@@ -32,6 +32,17 @@ set(KZ2_SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu_recompiled" CACHE PATH
 set(KZ2_RECOMP_COMPILE_OPTIONS "-O1" CACHE STRING
     "extra compile options for the lifted PPU chunks")
 
+# The lifted SPU code is mostly 128-bit vector work: shufb, fa/fm/fma. Its
+# helpers (spu_helpers.h) only take their SSE4.1 forms when the compiler may
+# use them, and the default x86-64 baseline fell back to a byte loop for every
+# shufb -- 40% of the SPU time in the first level. x86-64-v3 (AVX2, FMA;
+# Haswell / Excavator and later) is the default; set KZ2_ARCH=x86-64-v2 for an
+# SSE4.2-only machine, or native for this one.
+set(KZ2_ARCH "x86-64-v3" CACHE STRING "-march for the game and the runtime")
+if(KZ2_ARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    add_compile_options(-march=${KZ2_ARCH})
+endif()
+
 if(NOT EXISTS "${PS3RECOMP_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "ps3recomp not found at ${PS3RECOMP_DIR}. "
                         "Run: git submodule update --init")

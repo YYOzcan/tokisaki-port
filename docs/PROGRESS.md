@@ -453,3 +453,25 @@ and its per-SPU cursors keep changing (`01D000D9 00D8FFFF` -> `…DF` ->
 `…C9`), so it is running jobs but not reaching the patch job. Next: decode
 jm_post's command list (`00000002 <ea>` entries between the job groups look
 like guards/dependencies) and find what the patch job waits for.
+
+## 24. In the level: x86-64-v3 and the first in-level frames
+
+Sampling the SPU worker threads at the stall (`eu-stack`, 40 samples) put
+`spu_shufb` on top of 37 of ~90 stacks, then `spu_fa`, `spu__fma_any`,
+`spu_fm`. `spu_helpers.h` has an SSE4.1 `shufb`, but only the runtime library
+was built with `-msse4.1`; the lifted SPU and PPU code used the x86-64
+baseline and so the byte-loop `shufb`. The project now builds everything
+with `-march=x86-64-v3` (CMake `KZ2_ARCH`; `x86-64-v2` or `native` also
+work).
+
+The `00000002 <ea>` entries of a WWS job list are job-group descriptors:
+`{u16 jobs left, u16 0x0708, u32 bytes, u32 descriptor EA, u32 bytes}`
+(`KZ2_WWS_DUMP=<sec>:<list hdr>` walks a list). jm_post had been working
+through a 64-job group at about one job every two seconds -- slow, not stuck;
+the park-patch job queues behind it.
+
+With the faster helpers the level runs: in-level frames are presented at
+~2 per second, GCM label 0x4B passes 0xD3, and the Corinth River intro shows
+its subtitles ("ISA. Attention! Attention! Prepare for Air Operations.").
+The image itself is still horizontal streaks (`docs/media/first-in-level-frame.png`):
+the in-level renderer's surfaces are not decoded right yet.
