@@ -296,3 +296,14 @@ Two runtime bugs, found with the new `KZ2_THREADS` / `R<tid>.<reg>` dumps and
 
 The main thread now reaches the renderer (`0x48238`); frames are still not
 presented after the level loads.
+
+## 18. Next stall: GCM label 75 (open)
+
+After the physics steps run, the main thread waits in `func_00048208`
+(called from `func_00530AC8` at 0x532240) for GCM label 0x4B
+(`0xE80004B0`) to reach 1; the index and value come from `obj+0x174/+0x178`
+of the renderer object. No `SET_SEMAPHORE_OFFSET 0x4B0` appears in the frame
+blocks dumped at the stall (only the 0x480 texture-read fences), so the label
+is written elsewhere -- an SPU job or another command buffer. Writers of
+`obj+0x178` include `func_0019226C` and `func_001E704C`; next step is to see
+which one ran last and what it emits.
