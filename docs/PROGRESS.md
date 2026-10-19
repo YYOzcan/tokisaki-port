@@ -350,3 +350,42 @@ hands its work to (`jm_gfx`, Edge geometry); its tickets complete, but its
 command list still holds job descriptors (`00800001 406ABC00` ...).
 
 `KZ2_THREADS` now also prints the FIFO walker position (patch 0014).
+
+## 21. The black window: two bugs in the last screen pass (patch 0015)
+
+The play window showed (almost) black while the frame was being drawn: the
+presented image peaked at 12/255. Pass dumps (`RSX_ENGINE_PASS_DUMP`) show
+the frame correct up to the final pass on the display buffer, which is
+
+1. a copy of the offscreen frame (`0x7B0000`) into the display buffer,
+2. a fullscreen screen-distortion triangle (a noise texture offsets the
+   lookups; R, G and B are fetched separately for a slight colour fringe),
+   blended at alpha 0.958, that **samples the display buffer it is drawing
+   into**, and
+3. a multiplicative overlay (`DST_COLOR * src`).
+
+**Feedback read.** The engine refused to sample a surface the draw also
+writes (undefined on every API) and fell back to guest memory, which holds
+nothing; draw 2 then wrote 0.958 x black + 0.042 x frame. The backend now
+takes a GPU copy of the target just before such a draw (`color_snapshot`,
+Vulkan: one blit, one cached image per target) and the draw samples that --
+what the RSX itself reads from memory.
+
+**AltiVec halfword multiplies.** With the feedback fixed, the distortion
+pass smeared the whole frame into a few colours: its triangle came out
+1023 screens wide. Its corners are built with integer vector maths
+(`func_00461408`: `vmulouh` + `vmsumshm` + `vslw` + `vadduwm` = `w * 2`,
+then `vcfsx`), and the lifter read and wrote the halfword/word lanes of
+`vmulouh`, `vmuleuh`, `vmsumshm`, `vmsumuhm`, `vmsummbm`, `vadduhs`,
+`vaddshs`, `vadduws`, `vsubsws`, `vsubuws`, `vsum2sws`, `vpkshss`,
+`vpkuhus`, `vpkuwus` and `vpkuwum` through host `uint16_t*`/`int32_t*`
+pointers -- but `ctx->vr` holds big-endian bytes, so every element was
+byte-swapped (`0x500 * 2` stored as `0x000A0000`, read back as 655360
+instead of 2560). They now go through big-endian lane helpers
+(`ppu_vldh8`/`ppu_vsth8`, `ppu_vldu4`/`ppu_vstu4`). This is lifted code, so
+`tools/lift.sh` has to be run again.
+
+Diagnostics added: `RSX_ENGINE_SKIP_PIPES=<h,...>` drops a pipeline's
+draws; `RSX_ENGINE_PASS_DUMP_DRAWS` lines carry each draw's fragment
+constants, its first three host vertices and transform constants
+0-7/466/467.
