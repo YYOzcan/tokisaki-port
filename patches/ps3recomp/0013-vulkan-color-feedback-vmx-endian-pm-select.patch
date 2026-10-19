@@ -1,5 +1,5 @@
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 5904a7b..980d5ab 100644
+index 5904a7b..31b32e8 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
 @@ -1690,10 +1690,35 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
@@ -38,6 +38,22 @@ index 5904a7b..980d5ab 100644
          AcquireSRWLockExclusive(&si->lock);
          u32 wid = slot->wid;
          if (si->active[wid]) si->active[wid]--;
+@@ -1735,6 +1760,15 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                 if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn))
+                     continue; /* priority zero makes this physical lane ineligible */
+                 u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
++                /* SPURS_MAXCONT="<wid>:<n>[,...]": let a workload run on more
++                 * SPUs than it asked for (experiment: Killzone 2's jm_post, the
++                 * SPU post-processing job list, is the in-level bottleneck at 1). */
++                { static int nov = -1; static u32 ov[16];
++                  if (nov < 0) { nov = 0; const char* e = getenv("SPURS_MAXCONT");
++                      while (e && *e) { char* q; unsigned w = (unsigned)strtoul(e, &q, 10);
++                          if (*q != ':') break; unsigned n = (unsigned)strtoul(q + 1, &q, 10);
++                          if (w < 16) { ov[w] = n; nov = 1; } e = (*q == ',') ? q + 1 : q; if (!*q) break; } }
++                  if (nov && maxcont && ov[wid] > maxcont) maxcont = ov[wid]; }
+                 if (!maxcont || si->active[wid] >= maxcont) continue;
+                 WklPm* pm = spurs_resolve_pm(wid);
+                 if (!pm) continue;
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 index 954072f..a5fe95b 100644
 --- a/libs/video/cellGcmSys.c

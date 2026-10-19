@@ -626,3 +626,17 @@ Level frame rate (4 cores, low priority): 1.2 -> 1.5 presented frames/s;
 jm_post 1.1 -> 0.8 ms per job. Still far from 30: the post chain runs
 single-threaded on emulated SPU code, and each job is a full policy-module
 run.
+
+## 31. jm_post on more SPUs
+
+With the faster jobs, jm_post is still busy ~60% of wall time and gates the
+frame. Two scheduling changes, set by boot_main for Killzone 2:
+- `SPURS_PM_SELECT_CURRENT=1` (KZ3 fix list R6): the WWS policy module keeps
+  running jobs instead of returning to the kernel after each one -- jm_post
+  went from ~3400 to ~270 runs per 5 s. 1.5 -> 1.65 frames/s.
+- `SPURS_MAXCONT="7:3"`: the kernel lets workload 7 (jm_post, requested max
+  contention 1) run on up to three SPUs; the WWS job manager claims jobs per
+  SPU row atomically. 1.65 -> ~1.9 frames/s, image unchanged. At 4 the
+  level stalled once; 3 ran clean twice.
+
+The Havok stall of section 29 is rarer but not gone (one run of six).
