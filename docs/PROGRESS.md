@@ -15,7 +15,8 @@ page -> **start screen -> campaign difficulty select -> campaign start -> level 
 (30-130 presented frames/s on Vulkan, section 16), and level loading gets past
 the WWS job manager: both `jm_default` and `jm_default_ast` complete their
 job tickets (section 15). The main thread then waits in level setup
-(`func_0024F0F8 -> func_004D9BD0 -> func_004EED70`, `sys_cond_wait`).
+(`func_0024F0F8 -> func_004D9BD0 -> func_004EED70`, `sys_cond_wait`): that
+is the first Havok physics step of the level (section 17).
 
 Campaign start is fully unlocked: both the stream-specific stop hang in `func_009AD268`
 and the master sound voice teardown loop in `func_009A30F0` are resolved via
@@ -245,3 +246,28 @@ The FIFO drain stops at each flip, but the frame clock presented only when
 catches up rarely shows: the menus rendered ~200 frames a second and presented
 one every few seconds. A flip the drain decoded now presents at once, checked
 after every drain, not once per clock loop.
+
+## 17. The first physics step (open)
+
+With loading past the job manager, the main thread reaches
+`TtPhysicsWorld_Update` (`func_004D9BD0`) and waits in `func_004EED70` for the
+Havok worker threads. State at the stall:
+
+- **Havok PPU Thread** (`func_00803CB8`) is inside the job queue
+  (`func_00800638`) waiting on a shared-memory semaphore (`func_00803758`:
+  low 16 bits count, high 16 bits waiters; a waiter sleeps on one of the event
+  queues 4-12, attached to SPURS ports 16-24) -- i.e. waiting for new jobs.
+- **Havok SPU tasks**: four tasks of the ELF at `0xC42A80` (our `spu_0000`,
+  taskset `HavokSpursTaskSet`) are created at the step. Each runs its init
+  (returns 1 = continue), then its job loop `0x3178` returns **2** at once and
+  the task exits through `cellSpursExit`. Delaying the task start by 2 s
+  changes nothing, so it is not a start-order race.
+- **hkSpuUtil Helper** (`func_007F6F28`) is the SPU->PPU call server, idle.
+
+So the SPU side sees the queue as finished while the PPU side waits for jobs.
+Next: identify what `0x3178` reads to decide (the job-queue header the task
+argument points to), and whether the SPU-capable jobs are ever queued.
+
+Diagnostics (patch 0011): `KZ2_DUMPAT` accepts `<sec>:T<k>+<off>:<len>`, an
+address relative to word k of the last `cellSpursCreateTask` argument;
+`SPURS_TASK_DELAY_MS` delays a task's start.

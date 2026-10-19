@@ -6,8 +6,8 @@
 
 > [!WARNING]
 > **Work in progress — this is not a playable port.**
-> The game boots, streams its data, runs its SPU jobs and walks its menus up to the start of a campaign, but it is far from playable: some menu glyphs are missing, the intro movie and campaign loading stall, and gameplay has not been reached. Status details below.
-> **Devam eden bir çalışma — oynanabilir bir port değildir.** Oyun açılıyor, verisini okuyor, SPU işlerini çalıştırıyor ve menülerinde bir kampanya başlatmaya kadar ilerliyor; ancak bazı harfler eksik, giriş videosu ve kampanya yüklemesi takılıyor ve oynanışa ulaşılmadı.
+> The game boots, streams its data, runs its SPU jobs and walks its menus up to the start of a campaign, but it is far from playable: the campaign level loads and the game loop starts, but the first Havok physics step stalls, so nothing past the loading screen is shown yet; some menu glyphs are missing and the intro movie stalls. Status details below.
+> **Devam eden bir çalışma — oynanabilir bir port değildir.** Oyun açılıyor, verisini okuyor, SPU işlerini çalıştırıyor ve menülerinde bir kampanya başlatmaya kadar ilerliyor; kampanya seviyesi yükleniyor ve oyun döngüsü başlıyor, ancak ilk Havok fizik adımı takıldığı için yükleme ekranının ötesi henüz görünmüyor; bazı harfler eksik, giriş videosu takılıyor.
 >
 > Built on [ps3recomp](https://github.com/sp00nznet/ps3recomp); the boot harness is adapted from [Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal). Developed with an AI coding agent. See [CREDITS.md](CREDITS.md).
 

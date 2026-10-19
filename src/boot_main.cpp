@@ -83,6 +83,7 @@ void cellGcm_request_tick(void);
 int  cellGcm_take_flip_pending_synced(void);
 extern volatile unsigned g_spurs_pm_cur_wid, g_spurs_pm_cur_lane;   /* spurs_policy.c */
 extern volatile unsigned long long g_spurs_pm_cur_since;
+extern volatile uint32_t g_spurs_last_task_arg[4];                   /* cellSpurs.c */
 unsigned long long ps3_ms_now(void);
 void cellGcm_rsx_process_fifo(void);
 
@@ -258,8 +259,13 @@ static void dumpat_tick(void)
     buf[sizeof buf - 1] = 0;
     int i = 0;
     for (char* tok = strtok(buf, ","); tok && i < 16; tok = strtok(nullptr, ","), i++) {
-        unsigned sec = 0, ea = 0, len = 0;
-        if (sscanf(tok, "%u:%x:%x", &sec, &ea, &len) != 3 || done[i]) continue;
+        unsigned sec = 0, ea = 0, len = 0, tk = 0, off = 0;
+        /* <sec>:T<k>+<off>:<len> dumps relative to word k of the last
+         * cellSpursCreateTask argument (heap addresses move between runs). */
+        if (sscanf(tok, "%u:T%u+%x:%x", &sec, &tk, &off, &len) == 4 && tk < 4)
+            ea = g_spurs_last_task_arg[tk] + off;
+        else if (sscanf(tok, "%u:%x:%x", &sec, &ea, &len) != 3) continue;
+        if (done[i]) continue;
         if (now_ms() - t0 < sec * 1000ull) continue;
         done[i] = true;
         fprintf(stderr, "[dumpat] t=%us 0x%08X+0x%X:", sec, ea, len);
