@@ -434,3 +434,22 @@ list R6). Off by default; no change in the menus or the loading screen yet.
 **Still open:** section 20. A shorter park grace does not help: at 50 ms the
 walker skips the parked sub-buffer and the main thread then waits on label
 0x1E; at 3 s the timer never fires because `put` keeps moving.
+
+## 23. Section 20, narrowed: the park is jm_post's to patch
+
+The parked sub-buffers are a ring of four slots (IO `0x1A4A64C`, `…84C`,
+`…A4C`, `…C4C`). For every frame the PPU writes a self-JUMP into its slot
+(`func_0038E120` from the render pass `func_0053E930`), and a **jm_post**
+job (WWS workload 7, policy module image 100, overlay 209, SPU pc `0x0425C`)
+later PUTs 4 bytes over it: a JUMP to the next word, which opens the slot.
+`SPU_DMA_RANGE` now prints the image, overlay, task, workload id and the
+word a small PUT writes (`SPU_DMA_RANGE_MAX` lifts the 64-line cap).
+
+In steady state the SPU patch for frame k lands after the PPU has parked
+frame k+1. At the stall the PPU has parked the next slot and waits for GCM
+label 0x4B (released after the slot's CALL), and jm_post's patch for the
+parked slot never comes. jm_post is not idle: its readyCount stands at 6
+and its per-SPU cursors keep changing (`01D000D9 00D8FFFF` -> `…DF` ->
+`…C9`), so it is running jobs but not reaching the patch job. Next: decode
+jm_post's command list (`00000002 <ea>` entries between the job groups look
+like guards/dependencies) and find what the patch job waits for.
