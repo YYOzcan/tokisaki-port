@@ -143,7 +143,9 @@ static void kz2_lfqueue_push_body(ppu_context* ctx)
 
     static std::atomic<unsigned> n{0};
     unsigned k = ++n;
-    if (k <= 8 || !ok || (k % 500) == 0)
+    /* KZ2_EDGE_LOG=1: every request (who filled which buffer, and when). */
+    static const bool log_all = getenv("KZ2_EDGE_LOG") != nullptr;
+    if (log_all || k <= 8 || !ok || (k % 500) == 0)
         fprintf(stderr, "[kz2] edge-zlib #%u q=0x%08X %s 0x%08X(%u) -> 0x%08X(%u) counter=0x%08X(%u) flag=0x%08X/0x%04X %s\n",
                 k, q, (counter_w & 1) ? "inflate" : "copy", src, src_size, dst, expected,
                 counter, counter ? vm_read32(counter) : 0, event_flag, bits, ok ? "ok" : "FAILED");

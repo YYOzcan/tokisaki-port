@@ -502,3 +502,23 @@ colour targets (the exposure chain renders luminance into 320x180 X32
 surfaces; they were dropped as "not supported yet"). The pass log shows, for
 every main-memory texture, its EA, first bytes and how much of its first
 4 KB is nonzero.
+
+## 26. Why the colour-grading LUT is zero: a stream window nobody filled
+
+The LUT at EA `0x23721D80` is filled by the level loader's stream reader
+(`func_00A4A99C`: copy `n` bytes from the reader's window `[cur, end)` if
+they are there, else refill through `func_0006C4D8`). A gdb breakpoint on
+that function for destinations in `0x23xxxxxx` (with `KZ2_EDGE_LOG=1`, which
+logs every Edge Zlib request) shows, in one run:
+
+    LUTCOPY n=4000 dst=2371dd80 src=43351224 end=4335e450 nz=16358
+    LUTCOPY n=4000 dst=23721d80 src=432ea90e end=432ef0a1 nz=0
+
+The copy before the LUT reads the newest window (`0x4335…`, written by the
+Edge "copy" requests just before it, `0x433354F1`, `0x433454F1`, ...); the
+LUT copy reads a window at `0x432EA90E` that the reader moved to after a
+refill, which only older rounds ever wrote (`0x432DE440`, `0x432EE440`) and
+which now holds zeros. So the stream ring and the Edge requests disagree on
+where a decompressed block lands -- most likely the HLE's reading of the
+"copy" element (destination / skip fields) for FIOS's ring is off. Other
+assets streamed the same way may be damaged too.
