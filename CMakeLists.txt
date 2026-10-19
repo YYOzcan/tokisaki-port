@@ -29,6 +29,9 @@ set(KZ2_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/recompiled" CACHE PATH
 set(KZ2_SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu_recompiled" CACHE PATH
     "spu_lifter.py output: one <image>/spu_recomp.c per SPU image")
 # -O1 keeps the compiler's memory per 150k-line chunk around 2 GB.
+# The lifted SPU jobs are the in-level bottleneck (Killzone 2's post-processing
+# runs on one SPU); -O3 lets the vector helpers vectorize and inline.
+set(KZ2_SPU_OPT "-O3" CACHE STRING "optimisation level for the lifted SPU images")
 set(KZ2_RECOMP_COMPILE_OPTIONS "-O1" CACHE STRING
     "extra compile options for the lifted PPU chunks")
 
@@ -145,7 +148,7 @@ if(KZ2_SPU_SOURCES)
     set_source_files_properties(${KZ2_SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT
-        COMPILE_OPTIONS "-w;-O2")
+        COMPILE_OPTIONS "-w;${KZ2_SPU_OPT}")
 endif()
 
 install(TARGETS killzone2 RUNTIME DESTINATION bin)

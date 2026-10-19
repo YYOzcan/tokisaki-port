@@ -1,3 +1,43 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 5904a7b..980d5ab 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1690,10 +1690,35 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+             SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
+         if (si->stopping && !slot->busy) break;
+         ReleaseSRWLockExclusive(&si->lock);
++        extern unsigned long long ps3_ms_now(void);
++        const unsigned long long t_run = ps3_ms_now();
+         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
+                               slot->data, slot->wid, slot->ea, slot->spu_num);
+         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
+         unsigned polls = g_spurs_pm_polls;
++        /* SPURS_PM_STATS=1: every 5 s, per workload: runs, busy ms, polls. */
++        { static int st = -1;
++          if (st < 0) st = getenv("SPURS_PM_STATS") ? 1 : 0;
++          if (st) {
++              static volatile unsigned long long busy[16], runs[16], pls[16], t0;
++              const unsigned w = slot->wid & 15u;
++              const unsigned long long now = ps3_ms_now();
++              __atomic_add_fetch(&busy[w], now - t_run, __ATOMIC_RELAXED);
++              __atomic_add_fetch(&runs[w], 1, __ATOMIC_RELAXED);
++              __atomic_add_fetch(&pls[w], polls, __ATOMIC_RELAXED);
++              if (!t0) t0 = now;
++              if (now - t0 >= 5000) {
++                  t0 = now;
++                  char line[512]; int n = snprintf(line, sizeof line, "[spurs-pm-stats]");
++                  for (unsigned k = 0; k < 16; k++)
++                      if (runs[k]) {
++                          n += snprintf(line + n, sizeof line - n, " w%u:%llur/%llums/%llup", k,
++                                        runs[k], busy[k], pls[k]);
++                          runs[k] = busy[k] = pls[k] = 0;
++                      }
++                  fprintf(stderr, "%s\n", line);
++              }
++          } }
+         AcquireSRWLockExclusive(&si->lock);
+         u32 wid = slot->wid;
+         if (si->active[wid]) si->active[wid]--;
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 index 954072f..a5fe95b 100644
 --- a/libs/video/cellGcmSys.c
@@ -547,10 +587,44 @@ index db9ea00..f502d5f 100644
  
  /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 49567d6..963d660 100644
+index 49567d6..538d2a7 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -2174,7 +2174,18 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -1950,6 +1950,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+ static int spu_smc_microstep(spu_context* ctx)
+ {
+     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
++    const uint32_t entry_pc = pc;
+     for (int steps = 0; steps < 4096; steps++) {
+         uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
+                      ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
+@@ -2102,6 +2103,25 @@ static int spu_smc_microstep(spu_context* ctx)
+               for (int k = 0; k < 16; k++) fprintf(stderr, " %02X", ctx->ls[0x4000 + k]);
+               fprintf(stderr, "\n");
+           } }
++        /* SPU_INTERP_ENTRY_LOG=1: every distinct (image, overlay, entry pc)
++         * that falls back to the interpreter, once -- the entries the lifter
++         * did not find, to feed back as --extra-funcs. */
++        { static int en = -1;
++          if (en < 0) en = getenv("SPU_INTERP_ENTRY_LOG") ? 1 : 0;
++          if (en) {
++              enum { N = 1024 };
++              static uint64_t seen[N]; static int nseen;
++              const uint64_t key = ((uint64_t)(uint32_t)ctx->image_id << 40) |
++                                   ((uint64_t)(uint32_t)ctx->resident_ovl << 20) | entry_pc;
++              int found = 0;
++              spu_lockline_lock();
++              for (int k = 0; k < nseen; k++) if (seen[k] == key) { found = 1; break; }
++              if (!found && nseen < N) seen[nseen++] = key;
++              spu_lockline_unlock();
++              if (!found)
++                  fprintf(stderr, "[spu-interp-entry] img=%d ovl=%d pc=0x%05X\n",
++                          ctx->image_id, ctx->resident_ovl, entry_pc);
++          } }
+         ctx->pc = pc;
+         /* Stop at the drain's return point too: it sits mid-function, so it is
+          * no lifted entry, and a job's return would otherwise run on through
+@@ -2174,7 +2194,18 @@ void spu_indirect_branch(spu_context* ctx)
              if ((n <= 4 || (n % 4096) == 0) && s_poll_logs++ < 16)
                  fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                          n, ctx->gpr[3]._u32[0]);
@@ -629,6 +703,145 @@ index 9820cc2..88441ae 100644
            /* ...and every 5 s, the bytes PUT into / GOT from the range. */
            { static volatile long long s_put, s_get; static unsigned long long s_t0;
              extern unsigned long long ps3_ms_now(void);
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 8d96768..bc85ad3 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -828,6 +828,106 @@ SPU__NV_INLINE u128 spu__nv_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t
+ SPU__NV_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__nv_fma(a, b, c, 0, 0); }            /* a*b + c */
+ SPU__NV_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__nv_fma(a, b, c, 0, 0x80000000u); }  /* a*b - c */
+ SPU__NV_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__nv_fma(a, b, c, 0x80000000u, 0); }  /* c - a*b */
++#elif defined(__AVX2__) && defined(__FMA__) && !defined(SPU_SCALAR_HELPERS)
++#include <immintrin.h>
++/* The scalar fast path above, four lanes at a time on x86-64-v3 (AVX2 + FMA):
++ * widen to double (exact), operate, mask the 29 low significand bits
++ * (truncation toward zero), narrow (exact). A lane qualifies when its
++ * operands are ordinary singles (and, for fa/fs, their exponents differ by
++ * at most 29), its result is a normal single and, for the fma forms, the
++ * double did not land on a 24-bit boundary -- the conditions of
++ * spu__fa_fast/spu__fm_fast/spu__fma_fast. Every other lane is redone by the
++ * exact per-lane path, out of line. In Killzone 2's first level the SPU
++ * post-processing jobs spent most of their time in per-lane calls here. */
++#define SPU__XV_INLINE static inline __attribute__((always_inline))
++SPU__XV_INLINE __m128i spu__xv_ld(u128 a) { __m128i v; memcpy(&v, &a, 16); return v; }
++SPU__XV_INLINE u128 spu__xv_st(__m128i v) { u128 r; memcpy(&r, &v, 16); return r; }
++SPU__XV_INLINE __m128i spu__xv_bexp(__m128i x) { return _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF)); }
++SPU__XV_INLINE __m128i spu__xv_plain(__m128i x) {          /* biased exponent 1..254 */
++    const __m128i e = spu__xv_bexp(x);
++    return _mm_and_si128(_mm_cmpgt_epi32(e, _mm_setzero_si128()), _mm_cmpgt_epi32(_mm_set1_epi32(255), e));
++}
++/* an ordinary single or a true zero (+-0.0): in double 0 + y = y, x * 0 = +-0
++ * and 0 * y + z = z exactly, which are the SPU's zero rules (exponent-0 words
++ * with a nonzero fraction are zero on the SPU but not in double: exact path) */
++SPU__XV_INLINE __m128i spu__xv_zero(__m128i x) { return _mm_cmpeq_epi32(_mm_slli_epi32(x, 1), _mm_setzero_si128()); }
++SPU__XV_INLINE __m128i spu__xv_plain0(__m128i x) { return _mm_or_si128(spu__xv_plain(x), spu__xv_zero(x)); }
++/* truncate four doubles to singles; *ok = lanes whose result is a normal single
++ * (and, with boundary, not on a 24-bit boundary) or an exact zero, which the
++ * SPU returns as +0 */
++SPU__XV_INLINE __m128i spu__xv_trunc(__m256d d, __m128i* ok, int boundary) {
++    const __m256i u = _mm256_castpd_si256(d);
++    const __m256i az = _mm256_cmpeq_epi64(_mm256_slli_epi64(u, 1), _mm256_setzero_si256());
++    const __m256i ex = _mm256_and_si256(_mm256_srli_epi64(u, 52), _mm256_set1_epi64x(0x7FF));
++    __m256i good = _mm256_and_si256(_mm256_cmpgt_epi64(ex, _mm256_set1_epi64x(1023 - 127)),
++                                    _mm256_cmpgt_epi64(_mm256_set1_epi64x(1023 + 128), ex));
++    if (boundary)
++        good = _mm256_andnot_si256(_mm256_cmpeq_epi64(_mm256_and_si256(u, _mm256_set1_epi64x(0x1FFFFFFF)),
++                                                      _mm256_setzero_si256()), good);
++    good = _mm256_or_si256(good, az);
++    *ok = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(good, _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7)));
++    /* masked, and the sign cleared where the result is zero */
++    const __m256i m = _mm256_andnot_si256(_mm256_and_si256(az, _mm256_set1_epi64x((long long)0x8000000000000000ull)),
++                                          _mm256_and_si256(u, _mm256_set1_epi64x(~0x1FFFFFFFll)));
++    return _mm_castps_si128(_mm256_cvtpd_ps(_mm256_castsi256_pd(m)));
++}
++static inline __attribute__((noinline, cold)) u128 spu__xv_fix2(__m128i r, __m128i ok, u128 a, u128 b,
++                                                                 uint32_t negb, int mul) {
++    u128 out = spu__xv_st(r), m = spu__xv_st(ok);
++    for (int i = 0; i < 4; i++)
++        if (!m._u32[i]) out._u32[i] = mul ? spu__fm_any(a._u32[i], b._u32[i])
++                                          : spu__fa_any(a._u32[i], b._u32[i] ^ negb);
++    return out;
++}
++static inline __attribute__((noinline, cold)) u128 spu__xv_fix3(__m128i r, __m128i ok, u128 a, u128 b, u128 c,
++                                                                 uint32_t negp, uint32_t negc) {
++    u128 out = spu__xv_st(r), m = spu__xv_st(ok);
++    for (int i = 0; i < 4; i++)
++        if (!m._u32[i]) out._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], negp, negc);
++    return out;
++}
++SPU__XV_INLINE u128 spu__xv_fa(u128 a, u128 b, uint32_t negb) {
++    const __m128i x = spu__xv_ld(a), y = _mm_xor_si128(spu__xv_ld(b), _mm_set1_epi32((int)negb));
++    const __m128i gap = _mm_abs_epi32(_mm_sub_epi32(spu__xv_bexp(x), spu__xv_bexp(y)));
++    /* the exponent-gap limit applies only between two nonzero terms */
++    const __m128i pre = _mm_and_si128(_mm_and_si128(spu__xv_plain0(x), spu__xv_plain0(y)),
++                                      _mm_or_si128(_mm_cmpgt_epi32(_mm_set1_epi32(30), gap),
++                                                   _mm_or_si128(spu__xv_zero(x), spu__xv_zero(y))));
++    const __m256d d = _mm256_add_pd(_mm256_cvtps_pd(_mm_castsi128_ps(x)), _mm256_cvtps_pd(_mm_castsi128_ps(y)));
++    __m128i ok;
++    const __m128i r = spu__xv_trunc(d, &ok, 0);
++    ok = _mm_and_si128(ok, pre);
++    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return spu__xv_st(r);
++    return spu__xv_fix2(r, ok, a, b, negb, 0);
++}
++SPU__XV_INLINE u128 spu__xv_fm(u128 a, u128 b) {
++    const __m128i x = spu__xv_ld(a), y = spu__xv_ld(b);
++    const __m128i pre = _mm_and_si128(spu__xv_plain0(x), spu__xv_plain0(y));
++    const __m256d d = _mm256_mul_pd(_mm256_cvtps_pd(_mm_castsi128_ps(x)), _mm256_cvtps_pd(_mm_castsi128_ps(y)));
++    __m128i ok;
++    const __m128i r = spu__xv_trunc(d, &ok, 0);
++    ok = _mm_and_si128(ok, pre);
++    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return spu__xv_st(r);
++    return spu__xv_fix2(r, ok, a, b, 0, 1);
++}
++SPU__XV_INLINE u128 spu__xv_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
++    const __m128i x = spu__xv_ld(a), y = spu__xv_ld(b), z = spu__xv_ld(c);
++    const __m128i pre = _mm_and_si128(_mm_and_si128(spu__xv_plain0(x), spu__xv_plain0(y)), spu__xv_plain0(z));
++    const __m256d p = _mm256_mul_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_xor_si128(x, _mm_set1_epi32((int)negp)))),
++                                    _mm256_cvtps_pd(_mm_castsi128_ps(y)));          /* exact */
++    const __m256d d = _mm256_add_pd(p, _mm256_cvtps_pd(_mm_castsi128_ps(_mm_xor_si128(z, _mm_set1_epi32((int)negc)))));
++    __m128i ok;
++    const __m128i r = spu__xv_trunc(d, &ok, 1);
++    ok = _mm_and_si128(ok, pre);
++    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return spu__xv_st(r);
++    return spu__xv_fix3(r, ok, a, b, c, negp, negc);
++}
++SPU__XV_INLINE u128 spu_fa(u128 a, u128 b) { return spu__xv_fa(a, b, 0); }
++SPU__XV_INLINE u128 spu_fs(u128 a, u128 b) { return spu__xv_fa(a, b, 0x80000000u); }
++SPU__XV_INLINE u128 spu_fm(u128 a, u128 b) { return spu__xv_fm(a, b); }
++SPU__XV_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__xv_fma(a, b, c, 0, 0); }
++SPU__XV_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__xv_fma(a, b, c, 0, 0x80000000u); }
++SPU__XV_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__xv_fma(a, b, c, 0x80000000u, 0); }
+ #else
+ static inline u128 spu_fa(u128 a, u128 b) { return spu__fa_s(a, b); }
+ static inline u128 spu_fs(u128 a, u128 b) { return spu__fs_s(a, b); }
+diff --git a/tools/lift_jobmods.py b/tools/lift_jobmods.py
+index d2e6b07..c5b317c 100644
+--- a/tools/lift_jobmods.py
++++ b/tools/lift_jobmods.py
+@@ -56,6 +56,15 @@ CODE_END = {
+ # actually spans the address, so modules that do not contain it are unchanged.
+ EXTRA_FUNCS = [a.strip() for a in
+                os.environ.get("LBP_JOBMOD_EXTRA_FUNCS", "").split(",") if a.strip()]
++# JOBMOD_EXTRA_FUNCS="<sha>:0x4600,0x5300;<sha2>:0x...": entries for ONE module
++# each, by the 12-hex content hash in its file name -- for jobs that branch to
++# code nothing references statically (the runtime's SPU_INTERP_ENTRY_LOG names
++# them: they otherwise run in the fallback interpreter).
++MODULE_EXTRA_FUNCS = {}
++for _part in os.environ.get("JOBMOD_EXTRA_FUNCS", "").split(";"):
++    if ":" in _part:
++        _sha, _addrs = _part.split(":", 1)
++        MODULE_EXTRA_FUNCS[_sha.strip()] = [x.strip() for x in _addrs.split(",") if x.strip()]
+ 
+ 
+ def manual_link_targets(raw, base=BASE):
+@@ -181,6 +190,7 @@ def main():
+         # ef33c6c99dc7). Seeding it is exact, not a heuristic: every module's
+         # first instruction is at +0x30.
+         inside.append(hex(BASE + 0x30))
++        inside += MODULE_EXTRA_FUNCS.get(sha, [])
+         inside += [hex(a) for a in manual_link_targets(raw)]
+         inside += [hex(a) for a in switch_table_targets(raw)]
+         if inside:
 diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
 index adfceda..c442efd 100644
 --- a/tools/ppu_lifter.py

@@ -35,5 +35,9 @@ PYEOF
 # fallback interpreter and the PM ended mid-handler: no job ever started.
 
 "${PY}" -I "${ROOT}/tools/extract_jobmods_elf.py" "${ELF}" "${OUT}/jobmods"
+# Entries the jobs reach only through computed branches, found with the
+# runtime's SPU_INTERP_ENTRY_LOG=1 (they ran in the fallback interpreter --
+# the post-processing module 9de83b69cfa0 spent most of its time there).
+export JOBMOD_EXTRA_FUNCS="${JOBMOD_EXTRA_FUNCS:-9de83b69cfa0:0x4600,0x5300,0x8808}"
 "${PY}" -I "${T}/lift_jobmods.py" --jobmods "${OUT}/jobmods" --out "${SPU}" \
     --register "${SPU}/jobmods_register.c" --symbol-prefix kz2

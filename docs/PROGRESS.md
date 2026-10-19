@@ -594,3 +594,35 @@ now take the lock-line lock whenever reservations are tracked and look the
 reservation up under it. Four runs after the change, none stalled in
 physics (three ran in the level throughout; one hit the frame-park wait of
 section 20).
+
+## 30. Where the in-level time goes, and the first speed-ups
+
+Profiling the level (eu-stack, every thread): the main thread is always in
+`func_00048208` waiting for GCM label 0x4B; the RSX side sleeps in the frame
+clock; the FIFO walker sits on the render-pass sub-buffer parks that a
+jm_post job patches (section 23); five of six SPURS workers are idle. The
+frame is gated by **jm_post**, which may only run on one SPU and works
+through ~460 jobs (the SPU post-processing chain) a frame.
+`SPURS_PM_STATS=1` prints, every 5 s per workload, policy-module runs, busy
+milliseconds and selectWorkload polls: jm_post ran ~2800 times / 3.1 s busy
+in 5 s -- one job per run.
+
+Fixes so far:
+- SPU float ops on x86-64-v3: the scalar per-lane fast path of
+  `spu_fa/fs/fm/fma/fms/fnms` now runs four lanes at once with AVX2/FMA
+  (widen to double, operate, mask 29 bits, narrow), including true-zero
+  operands and results like the NEON path; lanes outside it take the exact
+  path out of line. 4 M random vectors x 6 ops match the exact reference;
+  upstream's helper tests pass.
+- Jobs no longer fall into the SPU interpreter: `SPU_INTERP_ENTRY_LOG=1`
+  lists every (image, overlay, pc) that does; the three entries of the
+  post-processing module 9de83b69cfa0 that only computed branches reach
+  (0x4600, 0x5300, 0x8808) are lifted (`JOBMOD_EXTRA_FUNCS`, read by
+  `lift_jobmods.py`, set in `tools/lift_spu.sh`). The job modules are now
+  lifted with the v0.15 lifter.
+- Lifted SPU images build at `-O3` (`KZ2_SPU_OPT`).
+
+Level frame rate (4 cores, low priority): 1.2 -> 1.5 presented frames/s;
+jm_post 1.1 -> 0.8 ms per job. Still far from 30: the post chain runs
+single-threaded on emulated SPU code, and each job is a full policy-module
+run.
