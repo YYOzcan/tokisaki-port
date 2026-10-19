@@ -1,0 +1,16 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 506da3f..9d0590d 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2107,7 +2107,10 @@ void spu_indirect_branch(spu_context* ctx)
+             /* cellSpursModulePoll: report "no contention — keep running".
+              * (The host scheduler admits bounded workers; this service does not preempt.) */
+             unsigned n = ++g_spurs_pm_polls;
+-            if (n <= 4 || (n % 4096) == 0)
++            /* g_spurs_pm_polls restarts with every PM run, so gate the print on
++             * a process-wide count too (it fired once per audio job). */
++            static unsigned s_poll_logs = 0;
++            if ((n <= 4 || (n % 4096) == 0) && s_poll_logs++ < 16)
+                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
+                         n, ctx->gpr[3]._u32[0]);
+             ctx->gpr[3] = spu_make_preferred_u32(0);

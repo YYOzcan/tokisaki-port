@@ -20,8 +20,8 @@ Everything below comes from it, unmodified unless listed in `patches/ps3recomp/`
   the RSX command processor and the Vulkan backend;
 - the project template whose `main.cpp` our `src/boot_main.cpp` starts from.
 
-It is included as a git submodule at `external/ps3recomp`, pinned to v0.14.0
-(`a2c2010`). Clone with `git clone --recursive`, or run
+It is included as a git submodule at `external/ps3recomp`, pinned to v0.15.0
+(`39a3629`; the v0.14.0 patch series is kept in `patches/ps3recomp-v0.14/`). Clone with `git clone --recursive`, or run
 `git submodule update --init` after a plain clone.
 
 ## The Linux boot harness — Twisted Metal port
@@ -87,3 +87,14 @@ engineering log in `docs/PROGRESS.md` records what was found and changed, and
 why.
 
 The verbatim MIT license texts are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Killzone 3 port fix list — undecuple
+
+The Killzone 3 port's write-up of general ps3recomp fixes
+([gist](https://gist.github.com/undecuple/2845432bf13e485634de122084d3fd56),
+[ps3recomp #214](https://github.com/sp00nznet/ps3recomp/issues/214)), offered
+under ps3recomp's MIT license. Most of it reached us through upstream v0.15.0
+(VMX lane order, TLS, GCM IO table, depth textures, texture gamma, the WWS
+policy-module argument). From the part not yet upstream we implemented, from
+its description and not its code, R6 (the policy module's `selectWorkload`
+answers the running workload; opt-in `SPURS_PM_SELECT_CURRENT=1`).

@@ -1,0 +1,323 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 0bc73dd..43e3504 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1370,7 +1370,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+         if (t.enabled) gamma_masks[u] = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
+     }
+-    const u32 gamma_units = fixed ? 0 : rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
++    /* RSX_TEX_GAMMA_OFF=1: sample textures without their sRGB decode (A/B). */
++    static int s_gamma_off = -1;
++    if (s_gamma_off < 0) s_gamma_off = getenv("RSX_TEX_GAMMA_OFF") ? 1 : 0;
++    const u32 gamma_units = (fixed || s_gamma_off) ? 0
++                          : rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
+     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
+         if (!(gamma_units & (1u << u))) gamma_masks[u] = 0;
+ 
+@@ -1485,10 +1489,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+         }
+     }
+     { static u32 logs = 0; if (logs++ < 32)
+-        fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
+-                        " %u constants -> %s\n",
+-                (unsigned long long)key, fixed ? "built-in" : "guest",
+-                vi, fi, nconst, handle ? "ok" : "FAILED (draw dropped)"); }
++        fprintf(stderr, "[rsx engine] pipeline %016llx (h%u): %s vp %d, fp %d,"
++                        " %u constants, srgb-out %u, gamma units %X (packer %X) -> %s\n",
++                (unsigned long long)key, handle, fixed ? "built-in" : "guest",
++                vi, fi, nconst, srgb_output, gamma_units, rsx_dsp_reg(&g.rsx, 0x1FECu),
++                handle ? "ok" : "FAILED (draw dropped)"); }
+ 
+     g.pipelines[g.n_pipelines].key = key;
+     g.pipelines[g.n_pipelines].handle = handle;
+@@ -2183,6 +2188,13 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+             fprintf(s_pd.draws_log, " t%u %u:0x%08X f%02X %ux%u", u, t.location, t.offset,
+                     t.format & 0xFFu, t.width, t.height);
+         }
++        if (g.fp_constants.count) {
++            fprintf(s_pd.draws_log, " | fpc");
++            for (u32 c = 0; c < g.fp_constants.count; c++) {
++                const float* v = (const float*)g.fp_constants.values[c];
++                fprintf(s_pd.draws_log, " %u(%g %g %g %g)", c, v[0], v[1], v[2], v[3]);
++            }
++        }
+         fprintf(s_pd.draws_log, "\n");
+     }
+     if (s_pd.draws++) return;
+@@ -2384,6 +2396,23 @@ static void sink_end(void* user, const rsx_dispatch* r)
+ 
+     pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
+ 
++    /* RSX_ENGINE_SKIP_PIPES=<h>[,<h>...]: drop the draws of those pipeline
++     * handles (diagnostic: which pass of a frame makes it come out wrong). */
++    {
++        static int init;
++        static u32 skip[16], nskip;
++        if (!init) {
++            init = 1;
++            const char* e = getenv("RSX_ENGINE_SKIP_PIPES");
++            while (e && *e && nskip < 16) {
++                skip[nskip++] = (u32)strtoul(e, (char**)&e, 0);
++                if (*e == ',') e++; else break;
++            }
++        }
++        for (u32 i = 0; i < nskip; i++)
++            if (skip[i] == pipeline) return;
++    }
++
+     /* The depth attachment is cleared the first time it is bound, so a title
+      * that never clears its shadow zeta still tests against something. */
+     const u32 depth_handle = (zslot != ENG_INVALID) ? g.zdepths[zslot].handle : 0;
+@@ -2443,6 +2472,23 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     }
+ 
+     const u32 uploaded = indexed ? dc.n_verts : n_draw;
++    /* RSX_ENGINE_PASS_DUMP_DRAWS: the first host vertices, as floats */
++    if (s_pd.state == 2 && s_pd.draws_log && dc.verts && layout.stride) {
++        const float* fv = (const float*)dc.verts;
++        const u32 nf = layout.stride / 4u;
++        for (u32 k = 0; k < uploaded && k < 3; k++) {
++            fprintf(s_pd.draws_log, "    vtx %u:", k);
++            for (u32 j = 0; j < nf && j < 24; j++) fprintf(s_pd.draws_log, " %g", fv[k * nf + j]);
++            fprintf(s_pd.draws_log, "\n");
++        }
++        static const u32 vc[] = { 0, 1, 2, 3, 4, 5, 6, 7, 466, 467 };
++        fprintf(s_pd.draws_log, "    vpc:");
++        for (u32 k = 0; k < sizeof vc / sizeof vc[0]; k++) {
++            const float* c = (const float*)g.rsx.constants[vc[k]];
++            fprintf(s_pd.draws_log, " %u(%g %g %g %g)", vc[k], c[0], c[1], c[2], c[3]);
++        }
++        fprintf(s_pd.draws_log, "\n");
++    }
+     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+                indexed ? g.indices : NULL, indexed ? n_draw : 0);
+     /* Counted only when the draw ran the guest's OWN programs, which is what
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index da30ca6..8424275 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -1943,6 +1943,7 @@ typedef struct vk_eng_obj {
+     u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
+     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
+     u8       cube;                   /* TEXTURE: six layers, a CUBE view    */
++    u8       snapshot;               /* COLOR: a feedback copy, not a target */
+ } vk_eng_obj;
+ 
+ static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
+@@ -2104,7 +2105,8 @@ static void vk_eng_release(void* user, u32 handle)
+         s_eobj[handle].surface = 0;
+         if (vk_eng_get(snap, VK_ENG_TEXTURE)) vk_eng_release(user, snap);
+     }
+-    if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
++    if ((s_eobj[handle].kind == VK_ENG_COLOR && !s_eobj[handle].snapshot) ||
++        s_eobj[handle].kind == VK_ENG_DEPTH)
+         vk_eng_drop_framebuffers();
+     vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
+     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
+@@ -2381,6 +2383,45 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
+     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
+     return hd;
+ }
++
++/* Same-target colour feedback (rsx_draw_backend.color_snapshot): a draw that
++ * samples the target it writes -- Killzone 2's last screen pass distorts the
++ * display buffer it is drawing into -- reads a copy of the target taken now,
++ * which is what the RSX reads from memory. Each call returns a fresh copy
++ * (all submissions are synchronous, so the blit already follows every earlier
++ * write); the engine releases it. It is a COLOR object so surface_view can
++ * give it the unit's crossbar, flagged so releasing it keeps the framebuffers. */
++static u32 vk_eng_color_snapshot(void* user, u32 surface)
++{
++    (void)user;
++    vk_eng_obj* c = vk_eng_get(surface, VK_ENG_COLOR);
++    if (!c) return 0;
++    const u32 snap = vk_eng_alloc();
++    if (!snap) return 0;
++    c = vk_eng_get(surface, VK_ENG_COLOR);
++    vk_eng_obj* t = &s_eobj[snap];
++    if (vk_create_image(&t->im, c->fmt, c->w, c->h,
++                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++                        VK_IMAGE_ASPECT_COLOR_BIT)) {
++        vk_destroy_image(&t->im); memset(t, 0, sizeof *t); return 0;
++    }
++    t->kind = VK_ENG_COLOR; t->fmt = c->fmt; t->bpp = c->bpp; t->w = c->w; t->h = c->h;
++    t->snapshot = 1;
++    if (vk_begin()) return 0;
++    vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
++    vk_barrier_image(c->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
++    VkImageBlit blit = {
++        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .srcOffsets = { { 0, 0, 0 }, { (int32_t)c->w, (int32_t)c->h, 1 } },
++        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .dstOffsets = { { 0, 0, 0 }, { (int32_t)c->w, (int32_t)c->h, 1 } },
++    };
++    pvkCmdBlitImage(s_vk.cmd, c->im.img, VK_IMAGE_LAYOUT_GENERAL,
++                    t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
++    if (vk_submit_and_wait()) { vk_eng_release(user, snap); return 0; }
++    return snap;
++}
+ /* ---- E4: depth snapshots --------------------------------------------------
+  * A depth target read as a texture, which the engine asks for only after a
+  * depth-writing draw. Metal resolves it with a fullscreen pass into R32Float;
+@@ -3227,6 +3268,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
+     .depth_target_create  = vk_eng_depth_target_create,
+     .depth_target_release = vk_eng_release,
+     .depth_snapshot       = vk_eng_depth_snapshot,
++    .color_snapshot       = vk_eng_color_snapshot,
+     .pipeline_create      = vk_eng_pipeline_create,
+     .pipeline_release     = vk_eng_pipeline_release,
+     .bind_targets         = vk_eng_bind_targets,
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 49567d6..963d660 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2174,7 +2174,18 @@ void spu_indirect_branch(spu_context* ctx)
+             if ((n <= 4 || (n % 4096) == 0) && s_poll_logs++ < 16)
+                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
+                         n, ctx->gpr[3]._u32[0]);
+-            ctx->gpr[3] = spu_make_preferred_u32(0);
++            /* SPURS_PM_SELECT_CURRENT=1: answer the workload that is running
++             * (SpursKernelContext.wklCurrentId, be32 at LS 0x1DC). A policy
++             * module that compares the answer with its own id -- the WWS job
++             * managers do -- treats 0 as "switch away" and exits after every
++             * job when it is not workload 0 (Killzone 3 fix list, R6). */
++            static int s_cur = -1;
++            if (s_cur < 0) s_cur = getenv("SPURS_PM_SELECT_CURRENT") ? 1 : 0;
++            uint32_t ans = 0;
++            if (s_cur)
++                ans = ((uint32_t)ctx->ls[0x1DC] << 24) | ((uint32_t)ctx->ls[0x1DD] << 16) |
++                      ((uint32_t)ctx->ls[0x1DE] << 8)  |  (uint32_t)ctx->ls[0x1DF];
++            ctx->gpr[3] = spu_make_preferred_u32(ans);
+             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+             return;
+         }
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index adfceda..c442efd 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -405,6 +405,15 @@ static inline void ppu_vstu4(void* v, const uint32_t in[4]) {
+     uint8_t* p = (uint8_t*)v;
+     for (int i = 0; i < 4; i++) { uint32_t b = ppu_vbswap32(in[i]); memcpy(p + i*4, &b, 4); }
+ }
++/* Halfword lanes of a big-endian vector register (lane i = bytes 2i, 2i+1). */
++static inline void ppu_vldh8(const void* v, uint16_t o[8]) {
++    const uint8_t* p = (const uint8_t*)v;
++    for (int i = 0; i < 8; i++) o[i] = (uint16_t)((p[i*2] << 8) | p[i*2 + 1]);
++}
++static inline void ppu_vsth8(void* v, const uint16_t in[8]) {
++    uint8_t* p = (uint8_t*)v;
++    for (int i = 0; i < 8; i++) { p[i*2] = (uint8_t)(in[i] >> 8); p[i*2 + 1] = (uint8_t)in[i]; }
++}
+ 
+ /* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
+  * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
+@@ -3325,16 +3334,16 @@ class PPULifter:
+                     f"for(int i=0;i<16;i++){{int32_t r=(int32_t)a[i]+(int32_t)b[i]; d[i]=(int8_t)(r>127?127:r<-128?-128:r);}} }}")
+         if mn == "vaddshs":
+             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+-            return (f"{{ int16_t* d=(int16_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
+-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
+-                    f"for(int i=0;i<8;i++){{int32_t r=(int32_t)a[i]+(int32_t)b[i]; d[i]=(int16_t)(r>32767?32767:r<-32768?-32768:r);}} }}")
++            return (f"{{ uint16_t a[8],b[8],d[8]; ppu_vldh8(&ctx->vr[{va}],a); ppu_vldh8(&ctx->vr[{vb}],b); "
++                    f"for(int i=0;i<8;i++){{int32_t r=(int32_t)(int16_t)a[i]+(int32_t)(int16_t)b[i]; d[i]=(uint16_t)(int16_t)(r>32767?32767:r<-32768?-32768:r);}} "
++                    f"ppu_vsth8(&ctx->vr[{vd}],d); }}")
+ 
+         # Subtract saturate
+         if mn == "vsubsws":
+             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+-            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int32_t* a=(int32_t*)&ctx->vr[{va}]; "
+-                    f"int32_t* b=(int32_t*)&ctx->vr[{vb}]; "
+-                    f"for(int i=0;i<4;i++){{int64_t r=(int64_t)a[i]-(int64_t)b[i]; d[i]=(int32_t)(r>0x7FFFFFFFLL?0x7FFFFFFFLL:r<-0x80000000LL?-0x80000000LL:r);}} }}")
++            return (f"{{ uint32_t a[4],b[4],d[4]; ppu_vldu4(&ctx->vr[{va}],a); ppu_vldu4(&ctx->vr[{vb}],b); "
++                    f"for(int i=0;i<4;i++){{int64_t r=(int64_t)(int32_t)a[i]-(int64_t)(int32_t)b[i]; d[i]=(uint32_t)(int32_t)(r>0x7FFFFFFFLL?0x7FFFFFFFLL:r<-0x80000000LL?-0x80000000LL:r);}} "
++                    f"ppu_vstu4(&ctx->vr[{vd}],d); }}")
+ 
+         if mn == "vsububs":  # subtract unsigned byte, saturate to [0,255]
+             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+@@ -3348,12 +3357,12 @@ class PPULifter:
+             # (word index = BE element, matching the VMX handlers above.) temp
+             # buffer so vD may alias vA/vB.
+             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+-            return (f"{{ int32_t* a=(int32_t*)&ctx->vr[{va}]; int32_t* b=(int32_t*)&ctx->vr[{vb}]; "
+-                    f"int64_t s0=(int64_t)a[0]+a[1]+b[1]; int64_t s1=(int64_t)a[2]+a[3]+b[3]; "
+-                    f"int32_t r[4]={{0,0,0,0}}; "
+-                    f"r[1]=(int32_t)(s0>0x7FFFFFFFLL?0x7FFFFFFFLL:s0<-0x80000000LL?-0x80000000LL:s0); "
+-                    f"r[3]=(int32_t)(s1>0x7FFFFFFFLL?0x7FFFFFFFLL:s1<-0x80000000LL?-0x80000000LL:s1); "
+-                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
++            return (f"{{ uint32_t a[4],b[4]; ppu_vldu4(&ctx->vr[{va}],a); ppu_vldu4(&ctx->vr[{vb}],b); "
++                    f"int64_t s0=(int64_t)(int32_t)a[0]+(int32_t)a[1]+(int32_t)b[1]; int64_t s1=(int64_t)(int32_t)a[2]+(int32_t)a[3]+(int32_t)b[3]; "
++                    f"uint32_t r[4]={{0,0,0,0}}; "
++                    f"r[1]=(uint32_t)(int32_t)(s0>0x7FFFFFFFLL?0x7FFFFFFFLL:s0<-0x80000000LL?-0x80000000LL:s0); "
++                    f"r[3]=(uint32_t)(int32_t)(s1>0x7FFFFFFFLL?0x7FFFFFFFLL:s1<-0x80000000LL?-0x80000000LL:s1); "
++                    f"ppu_vstu4(&ctx->vr[{vd}], r); }}")
+ 
+             # The vector register file holds BIG-ENDIAN data. Reading it through
+             # a host int16_t*/int32_t* and writing the result back the same way
+@@ -3448,10 +3457,8 @@ class PPULifter:
+         # Integer multiply (odd/even halfword)
+         if mn == "vmuleuh":
+             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
+-                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
+-                    f"d[0]=(uint32_t)a[0]*(uint32_t)b[0]; d[1]=(uint32_t)a[2]*(uint32_t)b[2]; "
+-                    f"d[2]=(uint32_t)a[4]*(uint32_t)b[4]; d[3]=(uint32_t)a[6]*(uint32_t)b[6]; }}")
++            return (f"{{ uint16_t a[8],b[8]; uint32_t d[4]; ppu_vldh8(&ctx->vr[{va}],a); ppu_vldh8(&ctx->vr[{vb}],b); "
++                    f"for(int i=0;i<4;i++) d[i]=(uint32_t)a[i*2]*(uint32_t)b[i*2]; ppu_vstu4(&ctx->vr[{vd}],d); }}")
+         # vmsumshs / vsumsws -- the two instructions an IDCT is actually built
+         # from, and both were emitted as "/* TODO */" no-ops. 32 sites, ALL of
+         # them inside ps1_netemu's MDEC decode function (func_000E90B4), so the
+@@ -3546,10 +3553,10 @@ class PPULifter:
+         # Pack signed halfword signed saturate
+         if mn == "vpkshss":
+             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+-            return (f"{{ int8_t* d=(int8_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
+-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
+-                    f"for(int i=0;i<8;i++){{int32_t v=a[i]; d[i]=(int8_t)(v>127?127:v<-128?-128:v);}} "
+-                    f"for(int i=0;i<8;i++){{int32_t v=b[i]; d[8+i]=(int8_t)(v>127?127:v<-128?-128:v);}} }}")
++            return (f"{{ uint16_t a[8],b[8]; int8_t d[16]; ppu_vldh8(&ctx->vr[{va}],a); ppu_vldh8(&ctx->vr[{vb}],b); "
++                    f"for(int i=0;i<8;i++){{int32_t v=(int16_t)a[i]; d[i]=(int8_t)(v>127?127:v<-128?-128:v);}} "
++                    f"for(int i=0;i<8;i++){{int32_t v=(int16_t)b[i]; d[8+i]=(int8_t)(v>127?127:v<-128?-128:v);}} "
++                    f"memcpy(&ctx->vr[{vd}], d, 16); }}")
+ 
+         # Pack unsigned halfword -> unsigned byte, saturating (vpkuhus).
+         # The saturating packs are the back half of a colour-conversion kernel:
+@@ -3559,26 +3566,27 @@ class PPULifter:
+         # destination register kept whatever it held.
+         if mn == "vpkuhus":
+             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+-            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
+-                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
++            return (f"{{ uint16_t a[8],b[8]; uint8_t d[16]; ppu_vldh8(&ctx->vr[{va}],a); ppu_vldh8(&ctx->vr[{vb}],b); "
+                     f"for(int i=0;i<8;i++){{uint32_t v=a[i]; d[i]=(uint8_t)(v>255u?255u:v);}} "
+-                    f"for(int i=0;i<8;i++){{uint32_t v=b[i]; d[8+i]=(uint8_t)(v>255u?255u:v);}} }}")
++                    f"for(int i=0;i<8;i++){{uint32_t v=b[i]; d[8+i]=(uint8_t)(v>255u?255u:v);}} "
++                    f"memcpy(&ctx->vr[{vd}], d, 16); }}")
+ 
+         # Pack unsigned word -> unsigned halfword, saturating (vpkuwus)
+         if mn == "vpkuwus":
+             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+-            return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
+-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
++            return (f"{{ uint32_t a[4],b[4]; uint16_t d[8]; ppu_vldu4(&ctx->vr[{va}],a); ppu_vldu4(&ctx->vr[{vb}],b); "
+                     f"for(int i=0;i<4;i++){{uint32_t v=a[i]; d[i]=(uint16_t)(v>65535u?65535u:v);}} "
+-                    f"for(int i=0;i<4;i++){{uint32_t v=b[i]; d[4+i]=(uint16_t)(v>65535u?65535u:v);}} }}")
++                    f"for(int i=0;i<4;i++){{uint32_t v=b[i]; d[4+i]=(uint16_t)(v>65535u?65535u:v);}} "
++                    f"ppu_vsth8(&ctx->vr[{vd}], d); }}")
+ 
+         # vmsummbm (VA-form, 4 operands)
+         if mn == "vmsummbm":
+             vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:]); vc = int(ops[3][1:])
+-            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int8_t* a=(int8_t*)&ctx->vr[{va}]; "
+-                    f"uint8_t* ub=(uint8_t*)&ctx->vr[{vb}]; int32_t* cc=(int32_t*)&ctx->vr[{vc}]; "
+-                    f"for(int i=0;i<4;i++) d[i]=(int32_t)a[4*i]*(int32_t)ub[4*i]+(int32_t)a[4*i+1]*(int32_t)ub[4*i+1]"
+-                    f"+(int32_t)a[4*i+2]*(int32_t)ub[4*i+2]+(int32_t)a[4*i+3]*(int32_t)ub[4*i+3]+cc[i]; }}")
++            return (f"{{ const int8_t* a=(const int8_t*)&ctx->vr[{va}]; const uint8_t* ub=(const uint8_t*)&ctx->vr[{vb}]; "
++                    f"uint32_t cc[4],d[4]; ppu_vldu4(&ctx->vr[{vc}],cc); "
++                    f"for(int i=0;i<4;i++) d[i]=(uint32_t)((int32_t)a[4*i]*(int32_t)ub[4*i]+(int32_t)a[4*i+1]*(int32_t)ub[4*i+1]"
++                    f"+(int32_t)a[4*i+2]*(int32_t)ub[4*i+2]+(int32_t)a[4*i+3]*(int32_t)ub[4*i+3]+(int32_t)cc[i]); "
++                    f"ppu_vstu4(&ctx->vr[{vd}],d); }}")
+ 
+         # Load/store string word immediate. Killzone 2's compiler inlines short
+         # fixed-size copies as `lswi r5,rA,15; stswi r5,rB,15` -- the URL

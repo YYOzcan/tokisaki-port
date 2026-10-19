@@ -1,0 +1,108 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index da009b4..b1f3a16 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1766,15 +1766,27 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                    * waited on that label for the rest of the run. Give the
+                    * patch time to arrive, and resync only for a park that
+                    * has stood with the same put for longer than any title
+-                   * takes between the two stores. */
++                   * takes between the two stores.
++                   *
++                   * GCM_PARK_GRACE_MS=<ms> overrides that time. Killzone 2
++                   * parks MID-FRAME (+0x2DC of each ring block) while the rest
++                   * of the frame is assembled and patches the park far later
++                   * than 50 ms when a frame is slow; resyncing skipped the
++                   * remainder and its end-of-frame label. The real RSX spins
++                   * on the park until it is patched. */
+                   if (put != s_fifo_getoff) {
+                       extern unsigned long long ps3_ms_now(void);
+                       static u32 park_off, park_put;
+-                      static unsigned long long park_since;
++                      static unsigned long long park_since, grace_ms;
++                      if (!grace_ms) {
++                          const char* e = getenv("GCM_PARK_GRACE_MS");
++                          grace_ms = (e && atoll(e) > 0) ? (unsigned long long)atoll(e)
++                                                         : GCM_PARK_GRACE_MS;
++                      }
+                       const unsigned long long now = ps3_ms_now();
+                       if (park_off != s_fifo_getoff || park_put != put) {
+                           park_off = s_fifo_getoff; park_put = put; park_since = now;
+-                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
++                      } else if (now - park_since >= grace_ms) {
+                           park_off = 0;
+                           gcm_fifo_dump_around(s_fifo_getoff);
+                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index d8506de..aec0497 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -368,6 +368,17 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+         { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
+         return 0;
+       }
++      /* NV4097_TEXTURE_READ_SEMAPHORE_RELEASE (cellGcmSetWriteTextureLabel):
++       * the same label write, released once texture reads before it are
++       * done, and WITHOUT the back-end path's byte 0<->2 swap. Killzone 2
++       * fences its streaming VRAM ring with it (label 0x48); dropping it
++       * froze the label and the allocator waited forever for free blocks. */
++      if (method == 0x1D74) {
++        extern void vm_write32(uint32_t a, uint32_t v);
++        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
++        { static int _l=0; if(_l++<4) fprintf(stderr,"[RSX] texture-read label write @0x%08X = 0x%08X\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), data); }
++        return 0;
++      }
+       if (method == 0x1D74) {
+         extern void vm_write32(uint32_t a, uint32_t v);
+         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index d4a93cd..adfceda 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -3580,6 +3580,46 @@ class PPULifter:
+                     f"for(int i=0;i<4;i++) d[i]=(int32_t)a[4*i]*(int32_t)ub[4*i]+(int32_t)a[4*i+1]*(int32_t)ub[4*i+1]"
+                     f"+(int32_t)a[4*i+2]*(int32_t)ub[4*i+2]+(int32_t)a[4*i+3]*(int32_t)ub[4*i+3]+cc[i]; }}")
+ 
++        # Load/store string word immediate. Killzone 2's compiler inlines short
++        # fixed-size copies as `lswi r5,rA,15; stswi r5,rB,15` -- the URL
++        # parser copies the scheme this way, so emitting these as TODO left
++        # every parsed scheme empty. Bytes fill registers from rD upward, four
++        # per register, most significant byte first in the low word (the high
++        # word is cleared), wrapping from r31 to r0; NB = 0 means 32.
++        if mn in ("lswi", "stswi"):
++            rt, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
++            nb = int(ops[2], 0) or 32
++            ea = "0" if ra == 0 else f"(uint32_t)ctx->gpr[{ra}]"
++            if mn == "lswi":
++                return (f"{{ uint32_t ea = {ea}; int r = {rt} - 1; "
++                        f"for (int i = 0; i < {nb}; i++) {{ "
++                        f"if ((i & 3) == 0) {{ r = (r + 1) & 31; ctx->gpr[r] = 0; }} "
++                        f"ctx->gpr[r] |= (uint64_t)vm_read8(ea + i) << (24 - 8 * (i & 3)); }} }}")
++            return (f"{{ uint32_t ea = {ea}; int r = {rt} - 1; "
++                    f"for (int i = 0; i < {nb}; i++) {{ "
++                    f"if ((i & 3) == 0) r = (r + 1) & 31; "
++                    f"vm_write8(ea + i, (uint8_t)(ctx->gpr[r] >> (24 - 8 * (i & 3)))); }} }}")
++
++        # VMX unsigned forms the integer handlers above do not cover; lane
++        # indexing follows the neighbouring signed/halfword handlers.
++        if mn == "vmsumuhm":
++            vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:]); vc = int(ops[3][1:])
++            return (f"{{ uint16_t* a=(uint16_t*)&ctx->vr[{va}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
++                    f"uint32_t* c=(uint32_t*)&ctx->vr[{vc}]; uint32_t r[4]; "
++                    f"for(int i=0;i<4;i++) r[i]=c[i]+(uint32_t)a[i*2]*(uint32_t)b[i*2]+(uint32_t)a[i*2+1]*(uint32_t)b[i*2+1]; "
++                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
++        if mn == "vsubuws":
++            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
++            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
++                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; uint32_t r[4]; "
++                    f"for(int i=0;i<4;i++) r[i]=a[i]>b[i]?a[i]-b[i]:0u; memcpy(d, r, 16); }}")
++        if mn in ("vmuloub", "vmuleub"):
++            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
++            k = 1 if mn == "vmuloub" else 0
++            return (f"{{ uint8_t* a=(uint8_t*)&ctx->vr[{va}]; uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
++                    f"uint16_t r[8]; for(int i=0;i<8;i++) r[i]=(uint16_t)a[2*i+{k}]*(uint16_t)b[2*i+{k}]; "
++                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
++
+         # Merge high halfword / low halfword (vmrghh, vmrglh — already in vmrg* handler above)
+ 
+         # ------- Default: emit as comment -------

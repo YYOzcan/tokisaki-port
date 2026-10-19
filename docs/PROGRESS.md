@@ -389,3 +389,48 @@ Diagnostics added: `RSX_ENGINE_SKIP_PIPES=<h,...>` drops a pipeline's
 draws; `RSX_ENGINE_PASS_DUMP_DRAWS` lines carry each draw's fragment
 constants, its first three host vertices and transform constants
 0-7/466/467.
+
+## 22. On ps3recomp v0.15.0
+
+The submodule moved from v0.14.0 to v0.15.0 (`39a3629`), which carries 33
+fixes from the Killzone 3 port and many from other titles. Our 15 patches
+were rebased onto it as 13 (`patches/ps3recomp/`; the old series is in
+`patches/ps3recomp-v0.14/`):
+
+- Already upstream, dropped: the `sys_lwcond_t` layout, `lwax` jump tables,
+  most of the carry-form callee-save analysis, the per-job log caps, the WWS
+  policy-module r4 layout (#309/#310), the extra SPU interpreter ops, half
+  of the VMX lane-order fixes (P1).
+- Merged: the park grace -- upstream now waits 50 ms when `put` stands still
+  (inFAMOUS 2); `GCM_PARK_GRACE_MS` overrides it and boot_main keeps 600 s.
+  Same-target colour feedback -- upstream added the engine side and a Metal
+  backend; our Vulkan snapshot now implements upstream's contract (a fresh
+  copy per draw, released by the engine). The taskset argument goes through
+  upstream's host-layout `CellSpursTasksetAttribute`.
+- Kept ours: MachStat answers 1 (upstream answers the interrupt-enable bit,
+  which stalls jm_default, section 15), eight VMX ops upstream still reads
+  through host pointers (`vaddshs`, `vsubsws`, `vsum2sws`, `vmuleuh`,
+  `vpkshss`, `vpkuhus`, `vpkuwus`, `vmsummbm`), the taskset start ordering,
+  diagnostics.
+- SPURS lane rotation (section 19's experiment) is gone with the old kernel.
+
+Results with a fresh lift: every menu glyph renders (`docs/media/main-menu-v015.png`);
+the title screen runs at 70+ presented frames/s; the campaign reaches the
+Corinth River loading screen as before.
+
+**Texture gamma.** v0.15.0 decodes sRGB-flagged textures (TEXTURE_ADDRESS
+bits 20-23) and encodes output when NV4097_SET_SHADER_PACKER is set. The menu
+sky shader decodes and does not encode, so the menus are darker than on
+v0.14 (offscreen mean 69 vs 149). That is the hardware model upstream
+verified on Killzone 3; `RSX_TEX_GAMMA_OFF=1` restores the old look for
+comparison until a reference capture settles it. Pipeline log lines now
+show `srgb-out`, `gamma units` and the packer value.
+
+**R6 (`SPURS_PM_SELECT_CURRENT=1`).** The policy-module poll answers the
+running workload instead of 0, so a job manager that is not workload 0 keeps
+its SPU instead of returning to the kernel after every job (Killzone 3 fix
+list R6). Off by default; no change in the menus or the loading screen yet.
+
+**Still open:** section 20. A shorter park grace does not help: at 50 ms the
+walker skips the parked sub-buffer and the main thread then waits on label
+0x1E; at 3 s the timer never fires because `put` keeps moving.

@@ -1,0 +1,14 @@
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index 1b7c4d1..6653384 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -38,6 +38,9 @@ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+ SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
+ SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
+ SPU_THREAD_LOCAL volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
++/* What the kernel is running right now, for a stall report (boot_main KZ2_FPS). */
++volatile unsigned g_spurs_pm_cur_wid = 0xFFFFFFFFu, g_spurs_pm_cur_lane = 0;
++volatile unsigned long long g_spurs_pm_cur_since = 0;
+ 
+ /* Contexts are resident per (instance, workload, physical SPU). Workload IDs
+  * from different instances must never share local store or pipeline state.

@@ -1,0 +1,98 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 9d0590d..82b8588 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -995,6 +995,13 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+ /* ===========================================================================
+  * Channel read (returns value in the preferred word slot)
+  * ===========================================================================*/
++/* A big-endian instruction word from local store. */
++static inline uint32_t spu_ls_read32_be(const spu_context* ctx, uint32_t a)
++{
++    const uint8_t* p = ctx->ls + (a & SPU_LS_MASK & ~3u);
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++
+ u128 spu_rdch(spu_context* ctx, uint32_t channel)
+ {
+     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
+@@ -1073,9 +1080,45 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
+     }
+     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
+     case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status; break;
+-    /* CBEA 9.8: numeric bit 0 is interrupt-enable, independent of run status.
+-     * This runtime models nonisolated SPUs, so the isolation bit stays clear. */
+-    case SPU_RdMachStat:    v = ctx->int_enable & 1u; break;
++    /* Bit 0 is the interrupt-enable state, bit 1 isolation (CBEA; RPCS3
++     * returns the same). The runtime answers "running", which is right for
++     * every read but the assertions below. */
++    case SPU_RdMachStat:
++        v = (ctx->status == SPU_STATUS_RUNNING) ? 1u : 0u;
++        /* An interrupts-on ASSERTION sees the real state: `rdch rT,MachStat;
++         * andi rX,rT,1; brz rX,<stop|stopd>`. Answering it 1 fixes
++         * Killzone 2's jm_default_ast job (module 15e56deeec92 at LS 0x68D0).
++         * Code that SAVES the state to restore it after a `bid` keeps the old
++         * answer: telling jm_default's module 6ac243f6bbc4 the truth makes it
++         * re-enable interrupts mid-job, and the policy module's stall-notify
++         * handler taken there never lets the job finish (runtime limitation,
++         * see docs/PROGRESS.md). SPU_MACHSTAT_IE=1 answers every read from
++         * int_enable. */
++        if (!v) {
++            static int ie = -1;
++            if (ie < 0) ie = getenv("SPU_MACHSTAT_IE") ? 1 : 0;
++            if (ie) { v = ctx->int_enable ? 1u : 0u; break; }
++            const uint32_t base = (uint32_t)ctx->pc & SPU_LS_MASK & ~3u;
++            for (uint32_t o = 0; o <= 8; o += 4) {
++                const uint32_t a = (base + o) & SPU_LS_MASK;
++                const uint32_t w = spu_ls_read32_be(ctx, a);
++                if ((w >> 21) != 0x00D || ((w >> 7) & 0x7F) != SPU_RdMachStat) continue;
++                const uint32_t rt = w & 0x7F;
++                const uint32_t w1 = spu_ls_read32_be(ctx, (a + 4) & SPU_LS_MASK);
++                const uint32_t w2 = spu_ls_read32_be(ctx, (a + 8) & SPU_LS_MASK);
++                /* andi rX,rT,1 */
++                if ((w1 >> 24) != 0x14 || ((w1 >> 14) & 0x3FF) != 1 || ((w1 >> 7) & 0x7F) != rt) break;
++                /* brz rX,i16 */
++                if ((w2 >> 23) != 0x040 || (w2 & 0x7F) != (w1 & 0x7F)) break;
++                const int32_t i16 = (int16_t)((w2 >> 7) & 0xFFFF);
++                const uint32_t tgt = (uint32_t)((int32_t)(a + 8) + i16 * 4) & SPU_LS_MASK;
++                const uint32_t op11 = spu_ls_read32_be(ctx, tgt) >> 21;
++                if (op11 == 0x000 || op11 == 0x140)                   /* stop / stopd */
++                    v = 1;
++                break;
++            }
++        }
++        break;
+     case SPU_RdSRR0:        v = ctx->srr0;                              break;
+     default:
+         v = 0;
+@@ -2040,7 +2083,12 @@ static int spu_smc_microstep(spu_context* ctx)
+           if (_n++ < 8)
+               fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X word 0x%08X not in the"
+                       " microstep set -- handing to the interpreter (steps=%d)\n",
+-                      ctx->image_id, pc, w, steps); }
++                      ctx->image_id, pc, w, steps);
++          if (_n <= 8) {
++              fprintf(stderr, "[spu-smc]   resident_ovl=%d LS 0x4000:", ctx->resident_ovl);
++              for (int k = 0; k < 16; k++) fprintf(stderr, " %02X", ctx->ls[0x4000 + k]);
++              fprintf(stderr, "\n");
++          } }
+         ctx->pc = pc;
+         /* Stop at the drain's return point too: it sits mid-function, so it is
+          * no lifted entry, and a job's return would otherwise run on through
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index 5d1c63d..1b7c4d1 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -158,6 +158,12 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+ {
+     if (!entry || !pm_host || !pm_size || pm_size > SPU_LS_SIZE - 0xA00)
+         return -1;
++    /* What the kernel is running right now, for a stall report. */
++    extern volatile unsigned g_spurs_pm_cur_wid, g_spurs_pm_cur_lane;
++    extern volatile unsigned long long g_spurs_pm_cur_since;
++    extern unsigned long long ps3_ms_now(void);
++    g_spurs_pm_cur_wid = wid; g_spurs_pm_cur_lane = spu_num;
++    g_spurs_pm_cur_since = ps3_ms_now();
+ 
+     /* Reuse one context per thread: this runs per policy dispatch (thousands
+      * per second with the SPURS workload churn live), and a fresh 260KB

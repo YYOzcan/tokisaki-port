@@ -1,0 +1,14 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 1937777..954072f 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1211,6 +1211,9 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+  * flipping, so the FIFO holds EXACTLY the completed frame -- no guest-side
+  * blocking needed (the old spin serialized two vsync-class waits per frame
+  * and halved the frame rate). Call AFTER draining. */
++/* Where the FIFO walker is (IO offset), for stall reports. */
++u32 cellGcm_fifo_walker_get(void) { return s_fifo_getoff; }
++
+ int cellGcm_take_flip_pending_synced(void)
+ {
+     if (!s_flip_pending) return 0;

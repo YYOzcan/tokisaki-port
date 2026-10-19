@@ -1,0 +1,14 @@
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 6e28f3b..d4a93cd 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -1117,8 +1117,7 @@ class PPULifter:
+                 if _s2 in _fp: _fp[_d] = _fp[_s2]
+                 else: _fp.pop(_d, None)
+                 continue
+-            _dm2 = re.match(r'\s*ctx->gpr\[(\d+)\] = ', _l)
+-            if _dm2:
++            for _dm2 in re.finditer(r'ctx->gpr\[(\d+)\] = ', _l):
+                 _fp.pop(int(_dm2.group(1)), None)
+         _saved_slots = set()
+         for _i, _l in enumerate(func.body_lines):

@@ -1,0 +1,54 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 015913a..a932fec 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -490,6 +490,7 @@ static void spurs_api_unlock(struct SpursInst* si)
+     ReleaseSRWLockExclusive(&si->lock);
+ }
+ 
++volatile uint32_t g_spurs_last_task_arg[4];
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+ 
+ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+@@ -1044,6 +1045,9 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+             g_ydkj_real_taskset_ea = taskset_ea;
+             g_ydkj_real_taskid     = i;
+ 
++            /* Last task argument, for a delayed dump of what it points at. */
++            { extern volatile uint32_t g_spurs_last_task_arg[4];
++              for (int k = 0; k < 4; k++) g_spurs_last_task_arg[k] = task_arg[k]; }
+             printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
+                    " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
+                    s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 1cdfe48..04c429e 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -9,6 +9,9 @@
+ #include "spu_lifted_job.h"   /* spu_run_lifted_job */
+ #include "../ps3_log.h"      /* ps3_log_verbose */
+ #include <stdio.h>
++#ifndef _WIN32
++#include <unistd.h>
++#endif
+ #include <stdlib.h>
+ #include <string.h>
+ #ifdef _WIN32
+@@ -609,6 +612,17 @@ static void spu_async_run(spu_async_job* j)
+                 if (d && *d) {
+ #ifdef _WIN32
+                     Sleep((unsigned)(atoi(d) * 1000));
++#endif
++                }
++                /* SPURS_TASK_DELAY_MS=<ms>: start a task this long after its
++                 * CreateTask, the way a real kernel picks it up on a later
++                 * scheduling pass rather than inside the PPU call. */
++                const char* dm = getenv("SPURS_TASK_DELAY_MS");
++                if (dm && *dm) {
++#ifdef _WIN32
++                    Sleep((unsigned)atoi(dm));
++#else
++                    usleep((useconds_t)atoi(dm) * 1000u);
+ #endif
+                 }
+             }

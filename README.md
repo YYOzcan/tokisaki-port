@@ -6,8 +6,8 @@
 
 > [!WARNING]
 > **Work in progress — this is not a playable port.**
-> The game boots, streams its data, runs its SPU jobs and walks its menus up to the start of a campaign, but it is far from playable: the campaign level loads and the game loop starts, but the first Havok physics step stalls, so nothing past the loading screen is shown yet; some menu glyphs are missing and the intro movie stalls. Status details below.
-> **Devam eden bir çalışma — oynanabilir bir port değildir.** Oyun açılıyor, verisini okuyor, SPU işlerini çalıştırıyor ve menülerinde bir kampanya başlatmaya kadar ilerliyor; kampanya seviyesi yükleniyor ve oyun döngüsü başlıyor, ancak ilk Havok fizik adımı takıldığı için yükleme ekranının ötesi henüz görünmüyor; bazı harfler eksik, giriş videosu takılıyor.
+> The game boots, streams its data, runs its SPU jobs and walks its menus up to the start of a campaign, but it is far from playable: the campaign level loads and its loading screen renders, but the first in-level frames stall on a command-buffer park nothing patches (docs/PROGRESS.md §20), so nothing past the loading screen is shown yet; the intro movie stalls. Status details below.
+> **Devam eden bir çalışma — oynanabilir bir port değildir.** Oyun açılıyor, verisini okuyor, SPU işlerini çalıştırıyor ve menülerinde bir kampanya başlatmaya kadar ilerliyor; kampanya seviyesi yükleniyor ve yükleme ekranı çiziliyor, ancak seviye içindeki ilk kareler yamalanmayan bir komut tamponu park noktasında takılıyor (docs/PROGRESS.md §20); giriş videosu takılıyor.
 >
 > Built on [ps3recomp](https://github.com/sp00nznet/ps3recomp); the boot harness is adapted from [Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal). Developed with an AI coding agent. See [CREDITS.md](CREDITS.md).
 
@@ -22,7 +22,7 @@ Static recompilation project for **Killzone 2** (PlayStation 3) targeting native
 
 ### 📊 Project Status: boots, streams data, renders its first frames (pre-alpha)
 
-Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.14.0, pinned as a submodule, with this port's fixes in `patches/ps3recomp/`). Linux/Vulkan is the primary host.
+Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.15.0, pinned as a submodule, with this port's fixes in `patches/ps3recomp/`). Linux/Vulkan is the primary host.
 
 | Stage | State |
 |---|---|
@@ -31,13 +31,13 @@ Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.14.0, pinne
 | Build & link | **done** — ~118 MB native x86-64 binary (clang, ~3 min at -j8) |
 | Boot | CRT, TLS, SPURS ×2, FIOS, cellGcm 720p, display buffers/tiles/zcull, cellFont, cellSaveData, cellAudio, trophies |
 | Asset streaming | **works** — FIOS reads `data_ps3.psarc`; Edge Zlib requests are inflated on the host |
-| Rendering | menus with text are presented on Vulkan, 30-60+ presented frames/s (some glyphs missing) |
+| Rendering | title screen and menus with full text on Vulkan, 60-150 presented frames/s; campaign loading screen renders |
 | Front end | language select → gamma → main menu → save warning → start screen → campaign difficulty → campaign start (driven with `PAD_SCRIPT`) |
 | Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); campaign start sound teardown hang resolved; advances to level asset loading; gameplay not reached |
 
-![Title screen in the Vulkan window, full brightness after the feedback-read and AltiVec fixes](docs/media/title-screen-vulkan.png)
+![Main menu on ps3recomp v0.15.0: every glyph present](docs/media/main-menu-v015.png)
 
-![Campaign loading screen: Corinth River with the mission briefing](docs/media/corinth-river-loading.png)
+![Campaign loading screen: Corinth River with the mission briefing](docs/media/corinth-river-loading-v015.png)
 
 Full engineering log: [docs/PROGRESS.md](docs/PROGRESS.md).
 
