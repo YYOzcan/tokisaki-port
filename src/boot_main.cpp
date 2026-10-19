@@ -81,6 +81,9 @@ uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
 
 void cellGcm_request_tick(void);
 int  cellGcm_take_flip_pending_synced(void);
+extern volatile unsigned g_spurs_pm_cur_wid, g_spurs_pm_cur_lane;   /* spurs_policy.c */
+extern volatile unsigned long long g_spurs_pm_cur_since;
+unsigned long long ps3_ms_now(void);
 void cellGcm_rsx_process_fifo(void);
 
 int  rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
@@ -210,8 +213,10 @@ static void frame_clock_loop(void)
             static unsigned fps_n0 = 0;
             if (fps_log && now - fps_t0 >= 5000) {
                 const unsigned n = g_frames_presented.load();
-                fprintf(stderr, "[fps] %.1f presented/s (%u total)\n",
-                        (n - fps_n0) * 1000.0 / (double)(now - fps_t0), n);
+                fprintf(stderr, "[fps] %.1f presented/s (%u total) | spurs pm wid %d lane %u for %llu ms\n",
+                        (n - fps_n0) * 1000.0 / (double)(now - fps_t0), n,
+                        (int)g_spurs_pm_cur_wid, g_spurs_pm_cur_lane,
+                        ps3_ms_now() - g_spurs_pm_cur_since);
                 fps_t0 = now; fps_n0 = n;
             }
         }

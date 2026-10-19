@@ -53,6 +53,17 @@ written independently, but only after reading the *names* of open branches in
 Killzone 3 port. undecuple found these bugs before we did; their own patches
 may differ from ours and should be preferred once merged upstream.
 
+They have since been merged: ps3recomp **v0.15.0** contains its own versions
+of `0001` (lwcond layout), `0002`, `0003` and the `0x1D74` label of `0005`
+(the park grace there is erikomis' inFAMOUS 2 fix). The submodule is still on
+v0.14.0, so the patches stay until it is moved up.
+
+The policy-module argument layout in `0010` (`r4` = the u64 workload argument
+in the preferred doubleword, word 0 = high half) is the same fix as
+**undecuple's** upstream PR #310 ("pass the policy module's u64 argument in the
+preferred doubleword"), re-applied here by hand because of the pinned
+submodule. It is what lets Killzone 2's WWS job lists complete.
+
 ## Other software
 
 - **zlib** — host-side inflate for Edge Zlib requests.

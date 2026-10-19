@@ -11,6 +11,12 @@ walks its own front end, driven by `PAD_SCRIPT` or keyboard:
 language select -> gamma -> main-menu assets -> save warning -> intro-movie
 page -> **start screen -> campaign difficulty select -> campaign start -> level asset streaming**
 
+**Update (2026-10-19):** presents now follow every flip the FIFO reaches
+(30-130 presented frames/s on Vulkan, section 16), and level loading gets past
+the WWS job manager: both `jm_default` and `jm_default_ast` complete their
+job tickets (section 15). The main thread then waits in level setup
+(`func_0024F0F8 -> func_004D9BD0 -> func_004EED70`, `sys_cond_wait`).
+
 Campaign start is fully unlocked: both the stream-specific stop hang in `func_009AD268`
 and the master sound voice teardown loop in `func_009A30F0` are resolved via
 watchdog hooks in `src/kz2_hle.cpp` (section 13). The title advances into
@@ -200,3 +206,42 @@ and fallback on port 0:
 Port 0 is maintained as connected, allowing full keyboard-driven navigation
 from language select through the entire menu tree.
 
+
+## 15. Level loading and the WWS job manager (patch 0010)
+
+The level loader waits in `FUN_003bd660` for a job ticket: row 3 of a WWS
+job-manager sync block (`jm_default`, data `0x4005EC80`; 16-byte rows at
++0x40, `+0x40` = ticket, `+0x42..+0x4E` = per-SPU progress, `FFFF` = SPU not
+participating). Three runtime bugs stood between it and the ticket:
+
+1. **Policy-module argument.** The runtime passed the workload argument in
+   `r4` as `{lo, lo, hi, hi}`. The wwsjob PM reads word 1 as the job list and
+   word 0 as an *audit* buffer; with the list address there too it stamped
+   `FFFFFFFF` over the list's own per-SPU rows. Fixed to the SPU ABI layout
+   (word 0 = high half, word 1 = low half), as upstream did in #310.
+2. **`SPU_RdMachStat` in job code.** The level-load job module
+   `15e56deeec92` (jm_default_ast) asserts that interrupts are on
+   (`rdch MachStat; andi 1; brz -> stopd`). The runtime answered "running",
+   which is 0 in a policy-module context left stopped, so the job hit the
+   `stopd` and the drain loop re-ran it millions of times. Answering every
+   read with the real interrupt state instead breaks `jm_default`: module
+   `6ac243f6bbc4` saves the state around a `bid` and re-enables interrupts
+   mid-job, and the PM's stall-notify handler taken there never lets the job
+   finish. So only the assertion pattern is answered 1; `SPU_MACHSTAT_IE=1`
+   switches to the real state for further work on interrupt delivery.
+3. **Interpreter gaps.** A job that returns into the middle of a lifted
+   function continues in `spu_interp.c`, which lacked `mpyui`, `mpyhhau`,
+   `bgx`, `rothmi`, `rotmah(i)` and the double-precision ops, and wrote
+   `mpyhha` to the wrong register. Module `6ac243f6bbc4` halted on an `mpyui`
+   at LS 0xE050.
+
+Diagnostics added: `SPURS_KERN_STATS=1` (per-workload dispatch counts and
+contention), the PM currently running in the `KZ2_FPS` line.
+
+## 16. Presents (patch 0009)
+
+The FIFO drain stops at each flip, but the frame clock presented only when
+`get == put`, which a title that queues its next frame before the walker
+catches up rarely shows: the menus rendered ~200 frames a second and presented
+one every few seconds. A flip the drain decoded now presents at once, checked
+after every drain, not once per clock loop.
