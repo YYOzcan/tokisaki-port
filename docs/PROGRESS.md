@@ -640,3 +640,19 @@ frame. Two scheduling changes, set by boot_main for Killzone 2:
   level stalled once; 3 ran clean twice.
 
 The Havok stall of section 29 is rarer but not gone (one run of six).
+
+## 32. The rest of the Havok stall: the taskset exit scheduler (KZ3 R1)
+
+A stalled run showed the Havok SPU semaphore at `0x12010000` (port 0x12, one
+waiter, count 0): the PPU had registered correctly, but one SPU half of the
+physics step had never run. Each step creates four Havok tasks (ELF
+`0xC42A80`); each, as it exits, readies a follow-up task (ELF `0xC59980`) in
+the taskset by setting bits with PUTLLC. The runtime's taskset exit
+scheduler (`spu_taskset_task_exited`) cleared and scanned the same ready /
+pending / enabled bytes with plain read-modify-writes under its own lock
+only -- one follow-up was lost ("start task 4/5/1" for four exits), and its
+semaphore release never came. This is the Killzone 3 port's fix R1: the
+scheduler now reads and writes the bitsets under the lock-line lock, reports
+the write to SPU reservations, and dispatches the chosen tasks after
+releasing it. Six runs since, no physics stall (null renderer); two
+Vulkan runs held ~1.9 frames/s in the level.

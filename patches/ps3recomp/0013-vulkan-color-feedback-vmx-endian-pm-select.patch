@@ -830,6 +830,60 @@ index 8d96768..bc85ad3 100644
  #else
  static inline u128 spu_fa(u128 a, u128 b) { return spu__fa_s(a, b); }
  static inline u128 spu_fs(u128 a, u128 b) { return spu__fs_s(a, b); }
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index ef11141..e50c9a2 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -408,6 +408,18 @@ void spu_taskset_mark_running(uint32_t taskset_ea, uint32_t taskid)
+     spu_taskset_mark(taskset_ea, taskid, 1);
+ }
+ 
++/* The bitsets share their 128-byte line with SPU code that sets bits through
++ * GETLLAR/PUTLLC (a task creating or readying another task, as Havok's does
++ * at the end of each physics step). Plain byte read-modify-writes here, under
++ * our own lock only, could land between an SPU's PUTLLC compare and commit
++ * and lose the SPU's new bit: the task never started, its semaphore release
++ * never came, and the physics step waited forever (Killzone 3 fix list R1).
++ * So the bitsets are read and written under the lock-line lock, with the
++ * write reported to SPU reservations, and the chosen tasks are dispatched
++ * after it is released. */
++extern void spu_lockline_lock(void);
++extern void spu_lockline_unlock(void);
++extern void spu_coh_notify_write(uint32_t ea);
+ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+ {
+     extern uint8_t* vm_base;
+@@ -415,6 +427,9 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+     ts_lock();
+     uint8_t* ts = vm_base + taskset_ea;
+     uint8_t* run = ts_running(taskset_ea);
++    struct { uint32_t t, elf, ctx; size_t sz; } go[128];
++    int ngo = 0;
++    spu_lockline_lock();
+     if (done_task < 128) {
+         uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
+         ts[0x10 + done_task / 8] &= (uint8_t)~m;
+@@ -439,11 +454,17 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+         if (!sz) continue;
+         ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
+         run[t / 8] |= m;
++        go[ngo].t = t; go[ngo].elf = elf; go[ngo].ctx = ctx; go[ngo].sz = sz; ngo++;
++    }
++    spu_coh_notify_write(taskset_ea + 0x10);
++    spu_coh_notify_write(taskset_ea + 0x30);
++    spu_lockline_unlock();
++    for (int k = 0; k < ngo; k++) {
+         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+-                        "(after task %u exited)\n", t, taskset_ea, elf, done_task);
+-        g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
++                        "(after task %u exited)\n", go[k].t, taskset_ea, go[k].elf, done_task);
++        g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = go[k].t;
+         s_ts_dispatch_locked = 1;        /* running bit already set, ts_lock held */
+-        spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
++        spu_workload_dispatch_async(vm_base + go[k].elf, (uint32_t)go[k].sz, go[k].ctx);
+         s_ts_dispatch_locked = 0;
+     }
+     ts_unlock();
 diff --git a/tools/lift_jobmods.py b/tools/lift_jobmods.py
 index d2e6b07..c5b317c 100644
 --- a/tools/lift_jobmods.py
