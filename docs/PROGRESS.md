@@ -548,3 +548,30 @@ Changes made on the way (kept, both safe defaults):
 - `KZ2_EDGE_ASYNC=1` services Edge Zlib elements on a host worker in push
   order (off by default; no difference seen).
 - `FS_READ_ALL=1` lines carry the destination and file position.
+
+## 28. The first visible in-level image
+
+Two more pieces:
+
+- **Main-memory render targets are written back.** Killzone 2 renders its
+  post-processing inputs into main memory (640x360 and 320x180 colour, a
+  320x180 R32F luminance target) for its SPU jobs to read. The engine kept
+  them on the GPU, so the SPU post chain worked on stale memory -- the
+  horizontal streaks of section 25. `rsx_draw_engine_flush_main_targets()`
+  now copies every main-memory target drawn since its last copy back to
+  guest memory before each label/semaphore release (NV4097 `0x1D70`/`0x1D74`,
+  NV406E `0x6C`); RGBA8 through the ARGB conversion, float formats raw with
+  big-endian elements. `RSX_MAIN_TARGET_WB=0` turns it off.
+- **The colour-grading LUT.** The 64x64 LUT the grading pass reads is
+  indexed by the input channel and the square root of the depth (RGB: a
+  per-channel curve per depth, alpha: desaturation by luminance and depth) --
+  KZ2's atmosphere (`AtmosphereBoxResource`). On disc it is a zero
+  placeholder that follows a filled LUT of the same size; a gdb hardware
+  watch over the whole run sees nothing write it. Until its writer is found
+  the engine fills a still-empty 64x64 main-memory A8R8G8B8 texture with an
+  identity curve (`RSX_ZERO_LUT_IDENTITY=1`, set by boot_main).
+
+Result: the Intruder dropship interior of the Corinth River intro, with its
+subtitles (`docs/media/in-level-intruder-first-image.png`), at ~1.6-2.3
+presented frames/s. The tint is still off (no atmosphere grading) and some
+runs still stall in the Havok step (section 20b).

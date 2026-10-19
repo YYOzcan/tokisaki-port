@@ -1,8 +1,111 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 954072f..a5fe95b 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1878,7 +1878,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                           static int n = 0; if (n++ < 64)
+                               fprintf(stderr, "[labelwatch] NV406E m=0x%02X v=0x%08X at get=0x%08X\n", m, v, s_fifo_getoff); } }
+                     if (m == 0x64u)      s_sema_offset = v;
+-                    else if (m == 0x6Cu) vm_write32(la, v);
++                    else if (m == 0x6Cu) {
++                        extern void rsx_draw_engine_flush_main_targets(void);
++                        rsx_draw_engine_flush_main_targets();
++                        vm_write32(la, v);
++                    }
+                     else if (m == 0x68u && vm_read32(la) != v) {
+             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
+              * the hardware does. Off by default: a title whose label nothing
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index f753dd0..93a1556 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -359,6 +359,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+             static int n = 0; if (n++ < 64)
+                 fprintf(stderr, "[labelwatch] NV4097 m=0x%04X v=0x%08X\n", method, data); } }
+       if (method == 0x1D6C) { s_sem_off = data; return 0; }
++      if (method == 0x1D70 || method == 0x1D74) {
++        extern void rsx_draw_engine_flush_main_targets(void);
++        rsx_draw_engine_flush_main_targets();
++      }
+       if (method == 0x1D70) {
+         extern void vm_write32(uint32_t a, uint32_t v);
+         /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 0bc73dd..568bab1 100644
+index 0bc73dd..8814ce0 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -1370,7 +1370,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1046,6 +1046,27 @@ static int eng_format_reinterprets_rgba8(u32 base_fmt)
+ 
+ /* Store a colour surface into guest memory, A,R,G,B per pixel at its own
+  * pitch. Returns 0 when it cannot, and the caller samples as before. */
++/* Render targets in MAIN memory are shared with the CPU and the SPUs: Killzone
++ * 2 renders its post-processing inputs there (640x360 colour, 320x180 colour
++ * and R32F luminance) and its SPU jobs DMA them in once a label says the RSX
++ * is done. The engine keeps every target on the GPU, so those jobs read
++ * whatever guest memory held before. This writes every main-memory target
++ * rendered since its last copy back to guest memory; the FIFO calls it before
++ * each label/semaphore release. RGBA8 goes through the usual ARGB conversion,
++ * float targets are stored raw with each element byte-swapped to big-endian.
++ * RSX_MAIN_TARGET_WB=0 turns it off. */
++static void eng_surface_writeback(u32 slot);
++void rsx_draw_engine_flush_main_targets(void)
++{
++    static int en = -1;
++    if (en < 0) { const char* e = getenv("RSX_MAIN_TARGET_WB"); en = e ? atoi(e) : 1; }
++    if (!en || !g.ready || !g.be->readback) return;
++    for (u32 i = 0; i < g.n_surfaces; i++) {
++        const eng_surface* s = &g.surfaces[i];
++        if (s->handle && s->location == 1 && s->guest_dirty) eng_surface_writeback(i);
++    }
++}
++
+ static int eng_surface_to_guest(u32 slot)
+ {
+     eng_surface* s = &g.surfaces[slot];
+@@ -1125,6 +1146,42 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
+     z->used_h = sf->clip_h ? sf->clip_h : g.height;
+ }
+ 
++static void eng_surface_writeback(u32 slot)
++{
++    eng_surface* s = &g.surfaces[slot];
++    u32 bpp = 0, elem = 4;
++    switch (s->fmt) {
++    case RSX_BE_FMT_R8G8B8A8:
++        rsx_draw_engine_guest_read(s->location, s->offset, s->pitch, s->w, s->h);
++        s->guest_dirty = 0;
++        eng_textures_touch(s->location, s->offset, s->pitch * s->h);
++        return;
++    case RSX_BE_FMT_R32F:          bpp = 4;  elem = 4; break;
++    case RSX_BE_FMT_R16G16F:       bpp = 4;  elem = 2; break;
++    case RSX_BE_FMT_R16G16B16A16F: bpp = 8;  elem = 2; break;
++    case RSX_BE_FMT_R32G32B32A32F: bpp = 16; elem = 4; break;
++    default: s->guest_dirty = 0; return;
++    }
++    if (s->pitch < s->w * bpp) { s->guest_dirty = 0; return; }
++    u8* rows = eng_coherence_buffer(s->w * bpp * s->h);
++    if (!rows) return;
++    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++    g.be->readback(g.be->user, s->handle, 0, 0, s->w, s->h, rows, s->w * bpp);
++    for (u32 r = 0; r < s->h; r++) {
++        u8* dst = (u8*)eng_guest_ptr(NULL, s->location, s->offset + r * s->pitch, s->w * bpp);
++        if (!dst) break;
++        const u8* src = rows + (size_t)r * s->w * bpp;
++        if (elem == 4)
++            for (u32 b = 0; b < s->w * bpp; b += 4) {
++                dst[b] = src[b + 3]; dst[b + 1] = src[b + 2]; dst[b + 2] = src[b + 1]; dst[b + 3] = src[b];
++            }
++        else
++            for (u32 b = 0; b < s->w * bpp; b += 2) { dst[b] = src[b + 1]; dst[b + 1] = src[b]; }
++    }
++    s->guest_dirty = 0;
++    eng_textures_touch(s->location, s->offset, s->pitch * s->h);
++}
++
+ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
+ {
+     const u64 serial = ++g.write_serial;
+@@ -1370,7 +1427,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
          if (t.enabled) gamma_masks[u] = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
      }
@@ -15,7 +118,7 @@ index 0bc73dd..568bab1 100644
      for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
          if (!(gamma_units & (1u << u))) gamma_masks[u] = 0;
  
-@@ -1485,10 +1489,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1485,10 +1546,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          }
      }
      { static u32 logs = 0; if (logs++ < 32)
@@ -31,7 +134,41 @@ index 0bc73dd..568bab1 100644
  
      g.pipelines[g.n_pipelines].key = key;
      g.pipelines[g.n_pipelines].handle = handle;
-@@ -2182,6 +2187,25 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+@@ -1881,6 +1943,33 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+                 }
+             if (textures[u]) continue;
+         }
++        /* RSX_ZERO_LUT_IDENTITY=1: a 64x64 A8R8G8B8 texture in main memory that
++         * is still all zero gets an identity curve (R=G=B=column, A=0) written
++         * into guest memory before it is uploaded. Killzone 2's colour grading
++         * takes every output channel from such a LUT (indexed by the channel
++         * and the depth) that its atmosphere system fills at run time; until
++         * that is found, an empty LUT made every in-level frame black. */
++        {
++            static int idl = -1;
++            if (idl < 0) { const char* e = getenv("RSX_ZERO_LUT_IDENTITY"); idl = (e && atoi(e)) ? 1 : 0; }
++            if (idl && t.location == 1 && t.width == 64 && t.height == 64 &&
++                (t.format & 0x9Fu) == 0x85u && (!t.pitch || t.pitch == 256u)) {
++                u8* lut = (u8*)eng_guest_ptr(NULL, 1, t.offset, 64u * 64u * 4u);
++                u32 nz = 0;
++                for (u32 b = 0; lut && b < 64u * 64u * 4u && !nz; b++) nz = lut[b];
++                if (lut && !nz) {
++                    for (u32 y = 0; y < 64; y++)
++                        for (u32 x = 0; x < 64; x++) {
++                            u8* px = lut + (y * 64u + x) * 4u;
++                            const u8 v = (u8)((x * 255u + 31u) / 63u);
++                            px[0] = 0; px[1] = v; px[2] = v; px[3] = v;   /* A R G B */
++                        }
++                    static int logged;
++                    if (!logged++) fprintf(stderr, "[rsx engine] zero 64x64 LUT at %u:0x%08X: identity filled\n",
++                                           t.location, t.offset);
++                }
++            }
++        }
+         textures[u] = eng_texture_slot(t.location, t.offset, t.format,
+                                        t.width, t.height, t.mipmaps, t.pitch,
+                                        (int)t.cubemap, t.remap & 0xFFFFu);
+@@ -2182,6 +2271,25 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
              rsx_dsp_get_texture(&g.rsx, u, &t);
              fprintf(s_pd.draws_log, " t%u %u:0x%08X f%02X %ux%u", u, t.location, t.offset,
                      t.format & 0xFFu, t.width, t.height);
@@ -57,7 +194,7 @@ index 0bc73dd..568bab1 100644
          }
          fprintf(s_pd.draws_log, "\n");
      }
-@@ -2384,6 +2408,23 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -2384,6 +2492,23 @@ static void sink_end(void* user, const rsx_dispatch* r)
  
      pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
  
@@ -81,7 +218,7 @@ index 0bc73dd..568bab1 100644
      /* The depth attachment is cleared the first time it is bound, so a title
       * that never clears its shadow zeta still tests against something. */
      const u32 depth_handle = (zslot != ENG_INVALID) ? g.zdepths[zslot].handle : 0;
-@@ -2443,6 +2484,23 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -2443,6 +2568,23 @@ static void sink_end(void* user, const rsx_dispatch* r)
      }
  
      const u32 uploaded = indexed ? dc.n_verts : n_draw;
@@ -105,6 +242,20 @@ index 0bc73dd..568bab1 100644
      g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                 indexed ? g.indices : NULL, indexed ? n_draw : 0);
      /* Counted only when the draw ran the guest's OWN programs, which is what
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index bf652b7..b96ff0c 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -292,6 +292,9 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
+  * pitch, `w` and `h` in 32-bit pixels. Only 8-bit-per-channel surfaces laid
+  * out with the same pitch take part; anything else is left alone. */
+ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
++/* Copy main-memory render targets drawn since their last copy back to guest
++ * memory (before a label release makes them visible to the CPU/SPUs). */
++void rsx_draw_engine_flush_main_targets(void);
+ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+ 
+ /* --- test hooks ---------------------------------------------------------- */
 diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
 index da30ca6..54c4fe8 100644
 --- a/libs/video/rsx_vulkan_backend.c

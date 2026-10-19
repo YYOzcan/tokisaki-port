@@ -593,6 +593,11 @@ int main(int argc, char** argv)
      * shader), and the renderer then waited forever for a label released
      * there. 10 minutes is "never" for practical purposes. */
     setenv("GCM_PARK_GRACE_MS", "600000", 0);
+    /* The in-level colour grading reads a 64x64 LUT that the atmosphere system
+     * fills at run time; that fill does not happen yet, and an all-zero LUT
+     * turns every in-level frame black. Until it does, the engine substitutes
+     * an identity curve (docs/PROGRESS.md section 28). */
+    setenv("RSX_ZERO_LUT_IDENTITY", "1", 0);
 
     uint32_t entry = ppu_load_elf(argv[1]);
     if (!entry) {
