@@ -31,7 +31,7 @@ Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.14.0, pinne
 | Build & link | **done** — ~118 MB native x86-64 binary (clang, ~3 min at -j8) |
 | Boot | CRT, TLS, SPURS ×2, FIOS, cellGcm 720p, display buffers/tiles/zcull, cellFont, cellSaveData, cellAudio, trophies |
 | Asset streaming | **works** — FIOS reads `data_ps3.psarc`; Edge Zlib requests are inflated on the host |
-| Rendering | menus with text are presented on Vulkan (some glyphs missing); real-time speed |
+| Rendering | menus with text are presented on Vulkan, 30-60+ presented frames/s (some glyphs missing) |
 | Front end | language select → gamma → main menu → save warning → start screen → campaign difficulty → campaign start (driven with `PAD_SCRIPT`) |
 | Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); campaign start sound teardown hang resolved; advances to level asset loading; gameplay not reached |
 
@@ -105,7 +105,7 @@ Diagnostics: `tools/snapshot.sh` (all thread stacks under gdb), `tools/sample.sh
 | Derleme | **tamam** — ~118 MB yerel x86-64 çalıştırılabilir dosya |
 | Açılış | CRT, TLS, 2×SPURS, FIOS, cellGcm 720p, ekran tamponları, cellFont, cellSaveData, cellAudio, kupalar |
 | Varlık akışı | **çalışıyor** — FIOS `data_ps3.psarc` okuyor; Edge Zlib istekleri host'ta açılıyor |
-| Grafik | menüler yazılarıyla Vulkan'da ekrana geliyor (bazı harfler eksik); gerçek zamanlı hız |
+| Grafik | menüler yazılarıyla Vulkan'da ekrana geliyor, saniyede 30-60+ kare (bazı harfler eksik) |
 | Menüler | dil seçimi → gama → ana menü → kayıt uyarısı → başlangıç ekranı → zorluk seçimi → kampanya başlangıcı (`PAD_SCRIPT` ile) |
 | Video / oynanış | giriş videosu oynatıcısı kilitleniyor (`tools/make_vfs_nointro.sh` ile atlanıyor); kampanya başlangıcı ses motoru kilitlenmesi çözüldü, seviye varlık yüklemesine geçildi; oynanışa ulaşılmadı |
 

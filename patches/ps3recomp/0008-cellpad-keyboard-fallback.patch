@@ -2,7 +2,16 @@ diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index f2b4c11..e3d6dc0 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -357,6 +357,49 @@ static void pad_poll_sdl2(void)
+@@ -348,24 +348,67 @@ static void pad_poll_sdl2(void)
+         /* Pressure: SDL has digital buttons, so 0 or 255 */
+         s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
+         s_host_state[i].press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
+         s_host_state[i].press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
+         s_host_state[i].press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
+         s_host_state[i].press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
+         s_host_state[i].press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
+         s_host_state[i].press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
+         s_host_state[i].press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
          s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
          s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
      }
@@ -52,3 +61,12 @@ index f2b4c11..e3d6dc0 100644
  }
  
  static void pad_init_backend(void)
+ {
+     if (!s_sdl_inited) {
+         if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
+             SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+         }
+         s_sdl_inited = 1;
+     }
+     memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
+ 

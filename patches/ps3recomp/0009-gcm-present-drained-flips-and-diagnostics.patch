@@ -1,0 +1,216 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 13593fd..2e41f7f 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -95,6 +95,9 @@ static u32 s_current_display_buffer_id = 0;
+  * presenting on a raw flip-count change raced the drain and showed empty or
+  * mixed batches (wave: black flashes, layout flicker). */
+ static volatile int s_flip_pending = 0;
++/* Set when the drain itself decoded the flip marker: every command before
++ * the flip has then been processed, whatever `put` says about the next frame. */
++static volatile int s_flip_pending_drained = 0;
+ /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
+ #define GCM_FLIP_MARKER 0xFEAD0100u
+ /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
+@@ -105,6 +108,7 @@ int cellGcm_take_flip_pending(void)
+ {
+     int v = s_flip_pending;
+     s_flip_pending = 0;
++    s_flip_pending_drained = 0;
+     return v;
+ }
+ 
+@@ -1186,6 +1190,15 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+ int cellGcm_take_flip_pending_synced(void)
+ {
+     if (!s_flip_pending) return 0;
++    /* A flip the drain reached in the command stream: the frame before it is
++     * complete. Waiting for get == put as well starved presents in a title
++     * that queues its next frame before the walker catches up -- Killzone 2
++     * rendered ~200 frames a second in its menus and presented one. */
++    if (s_flip_pending_drained) {
++        s_flip_pending_drained = 0;
++        s_flip_pending = 0;
++        return 1;
++    }
+     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+     u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+     if (get != put) return 0;   /* frame not fully drained yet */
+@@ -1689,9 +1702,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                  * guest-visible half of the request. */
+                 gcm_set_current_display_buffer(w & 7u);
+                 s_flip_pending = 1;
++                s_flip_pending_drained = 1;
+                 s_flip_request_count++;
+             } else {
+                 cellGcmSetFlipCommand(w & 0xFFu);
++                s_flip_pending_drained = s_flip_pending;   /* decoded here, too */
+             }
+             /* ...unless the FIFO is badly backlogged. One flip per drain is
+              * right while `get` is keeping up with `put`; when it is megabytes
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index b438d87..09b7eea 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1768,6 +1768,7 @@ static struct {
+     u32 min_draws;
+     u32 after_s;
+     u32 max_passes;
++    u32 only, has_only, skip;   /* RSX_ENGINE_PASS_DUMP_ONLY: one target offset */
+     time_t start;
+     FILE* index;
+     FILE* draws_log;        /* RSX_ENGINE_PASS_DUMP_DRAWS: one line a draw */
+@@ -1803,6 +1804,12 @@ static int pd_capturing(void)
+         s_pd.after_s = a ? (u32)strtoul(a, NULL, 0) : 0u;
+         const char* x = getenv("RSX_ENGINE_PASS_DUMP_MAX");
+         s_pd.max_passes = x ? (u32)strtoul(x, NULL, 0) : 64u;
++        /* RSX_ENGINE_PASS_DUMP_ONLY=<offset>: record only passes whose target
++         * set includes the colour surface at that offset (render-to-texture
++         * passes that run once in a few hundred frames). */
++        const char* o = getenv("RSX_ENGINE_PASS_DUMP_ONLY");
++        s_pd.has_only = o && *o;
++        s_pd.only = s_pd.has_only ? (u32)strtoul(o, NULL, 0) : 0u;
+         s_pd.start = time(NULL);
+         s_pd.state = (s_pd.dir && *s_pd.dir) ? 1 : 3;
+     }
+@@ -1917,9 +1924,10 @@ static void pd_write_depth(u32 zslot, const char* path, float* lo_out, float* hi
+ static void pd_close_pass(void)
+ {
+     if (!s_pd.open) return;
++    if (s_pd.skip) { s_pd.open = 0; return; }
+     char path[1024];
+-    fprintf(s_pd.index, "pass %03u: draws %u clears %u |", s_pd.pass, s_pd.draws,
+-            s_pd.clears);
++    fprintf(s_pd.index, "pass %03u: frame %u t %.0fs draws %u clears %u |", s_pd.pass, g.frames,
++            difftime(time(NULL), s_pd.start), s_pd.draws, s_pd.clears);
+     for (u32 k = 0; k < s_pd.n_targets; k++) {
+         const eng_surface* s = &g.surfaces[s_pd.targets[k]];
+         fprintf(s_pd.index, " %c 0x%08X fmt %d %ux%u p%u", 'A' + (int)k, s->offset,
+@@ -1966,7 +1974,14 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+         s_pd.zslot = zslot;
+         s_pd.draws = s_pd.clears = 0;
+         s_pd.first[0] = 0;
++        s_pd.skip = 0;
++        if (s_pd.has_only) {
++            s_pd.skip = 1;
++            for (u32 k = 0; k < n_targets; k++)
++                if (g.surfaces[targets[k]].offset == s_pd.only) s_pd.skip = 0;
++        }
+     }
++    if (s_pd.skip) return;
+     if (!rs) {
+         s_pd.clears++;
+         const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+@@ -1982,6 +1997,17 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+                 " dt %u dw %u at %u |", s_pd.pass, s_pd.draws, pipeline, rs->color_mask,
+                 rs->blend_enable, rs->sf_rgb, rs->df_rgb, rs->depth_test, rs->depth_write,
+                 rs->alpha_test_enable);
++        if (rs->stencil_enable)
++            fprintf(s_pd.draws_log, " st%s f%X m%02X/%02X ops %X/%X/%X back f%X ops %X/%X/%X |",
++                    rs->stencil_two_sided ? "2" : "1", rs->s_func, rs->s_func_mask & 0xFFu,
++                    rs->s_write_mask & 0xFFu, rs->s_fail, rs->s_zfail, rs->s_zpass,
++                    rs->bs_func, rs->bs_fail, rs->bs_zfail, rs->bs_zpass);
++        fprintf(s_pd.draws_log, " cull %u/%X ff %X | prim %u arr %u idx %u refs %u verts %u cuts %u inl %u |",
++                rs->cull_enable, rs->cull_face, rs->front_face, g.rsx.current_primitive,
++                dc.n_arr, dc.n_idx, dc.n_source_refs, dc.n_verts, dc.n_cuts, dc.inl_bytes);
++        { rsx_dsp_vertex_attr va; rsx_dsp_get_vertex_attr(&g.rsx, 0, &va);
++          fprintf(s_pd.draws_log, " v0 %u:0x%08X t%u s%u st%u first %u |", va.location, va.offset,
++                  va.type, va.size, va.stride, dc.n_arr ? dc.arr[0].first : 0u); }
+         for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+             if (!(tex_mask & (1u << u))) continue;
+             rsx_dsp_texture t;
+@@ -2048,7 +2074,7 @@ static void pd_present(u32 presented)
+     if (s_pd.state == 2) {
+         char path[1024];
+         pd_close_pass();
+-        if (s_pd.state != 2) return;               /* that pass was the last */
++        if (s_pd.state != 2 || s_pd.has_only) return;  /* last pass / targets only */
+         snprintf(path, sizeof path, "%s/present%03u.ppm", s_pd.dir, s_pd.pass);
+         pd_write_surface(presented, path);
+         fprintf(s_pd.index, "present%03u: surface %u 0x%08X, %u guest draws\n",
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 87ea864..355762b 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -62,6 +62,7 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <time.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -500,8 +501,28 @@ static int vk_submit_and_wait(void)
+     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
+     VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
++    /* PS3RECOMP_VK_SUBMIT_STATS=1: every 5 s, how many synchronous submits
++     * ran and how long their fence waits took. */
++    static int stats = -1;
++    if (stats < 0) stats = getenv("PS3RECOMP_VK_SUBMIT_STATS") ? 1 : 0;
++    struct timespec t0, t1;
++    if (stats) clock_gettime(CLOCK_MONOTONIC, &t0);
+     VK_CHECK(pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence), "vkQueueSubmit");
+     VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
++    if (stats) {
++        static double acc_ms, win_start;
++        static unsigned n;
++        clock_gettime(CLOCK_MONOTONIC, &t1);
++        const double now = t1.tv_sec + t1.tv_nsec * 1e-9;
++        acc_ms += (now - (t0.tv_sec + t0.tv_nsec * 1e-9)) * 1e3;
++        n++;
++        if (!win_start) win_start = now;
++        if (now - win_start >= 5.0) {
++            fprintf(stderr, "[vk] %u submits in %.1f s, %.1f ms waiting (%.3f ms each)\n",
++                    n, now - win_start, acc_ms, acc_ms / n);
++            n = 0; acc_ms = 0; win_start = now;
++        }
++    }
+     return 0;
+ }
+ 
+@@ -1679,10 +1700,14 @@ static int vk_create_swapchain(void)
+     VK_CHECK(pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, NULL),
+              "vkGetPhysicalDeviceSurfaceFormatsKHR");
+     if (nf == 0) { VK_LOG("surface reports no formats\n"); return -1; }
+-    if (nf > 64) nf = 64;
+-    VkSurfaceFormatKHR fmts[64];
+-    VK_CHECK(pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, fmts),
+-             "vkGetPhysicalDeviceSurfaceFormatsKHR");
++    VkSurfaceFormatKHR* fmts = (VkSurfaceFormatKHR*)malloc(nf * sizeof(VkSurfaceFormatKHR));
++    if (!fmts) { VK_LOG("out of memory for surface formats\n"); return -1; }
++    VkResult r_fmt = pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, fmts);
++    if (r_fmt != VK_SUCCESS && r_fmt != VK_INCOMPLETE) {
++        VK_LOG("vkGetPhysicalDeviceSurfaceFormatsKHR failed (VkResult %d)\n", (int)r_fmt);
++        free(fmts);
++        return -1;
++    }
+     /* UNORM, not SRGB: the offscreen target holds the guest's values as-is. */
+     VkSurfaceFormatKHR fmt = fmts[0];
+     if (nf == 1 && fmts[0].format == VK_FORMAT_UNDEFINED) {
+@@ -1694,6 +1719,7 @@ static int vk_create_swapchain(void)
+             for (u32 i = 0; i < nf; i++)
+                 if (fmts[i].format == pref[k]) { fmt = fmts[i]; found = 1; break; }
+     }
++    free(fmts);
+     VkFormatProperties fp;
+     pvkGetPhysicalDeviceFormatProperties(s_vk.phys, fmt.format, &fp);
+     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+@@ -1836,8 +1862,15 @@ static void vk_present_window(void)
+ 
+ static void vk_dump_ppm(const unsigned char* rgba)
+ {
+-    FILE* f = fopen(s_vk.dump_path, "wb");
+-    if (!f) { VK_LOG("cannot open %s for the frame dump\n", s_vk.dump_path); return; }
++    char path[512];
++    if (strchr(s_vk.dump_path, '%')) {
++        snprintf(path, sizeof path, s_vk.dump_path, s_vk.presented);
++    } else {
++        strncpy(path, s_vk.dump_path, sizeof path - 1);
++        path[sizeof path - 1] = 0;
++    }
++    FILE* f = fopen(path, "wb");
++    if (!f) { VK_LOG("cannot open %s for the frame dump\n", path); return; }
+     fprintf(f, "P6\n%u %u\n255\n", s_vk.width, s_vk.height);
+     for (size_t i = 0; i < (size_t)s_vk.width * s_vk.height; i++)
+         fwrite(rgba + i * 4, 1, 3, f);

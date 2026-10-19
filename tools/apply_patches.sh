@@ -5,10 +5,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="${ROOT}/external/ps3recomp"
 for p in "${ROOT}"/patches/ps3recomp/*.patch; do
-    if git -C "${SDK}" apply --check "${p}" 2>/dev/null; then
-        git -C "${SDK}" apply "${p}" && echo "[patch] applied  $(basename "${p}")"
-    elif git -C "${SDK}" apply --reverse --check "${p}" 2>/dev/null; then
+    # Reverse check first: a hunk whose context occurs twice in the file (0008)
+    # still passes the forward check once applied, and would land again.
+    if git -C "${SDK}" apply --reverse --check "${p}" 2>/dev/null; then
         echo "[patch] present  $(basename "${p}")"
+    elif git -C "${SDK}" apply --check "${p}" 2>/dev/null; then
+        git -C "${SDK}" apply "${p}" && echo "[patch] applied  $(basename "${p}")"
     else
         echo "[patch] CONFLICT $(basename "${p}")" >&2; exit 1
     fi
