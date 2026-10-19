@@ -522,3 +522,29 @@ which now holds zeros. So the stream ring and the Edge requests disagree on
 where a decompressed block lands -- most likely the HLE's reading of the
 "copy" element (destination / skip fields) for FIOS's ring is off. Other
 assets streamed the same way may be damaged too.
+
+## 27. The LUT is zero on disc: it is filled at run time
+
+Tracing the stream further: the reader double-buffers 256 KB windows
+(`+0x80`/`+0x84`, file position `+0xA8`; `func_0006C1F0` issues an async read
+for the current and the next window and waits with `WaitForAsyncOperation`).
+FIOS satisfies the tail window from its block cache (`func_007CE528`: page
+`cache base + page * 0x10000`, PPU memcpy or an Edge copy). In some runs the
+cache-hit copy writes zeros into the window, in others the window is not
+written before the reader goes on -- but `tools/psarc_find.py` (reads an
+entry of `data_ps3.psarc` straight from the dump) shows the file itself is
+zero there: entry 216 (2,202,560 bytes) has 16 KB of zeros at `0x21542D`,
+exactly the LUT the reader copies. So the colour-grading LUT is a placeholder
+on disc and something fills it at run time -- a PPU routine writing with
+AltiVec stores (invisible to `PPU_WWATCH`, which hooks `vm_write*`), an SPU
+job, or an RSX render target. Finding that writer is next.
+
+Changes made on the way (kept, both safe defaults):
+- `sys_lwcond_wait` waits on a real per-lwcond condition variable and wakes
+  on `signal`/`signal_all`; without a guest timeout it still returns after
+  `LWCOND_SAFETY_MS` (2) as a spurious wakeup, because signalers need not
+  hold the lwmutex and long waits slowed the menus to a crawl.
+  `LWCOND_POLL=1` restores the old poll.
+- `KZ2_EDGE_ASYNC=1` services Edge Zlib elements on a host worker in push
+  order (off by default; no difference seen).
+- `FS_READ_ALL=1` lines carry the destination and file position.

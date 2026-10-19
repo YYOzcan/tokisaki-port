@@ -123,21 +123,19 @@ static bool kz2_edge_inflate(uint32_t src, uint32_t src_size, uint32_t dst,
     return produced == expected;
 }
 
-static void kz2_lfqueue_push_body(ppu_context* ctx)
+struct Kz2EdgeReq {
+    uint32_t q, src, dst, src_size, expected, counter_w, event_flag, skips;
+    uint16_t bits;
+};
+
+/* One queue element: inflate or copy, then count down and raise the flag. */
+static void kz2_edge_service(const Kz2EdgeReq& r)
 {
-    const uint32_t q   = (uint32_t)ctx->gpr[3];
-    const uint32_t buf = (uint32_t)ctx->gpr[4];
-
-    const uint32_t src        = vm_read32(buf + 0x00);
-    const uint32_t dst        = vm_read32(buf + 0x04);
-    const uint32_t src_size   = vm_read32(buf + 0x08);
-    const uint32_t expected   = vm_read32(buf + 0x0C);
-    const uint32_t counter_w  = vm_read32(buf + 0x10);
-    const uint32_t event_flag = vm_read32(buf + 0x14);
-    const uint16_t bits       = (uint16_t)(vm_read32(buf + 0x18) >> 16);
-    const uint32_t skips      = vm_read32(buf + 0x1C);
-    const uint32_t counter    = counter_w & ~3u;
-
+    const uint32_t q = r.q, src = r.src, dst = r.dst, src_size = r.src_size;
+    const uint32_t expected = r.expected, counter_w = r.counter_w, event_flag = r.event_flag;
+    const uint32_t skips = r.skips;
+    const uint16_t bits = r.bits;
+    const uint32_t counter = counter_w & ~3u;
     bool ok = kz2_edge_inflate(src, src_size, dst, expected, skips >> 16, skips & 0xFFFF,
                                (counter_w & 1) != 0);
 
@@ -145,10 +143,22 @@ static void kz2_lfqueue_push_body(ppu_context* ctx)
     unsigned k = ++n;
     /* KZ2_EDGE_LOG=1: every request (who filled which buffer, and when). */
     static const bool log_all = getenv("KZ2_EDGE_LOG") != nullptr;
-    if (log_all || k <= 8 || !ok || (k % 500) == 0)
-        fprintf(stderr, "[kz2] edge-zlib #%u q=0x%08X %s 0x%08X(%u) -> 0x%08X(%u) counter=0x%08X(%u) flag=0x%08X/0x%04X %s\n",
+    if (log_all || k <= 8 || !ok || (k % 500) == 0) {
+        fprintf(stderr, "[kz2] edge-zlib #%u q=0x%08X %s 0x%08X(%u) -> 0x%08X(%u) counter=0x%08X(%u) flag=0x%08X/0x%04X skip=%u/%u %s",
                 k, q, (counter_w & 1) ? "inflate" : "copy", src, src_size, dst, expected,
-                counter, counter ? vm_read32(counter) : 0, event_flag, bits, ok ? "ok" : "FAILED");
+                counter, counter ? vm_read32(counter) : 0, event_flag, bits,
+                skips >> 16, skips & 0xFFFF, ok ? "ok" : "FAILED");
+        if (log_all) {   /* nonzero bytes per 16 KB slice of what was written */
+            const uint32_t out = expected - (skips >> 16) - (skips & 0xFFFF);
+            fprintf(stderr, " nz");
+            for (uint32_t o = 0; o < out; o += 0x4000) {
+                uint32_t nz = 0;
+                for (uint32_t b = o; b < o + 0x4000 && b < out; b++) nz += guest(dst)[b] != 0;
+                fprintf(stderr, " %u", nz);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
 
     /* Work-to-do counter: decremented once per element; the flag is raised
      * by the element that takes it to zero. */
@@ -165,6 +175,61 @@ static void kz2_lfqueue_push_body(ppu_context* ctx)
     if (last && event_flag)
         cellSpursEventFlagSet((void*)(uintptr_t)event_flag, bits);
 
+}
+
+/* KZ2_EDGE_ASYNC=1: service the elements on a host worker in push order, as
+ * the SPU task does, instead of inside the push. FIOS does its own
+ * bookkeeping after the push returns; finishing the element before that may
+ * be what leaves a cached block unaccounted for (PROGRESS section 27). */
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+static std::mutex s_edge_lock;
+static std::condition_variable s_edge_cv;
+static std::deque<Kz2EdgeReq> s_edge_q;
+static void kz2_edge_worker()
+{
+    for (;;) {
+        Kz2EdgeReq r;
+        {
+            std::unique_lock<std::mutex> g(s_edge_lock);
+            s_edge_cv.wait(g, [] { return !s_edge_q.empty(); });
+            r = s_edge_q.front();
+            s_edge_q.pop_front();
+        }
+        kz2_edge_service(r);
+    }
+}
+
+static void kz2_lfqueue_push_body(ppu_context* ctx)
+{
+    const uint32_t q   = (uint32_t)ctx->gpr[3];
+    const uint32_t buf = (uint32_t)ctx->gpr[4];
+    Kz2EdgeReq r;
+    r.q          = q;
+    r.src        = vm_read32(buf + 0x00);
+    r.dst        = vm_read32(buf + 0x04);
+    r.src_size   = vm_read32(buf + 0x08);
+    r.expected   = vm_read32(buf + 0x0C);
+    r.counter_w  = vm_read32(buf + 0x10);
+    r.event_flag = vm_read32(buf + 0x14);
+    r.bits       = (uint16_t)(vm_read32(buf + 0x18) >> 16);
+    r.skips      = vm_read32(buf + 0x1C);
+
+    static int async = -1;
+    if (async < 0) { const char* e = getenv("KZ2_EDGE_ASYNC"); async = (e && atoi(e)) ? 1 : 0; }
+    if (async) {
+        static std::once_flag once;
+        std::call_once(once, [] { std::thread(kz2_edge_worker).detach(); });
+        {
+            std::lock_guard<std::mutex> g(s_edge_lock);
+            s_edge_q.push_back(r);
+        }
+        s_edge_cv.notify_one();
+    } else {
+        kz2_edge_service(r);
+    }
     ctx->gpr[3] = 0;
 }
 

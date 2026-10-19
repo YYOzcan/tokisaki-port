@@ -200,6 +200,133 @@ index da30ca6..54c4fe8 100644
      .pipeline_create      = vk_eng_pipeline_create,
      .pipeline_release     = vk_eng_pipeline_release,
      .bind_targets         = vk_eng_bind_targets,
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 7f1ffc9..e893d5d 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -452,9 +452,9 @@ static void cellFsRead(ppu_context* ctx)
+       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
+       int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
+       if(_n++<50 || first_for_fd || getenv("FS_READ_ALL"))
+-        fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
++        fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu) buf=0x%08X pos=0x%lX%s\n",
+                 fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
+-                (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
++                (unsigned long long)tot, (unsigned)buf, (long)fpos_before, first_for_fd?"  <= FIRST READ ON THIS FD":"");
+       if (getenv("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
+           fprintf(stderr, "        from %s\n", g_fd_path[fd]);
+       if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index db9ea00..f502d5f 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -340,31 +340,91 @@ static void sys_lwcond_create(ppu_context* ctx)
+     vm_write32(lwcond + 0x04, ++s_lwcond_id);
+     ctx->gpr[3] = 0;
+ }
+-static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
+-/* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
+- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
+- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
+- * common single (non-recursive) hold. */
++/* A real condition variable per lwcond (keyed by its EA). The old wait
++ * released the lwmutex, slept 1 ms and returned, and every signal was a no-op:
++ * a waiter that does not re-check its predicate in a loop went on before the
++ * event. Killzone 2's stream reader waits once for a FIOS read and then copied
++ * a buffer the read had not filled yet (the colour-grading LUT came out zero).
++ * signal wakes one waiter, signal_all all of them; signal_to is treated as
++ * signal. A wait without a timeout still returns after LWCOND_SAFETY_MS
++ * (default 2) as a spurious wakeup: signalers need not hold the lwmutex, so
++ * a signal can come before the waiter registers, and the menus slowed to a
++ * crawl when such waits lasted seconds. LWCOND_POLL=1 restores the old poll. */
++#include <condition_variable>
++#include <mutex>
++#include <unordered_map>
++#include <chrono>
++struct LwcondState { std::condition_variable cv; uint32_t waiters = 0, signals = 0; };
++static std::mutex s_lwc_lock;
++static std::unordered_map<uint32_t, LwcondState> s_lwc;
++static int lwcond_poll(void)
++{
++    static int p = -1;
++    if (p < 0) { const char* e = getenv("LWCOND_POLL"); p = (e && atoi(e)) ? 1 : 0; }
++    return p;
++}
++static void sys_lwcond_destroy(ppu_context* ctx)
++{
++    std::lock_guard<std::mutex> g(s_lwc_lock);
++    auto it = s_lwc.find((uint32_t)ctx->gpr[3]);
++    if (it != s_lwc.end() && !it->second.waiters) s_lwc.erase(it);
++    ctx->gpr[3] = 0;
++}
++static void lwcond_wake(uint32_t lwcond, int all)
++{
++    std::lock_guard<std::mutex> g(s_lwc_lock);
++    auto it = s_lwc.find(lwcond);
++    if (it == s_lwc.end()) return;
++    LwcondState& st = it->second;
++    if (all) { st.signals = st.waiters; st.cv.notify_all(); }
++    else if (st.signals < st.waiters) { st.signals++; st.cv.notify_one(); }
++}
++static void sys_lwcond_signal(ppu_context* ctx)     { lwcond_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
++static void sys_lwcond_signal_all(ppu_context* ctx) { lwcond_wake((uint32_t)ctx->gpr[3], 1); ctx->gpr[3] = 0; }
++static void sys_lwcond_signal_to(ppu_context* ctx)  { lwcond_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
+ static void sys_lwcond_wait(ppu_context* ctx)
+ {
+     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
++    uint64_t timeout = ctx->gpr[4];            /* microseconds, 0 = none */
+     uint32_t lwmutex = vm_read32(lwcond + 0x00);
+     HANDLE s = lwm_sem(lwmutex);
+-    if (s) {
+-        uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+-        uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
++    if (!s) { ctx->gpr[3] = 0; return; }
++    uint32_t own = vm_read32(lwmutex + LWM_OWNER);
++    uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
++    uint64_t result = 0;
++    if (lwcond_poll()) {
+         vm_write32(lwmutex + LWM_RECUR, 0);
+         vm_write32(lwmutex + LWM_OWNER, 0);
+         ReleaseSemaphore(s, 1, NULL);
+         Sleep(1);
+-        WaitForSingleObject(s, INFINITE);
+-        vm_write32(lwmutex + LWM_OWNER, own);
+-        vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
++    } else {
++        static int safety = -1;
++        if (safety < 0) { const char* e = getenv("LWCOND_SAFETY_MS"); safety = e ? atoi(e) : 2; }
++        std::unique_lock<std::mutex> g(s_lwc_lock);
++        LwcondState& st = s_lwc[lwcond];
++        st.waiters++;
++        /* drop the lwmutex while holding the state lock: a signaler takes the
++         * lwmutex first and then this lock, so its signal cannot fall between */
++        vm_write32(lwmutex + LWM_RECUR, 0);
++        vm_write32(lwmutex + LWM_OWNER, 0);
++        ReleaseSemaphore(s, 1, NULL);
++        const auto limit = timeout ? std::chrono::microseconds(timeout)
++                                   : std::chrono::microseconds((uint64_t)safety * 1000u);
++        const bool got = st.cv.wait_for(g, limit, [&] { return st.signals > 0; });
++        if (got) st.signals--;
++        st.waiters--;
++        if (!got) {
++            if (timeout) result = 0x8001000Bull;   /* CELL_ETIMEDOUT */
++            /* else: a spurious wakeup, as the poll always was -- the guest
++             * re-checks its predicate, and a signal that came before this
++             * waiter registered (signalers need not hold the lwmutex) is not
++             * lost for longer than this */
++        }
+     }
+-    ctx->gpr[3] = 0;
++    WaitForSingleObject(s, INFINITE);
++    vm_write32(lwmutex + LWM_OWNER, own);
++    vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
++    ctx->gpr[3] = result;
+ }
+ 
+ /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
 index 49567d6..963d660 100644
 --- a/runtime/spu/spu_channels.c
