@@ -601,11 +601,12 @@ int main(int argc, char** argv)
     /* In the level the frame is gated by jm_post (workload 7), the SPU
      * post-processing job list. Its policy module keeps running while it has
      * jobs instead of returning to the kernel after each one (KZ3 fix list
-     * R6), and it may use up to three SPUs instead of one -- the WWS job
-     * manager claims jobs atomically per SPU row. 1.5 -> ~1.9 frames/s
-     * (docs/PROGRESS.md section 31). */
+     * R6), and it may use up to four SPUs instead of one -- the WWS job
+     * manager claims jobs atomically per SPU row. 1.5 -> ~2.1 frames/s on
+     * four host cores (docs/PROGRESS.md sections 31 and 34). Four used to
+     * stall; that was the taskset scheduler race fixed in section 32. */
     setenv("SPURS_PM_SELECT_CURRENT", "1", 0);
-    setenv("SPURS_MAXCONT", "7:3", 0);
+    setenv("SPURS_MAXCONT", "7:4", 0);
 
     uint32_t entry = ppu_load_elf(argv[1]);
     if (!entry) {

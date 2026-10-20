@@ -669,3 +669,12 @@ zeroed) and `pmaddwd`/`pmulld` forms. `tests/test_spu_sx.c` compares every
 one against the reference loops: 0 mismatches over 2M random inputs. The
 level runs ~2.0 frames/s (was ~1.9); the image is unchanged. The float ops
 (exact SPU truncation through double) remain the bulk of that loop.
+
+## 34. jm_post on four SPUs
+
+`SPURS_MAXCONT 7:4` used to stall; with the taskset scheduler race fixed
+(section 32) four runs at 7:4 and one at 7:5 ran to the end. The profile
+shows the hot jm_post filter already spread over three host threads, and
+the per-workload stats (`SPURS_PM_STATS=1`) put jm_post at ~1.4 busy cores
+on a four-core test pinning. The default is now 7:4: ~2.1 frames/s pinned to
+four cores (was ~2.0); a machine with more cores gains more.
