@@ -678,3 +678,19 @@ shows the hot jm_post filter already spread over three host threads, and
 the per-workload stats (`SPURS_PM_STATS=1`) put jm_post at ~1.4 busy cores
 on a four-core test pinning. The default is now 7:4: ~2.1 frames/s pinned to
 four cores (was ~2.0); a machine with more cores gains more.
+
+## 35. In the level: stable, but the opening scene does not advance
+
+A 15-minute Vulkan run (four cores) stayed in Corinth River at ~2.1
+frames/s with no stall and no crash. The view does not move, though: frame
+to frame the image differs by ~0.2 grey levels except for the ISA
+announcement subtitle ("Attention! Attention! Prepare for Air Operations."),
+which comes and goes every ~75 frames. Input reaches the game -- the
+`START` press of the test script that lands during loading opens the pause
+menu (Resume / Restart / Quit / Options) as the level starts -- but held
+sticks (`PAD_STICK`, `PAD_SWEEP`) and in-level presses of X, R1, R2, L1, L2,
+square and triangle change nothing in the view. The sound streamer's
+per-stream request counters (`+0x134` of the 0x38D8-byte stream records at
+`0x4211C000`) are all zero, so no music/dialogue stream is waiting to start.
+Next: find what the opening sequence waits on (script state, the cinematic
+camera, or the characters, which do not appear in the frame).
