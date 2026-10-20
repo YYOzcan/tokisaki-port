@@ -656,3 +656,16 @@ scheduler now reads and writes the bitsets under the lock-line lock, reports
 the write to SPU reservations, and dispatches the chosen tasks after
 releasing it. Six runs since, no physics stall (null renderer); two
 Vulkan runs held ~1.9 frames/s in the level.
+
+## 33. SSE forms of the SPU byte shifts and 16-bit multiplies
+
+A stack-sampling profile in the level put one jm_post job loop
+(`jobmod_a27e818cca34` at `0x5908`, a gather-and-sum filter) in two thirds of
+the samples. On x86 the runtime had vector forms only for shufb and the
+float ops; `rotqby`/`rotqbyi`/`shlqby*`/`rotqmby*` were 16-step byte loops and
+the `mpy` family was scalar per lane. They are now one `pshufb` (result SPU
+byte i = source byte i + d, host byte = SPU byte ^ 3, out-of-range lanes
+zeroed) and `pmaddwd`/`pmulld` forms. `tests/test_spu_sx.c` compares every
+one against the reference loops: 0 mismatches over 2M random inputs. The
+level runs ~2.0 frames/s (was ~1.9); the image is unchanged. The float ops
+(exact SPU truncation through double) remain the bulk of that loop.
