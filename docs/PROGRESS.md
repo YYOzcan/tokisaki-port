@@ -694,3 +694,13 @@ per-stream request counters (`+0x134` of the 0x38D8-byte stream records at
 `0x4211C000`) are all zero, so no music/dialogue stream is waiting to start.
 Next: find what the opening sequence waits on (script state, the cinematic
 camera, or the characters, which do not appear in the frame).
+
+A pass capture of one in-level frame (`RSX_ENGINE_PASS_DUMP`, 190 s in):
+1694 guest draws; six shadow-map passes of 14-387 draws each; the 2560x720
+G-buffer pass has 403 draws. The G-buffer albedo target is correct and
+neutral grey (bunk hatches and wall panels in full detail), and its depth
+spans 0.930..0.963 -- the camera faces a wall a short way off, so the
+static view is the scene's own framing, not missing geometry in front of
+it. The teal cast is therefore added later: the second target of the same
+pass is already blue-green, and the lighting and the colour-grading LUT
+(still the identity fill) come after that.
