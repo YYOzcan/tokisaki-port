@@ -736,8 +736,8 @@ objects are created and registered in the list at `0xFADDE8`; each binds
 (`0x1D77A0`), auto-starts (`0x1D7690`, playing flag `+0x11C` = 1) and runs
 its prepare step once. After that their update (`Sequence` vtable `0xF7CF4C`
 slot `+0x4C` = `0x1D7F00`, tick `0x1D7D60`) is **never called**: every
-sequence stays in state `+0x160` = 0 (ready is 2) with frame counter
-`+0x128` = 0, and no `SequenceCameraEntity` is ever created. The other
+sequence is ready (`+0x160` = 2) with its frame counter `+0x128` at 0, and
+no `SequenceCameraEntity` is ever created. The other
 inherited entity methods (`0x66xxxx`) also run only during level load. So
 the entity think pass does not reach these entities; finding where that
 pass is scheduled is the next step.
@@ -747,3 +747,40 @@ Tools added: `tools/ghidra/XrefsTo.java` (code references to an address),
 script timers; `run_gdb.sh` sets up the run environment), and `KZ2_DUMPAT`
 takes up to 64 entries and an absolute base with pointer chains
 (`A<ea>>0>10+20:40`).
+
+## 37. Entity updates run on fibers: host batch runner -- the opening cutscene plays
+
+The entity think scheduler (`0x684798`, called through the entity manager
+every world update) picks the entities that asked to update (`+0xE4` bit 3;
+visibility through the representation's last drawn frame, update range) and
+`0x684560` hands them to a fiber job system as one batch of jobs
+`{OPD 0x66E420, &entity}`:
+
+- `0x72438` runs a batch: five fiber contexts (stack, TOC, entry, argument)
+  and a switch into the first;
+- `0x7203C` is the switch: save the callee-saved registers (`0x71E10`),
+  pick the next runnable fiber (`0x72680`), load its registers -- `r1`
+  included -- and branch to its entry (`0x71F24`);
+- the job `0x66E420` waits for its parent entity (`0x72600`), updates the
+  entity (`0x66E288`) and ends (`0x72760`), switching to the next fiber.
+
+A hand-written context switch cannot be lifted to C: it cannot move to
+another stack or jump to an entry address, and the lifted code ran into the
+next function in the binary instead. No entity job ever ran, so after the
+level loaded nothing updated -- the sequences sat on frame 0, the camera
+never moved, the characters never appeared. (The Killzone 3 port replaced
+the same mechanism with host code, fix list P3.)
+
+`tools/postlift_fixups.py` now routes the three functions to
+`src/kz2_fiber.cpp`: the batch runs its jobs one after the other on the
+calling thread, each in a frame below the caller's; a job's end returns;
+the parent wait returns (the batch is sorted parents first, `0x684628`).
+One trap: `ppu_stwcx32` keeps the reservation in `g_active_ctx`, not in the
+context the lifted code passes, so each job is made the active context while
+it runs and the caller's is restored after -- otherwise every later `stwcx.`
+on the main thread failed and the allocator's semaphore spun forever.
+
+With that the opening cutscene plays: Garza walks Sev to the window of *The
+New Sun* ("Come on Sev, let's go. Time for us to deploy!", "Look at that.").
+Applying it to an existing lift: `python3 tools/postlift_fixups.py`, then
+rebuild (two chunks and the new file, under a minute at `-j 8`).

@@ -41,6 +41,30 @@ loc_009A2284:
         return;
 }""",
     ),
+    # Entity-update fiber jobs (docs/PROGRESS.md section 37, src/kz2_fiber.cpp):
+    # the title's hand-written context switch cannot run as lifted C, so the
+    # batch runner, the job end and the dependency wait go to host code.
+    (
+        "func_00072438",
+        "void func_00072438(ppu_context* ctx) {\n",
+        'extern "C" void kz2_fiber_run_batch(ppu_context*);\n'
+        "void func_00072438(ppu_context* ctx) {\n"
+        "        /* kz2 postlift: fiber batch on the host */ kz2_fiber_run_batch(ctx); return;\n",
+    ),
+    (
+        "func_00072760",
+        "void func_00072760(ppu_context* ctx) {\n",
+        'extern "C" void kz2_fiber_job_end(ppu_context*);\n'
+        "void func_00072760(ppu_context* ctx) {\n"
+        "        /* kz2 postlift: fiber job end on the host */ kz2_fiber_job_end(ctx); return;\n",
+    ),
+    (
+        "func_00072600",
+        "void func_00072600(ppu_context* ctx) {\n",
+        'extern "C" void kz2_fiber_wait(ppu_context*);\n'
+        "void func_00072600(ppu_context* ctx) {\n"
+        "        /* kz2 postlift: fiber wait on the host */ kz2_fiber_wait(ctx); return;\n",
+    ),
 ]
 
 
