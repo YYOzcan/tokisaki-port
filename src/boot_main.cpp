@@ -38,6 +38,7 @@
 #include <atomic>
 #include <csignal>
 #include <cstdint>
+#include <cctype>
 #include <cstdio>
 #if defined(__linux__)
 #include <sys/prctl.h>
@@ -256,7 +257,7 @@ static void peek_tick(void)
     }
 }
 
-/* KZ2_DUMPAT=<sec>:<ea>:<len>[,...]: hex-dump guest memory once, <sec>
+/* KZ2_DUMPAT=<sec>:<ea>:<len>[,...] (up to 64): hex-dump guest memory once, <sec>
  * seconds after the frame clock starts. */
 /* KZ2_THREADS=<sec>[,<sec>...]: print every guest thread's lr and registers. */
 extern "C" void ppu_report_guest_lrs(void);
@@ -321,23 +322,30 @@ static void dumpat_tick(void)
 {
     static const char* spec = getenv("KZ2_DUMPAT");
     static uint64_t t0 = 0;
-    static bool done[16];
+    static bool done[64];
     if (!spec) return;
     if (!t0) t0 = now_ms();
-    char buf[512];
+    static char buf[4096];
     strncpy(buf, spec, sizeof buf - 1);
     buf[sizeof buf - 1] = 0;
     int i = 0;
-    for (char* tok = strtok(buf, ","); tok && i < 16; tok = strtok(nullptr, ","), i++) {
+    for (char* tok = strtok(buf, ","); tok && i < 64; tok = strtok(nullptr, ","), i++) {
         unsigned sec = 0, ea = 0, len = 0, tk = 0, off = 0;
         /* <sec>:T<k>[>p1>p2...]+<off>:<len> dumps relative to word k of the
          * last cellSpursCreateTask argument (heap addresses move between
          * runs); each >p follows the pointer stored at the current address + p. */
-        unsigned rtid = 0, rreg = 0;
+        unsigned rtid = 0, rreg = 0, abs_ea = 0;
         const bool by_reg = sscanf(tok, "%u:R%u.%u", &sec, &rtid, &rreg) == 3;
-        if (by_reg || (sscanf(tok, "%u:T%u", &sec, &tk) == 2 && tk < 4)) {
+        /* A<ea>: a fixed address as the base, for following a global pointer
+         * (A<ea>>0>10+20:40 = *(*(ea)+0x10) + 0x20). */
+        const bool by_abs = !by_reg && sscanf(tok, "%u:A%x", &sec, &abs_ea) == 2;
+        if (by_reg || by_abs || (sscanf(tok, "%u:T%u", &sec, &tk) == 2 && tk < 4)) {
             const char* q;
-            if (by_reg) {
+            if (by_abs) {
+                ea = abs_ea;
+                q = strchr(tok, 'A') + 1;
+                while (isxdigit((unsigned char)*q)) q++;
+            } else if (by_reg) {
                 /* R<tid>.<reg>: a guest thread's register as the base */
                 ea = (uint32_t)ppu_guest_reg(rtid, rreg);
                 q = strchr(strchr(tok, 'R'), '.') + 1;

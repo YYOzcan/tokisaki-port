@@ -704,3 +704,46 @@ static view is the scene's own framing, not missing geometry in front of
 it. The teal cast is therefore added later: the second target of the same
 pass is already blue-green, and the lighting and the colour-grading LUT
 (still the identity fill) come after that.
+
+## 36. Why the opening scene stands still: its sequences never tick (open)
+
+The level is Corinth River's opening on the cruiser *The New Sun* (the
+checkpoint names `section_thenewsun ... cutscenes`, `cryo`, `launchbay`);
+the round hatches in view are its cryo pods. What was ruled out:
+
+- **Lua errors:** none. `luaL_error` (`0x3F3978`), `luaG_runerror`
+  (`0x3EFD40`) and `luaD_seterrorobj` (`0x3E6790`) are never hit
+  (`tools/gdb/lua_errors.py`). The level script's `OnUpdate` timer runs once
+  per frame (`0x2CEA30` -> `0x3E5A10`, `tools/gdb/script_timers.py`).
+- **Pause:** without the test script's START during loading the view is the
+  same.
+- **Streaming:** the cutscene lumps are read at level load; nothing waits on
+  the asset streaming thread; no sound stream has a pending request.
+- **Game state:** the campaign mode object is in state 7 (running), the
+  world update `0x24F0F8` runs every frame with game time advancing
+  (`dt` = 1/15 s at `0xF2A1D4`), and the session "is host" test
+  (`0x680DE8`) answers 1.
+- **Audio:** sound works in the title screen (port 0 peaks ~0.5); the
+  silence that follows is a separate open item. The fast SPU helpers were
+  bisected and are not the cause.
+
+What is wrong: the game's reflection table (type descriptors with name,
+member list, size and create/destroy function pointers 0x20 bytes before
+the name) gives the create functions of the sequence types: `Sequence`
+`0x1D4A20`, `SequenceRep` `0x1D4BC8`, `SequenceCameraEntity` `0x1D4E28`,
+`StartSequenceEventInstance` `0x1C71A0`. At level load 21 `Sequence`
+objects are created and registered in the list at `0xFADDE8`; each binds
+(`0x1D77A0`), auto-starts (`0x1D7690`, playing flag `+0x11C` = 1) and runs
+its prepare step once. After that their update (`Sequence` vtable `0xF7CF4C`
+slot `+0x4C` = `0x1D7F00`, tick `0x1D7D60`) is **never called**: every
+sequence stays in state `+0x160` = 0 (ready is 2) with frame counter
+`+0x128` = 0, and no `SequenceCameraEntity` is ever created. The other
+inherited entity methods (`0x66xxxx`) also run only during level load. So
+the entity think pass does not reach these entities; finding where that
+pass is scheduled is the next step.
+
+Tools added: `tools/ghidra/XrefsTo.java` (code references to an address),
+`tools/gdb/` (gdb Python scripts: call counts, backtraces, Lua errors,
+script timers; `run_gdb.sh` sets up the run environment), and `KZ2_DUMPAT`
+takes up to 64 entries and an absolute base with pointer chains
+(`A<ea>>0>10+20:40`).
