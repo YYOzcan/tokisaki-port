@@ -821,3 +821,19 @@ time until the first word of each record in the list at `0x11C27D8`
 count that something else -- most likely SPU jobs -- decrements when done.
 One decrement never arrived. Next: identify who decrements those counters
 (watch the word with `PPU_CASWATCH` / `SPU_DMA_RANGE` in a stalled run).
+
+Tracing the record the stalled run waited on (`0x235BB9D0`, the same
+address every run, first of 17 in the list): the main thread increments its
+pending count with `lwarx`/`stwcx.` in `0x557A10` (lr `0x557B94`) when it
+starts a job for it, and stores the buffer count at `+4` with plain stores
+(`0x557500`, `0x5573A0`). Each job is a SPURS task (SPU image 18, created
+with the record as its argument) that decrements the count on its 128-byte
+line `0x235BB980` with GETLLAR/PUTLLC (`pc 0x5EE0`; `SPU_ATOM_EA=235BB9D0`
+shows the attempts, several PUTLLCs fail and retry as expected). PUTLLC
+compares the whole line with its GETLLAR copy under the lock-line lock and
+`ppu_stwcx32` takes the same lock, so the count itself is serialized; the
+PPU's plain stores to the same line are the remaining suspect. These tasks
+only run since entity updates do (section 37). Next: catch a stalled run
+and read the record (`KZ2_DUMPAT=...:235BB9D0:0x20`) -- a count of
+0xFFFFFFFF would mean a lost increment, a positive count a lost decrement
+or a task that never ran.
