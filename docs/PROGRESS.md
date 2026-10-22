@@ -839,3 +839,104 @@ and read the record (`KZ2_DUMPAT=...:235BB9D0:0x20`) -- a count of
 or a task that never ran.
 Four more unpinned runs with that dump did not stall (count 1 at 200 s, the
 normal in-flight value); the stall rate is about one run in eight.
+
+## 40. Where the gameplay frame went: one GPU round trip per draw
+
+A whole-process sampling profile in gameplay (`tools/prof_all.sh`, eu-stack of
+every thread every 0.5 s; `tools/prof_report.py` summarises) showed only ~1.6
+of 16 host threads busy. The guest main thread spent 78% of its time waiting
+for GCM label 0x4B, and the FIFO thread was nearly always inside the Vulkan
+backend's `vk_submit_and_wait`: every operation (draw, clear, upload,
+snapshot) was its own command buffer, submitted and waited on. A level frame
+has ~1700 draws.
+
+The backend now records into one open command buffer and submits only when
+the host needs a result (readbacks, present, the engine's `submit_and_wait`)
+or a per-batch resource runs out (patch 0014):
+- a full memory barrier opens every operation (all images stay in GENERAL),
+  so each one still sees everything recorded before it;
+- vertices, indices, constants and upload staging come from one 128 MB
+  host-coherent ring, reset after each wait; constants are copied once while
+  they stay the same;
+- each draw gets a descriptor set from a pool reset after each wait (or the
+  previous draw's, when nothing it names changed);
+- images, framebuffers, pipelines and modules released while a batch is open
+  are destroyed after it ran; readbacks reuse one cached staging buffer.
+`PS3RECOMP_VK_SYNC=1` waits on every operation again;
+`PS3RECOMP_VK_SUBMIT_STATS=1` prints submissions, operations and wait time.
+
+Menus went from ~100 to ~250 presented frames/s and the campaign loads in
+about a third of the time (level start at ~70 s instead of ~200 s). In the
+level the frame rate barely moved: the waits that remained are at the points
+the host really needs the GPU, about 24 a frame.
+
+Two findings about those waits:
+- **The NVIDIA dGPU stays at 330-550 MHz** (P5/P8, 4-8 W, 30-40% busy) under
+  this stop-and-go load; `nvidia-settings GPUPowerMizerMode=1` does not change
+  it on this laptop. The integrated Radeon 680M (`PS3RECOMP_VK_DEVICE=1`)
+  halves the wait time (5-6.5 instead of ~4.3 frames/s at that point).
+- Most of the remaining FIFO-thread time was textures that sample a render
+  target in another format through guest memory (section 41).
+
+## 41. Targets read in another format, built on the GPU
+
+`RSX_ENGINE_RT_LOG=<n>` lists the textures the engine resolves through guest
+memory. In the level, every frame:
+- the 2560x720 D24S8 depth buffer read as A8R8G8B8 (deferred lighting
+  rebuilds positions from it; bound in ~67 draws);
+- the 2560x720 RGBA8 G-buffer target read as Y16_X16_FLOAT;
+- the Z16 shadow map read as DEPTH16 (1024x1024) and X16 (640x360).
+Each costs a GPU wait, a readback, a store to guest memory, a content hash,
+a CPU decode and an upload -- and the texture cache made a new GPU image for
+every changed texture and destroyed the old one.
+
+- The cache re-decodes a changed texture into the image it already has
+  (`RSX_TEX_REUPLOAD=0` turns that off).
+- The backend's new `reinterpret` entry builds the texture on the GPU: the
+  target is copied into the batch ring, a compute pass
+  (`shaders/rsx_vk_reinterpret.comp`, compiled into
+  `rsx_vk_reinterpret_spv.h`) turns each pixel into the texel the decoder
+  would have made of the guest bytes, and that is copied into the texture --
+  no wait, no CPU work. The engine keeps one result per (address, size,
+  format, crossbar) and rebuilds it only when the target's write serial moved.
+- The Z16 kinds stay on the guest-memory path: with them on the GPU the level
+  start stalled in two of two runs (something reads the shadow map's guest
+  bytes). `RSX_GPU_REINTERPRET_MASK` (default 5 = D24S8->ARGB8 and
+  RGBA8->Y16_X16_FLOAT; 7 adds Z16; 0 = all off) selects them.
+
+## 42. The fma fast path: TwoSum instead of the boundary test
+
+The AVX2 forms of `fma/fms/fnms` (section 30) sent every lane whose double
+result had its 29 low bits clear to the exact per-lane path -- every exactly
+representable result, the common case in the post-processing filters --
+which is why `spu__xv_fix3` was a quarter of all SPU samples. Like upstream's
+AVX2 path (#369) and the NEON one, a lane now leaves the fast path only when
+TwoSum says the double add actually rounded onto that boundary.
+`tests/test_spu_fma.c` compares all six float ops with the exact reference on
+4 M random and image-filter-like vectors: 0 mismatches.
+
+## 43. The level-start stall: lost taskset bit updates (upstream #340, #388)
+
+With the faster FIFO thread the level-start stall of section 39 showed in
+about every second run, in two shapes: the main thread in `0x5573A0`
+(pending count) or in `0x4FAAB0`, a semaphore held by a worker that waits on
+an event queue for an SPU task (`0x4F7668`: create task, wait for its
+completion events) that never reports. Both are SPURS tasks that never
+finish.
+
+The taskset's ready/pending/enabled/signalled bitsets share its first
+128-byte line with the SPU task library, which updates them with
+GETLLAR/PUTLLC under the lock-line lock. Three host writers did a plain
+read outside that lock and a write inside it, undoing any SPU commit in
+between: `cellSpursCreateTask`'s free-slot search and `add_task`'s
+enabled/ready bits (fixed upstream in #388 by undecuple, Killzone 3),
+the signalled bit in `spu_taskset_signal_task` / `spu_taskset_wait_signal`
+(#340, Kurtisone, Twisted Metal), and the host policy module's
+ready->running move. All four now update the raw bytes under the lock-line
+lock and drop the line's reservations. Four runs since, none stalled (each
+~5 frames/s in gameplay with two instances side by side).
+
+A per-doubleword PUTLLC commit (keep a PPU plain store that lands between
+the compare and the copy) was tried and reverted: the level start crashed in
+`memcpy` into the stack region twice and stalled once -- a line written
+piecemeal is visible half-written for longer than the 128-byte copy.
