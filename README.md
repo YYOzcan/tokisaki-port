@@ -33,9 +33,13 @@ Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.15.0, pinne
 | Asset streaming | **works** — FIOS reads `data_ps3.psarc`; Edge Zlib requests are inflated on the host |
 | Rendering | title screen and menus with full text on Vulkan, 60-150 presented frames/s; campaign loading screen renders |
 | Front end | language select → gamma → main menu → save warning → start screen → campaign difficulty → campaign start (driven with `PAD_SCRIPT`) |
-| Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); campaign start sound teardown hang resolved; advances to level asset loading; gameplay not reached |
+| Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); Corinth River loads, the opening cutscene on *The New Sun* plays and gameplay starts ("Follow Garza to the Launch Bay") at ~3 frames/s; audio is silent after the title screen |
 
-![First in-level image: the Intruder dropship in the Corinth River intro](docs/media/in-level-intruder-first-image.png)
+![Gameplay: first objective on The New Sun, "Follow Garza to the Launch Bay"](docs/media/new-sun-first-gameplay.png)
+
+![Opening cutscene: Garza at the window of The New Sun](docs/media/new-sun-cutscene-garza.png)
+
+![First in-level image: the cryo bay of The New Sun before entity updates ran](docs/media/in-level-intruder-first-image.png)
 
 ![Main menu on ps3recomp v0.15.0: every glyph present](docs/media/main-menu-v015.png)
 
@@ -123,7 +127,7 @@ Diagnostics: `tools/snapshot.sh` (all thread stacks under gdb), `tools/sample.sh
 | Varlık akışı | **çalışıyor** — FIOS `data_ps3.psarc` okuyor; Edge Zlib istekleri host'ta açılıyor |
 | Grafik | menüler yazılarıyla Vulkan'da ekrana geliyor, saniyede 30-60+ kare (bazı harfler eksik) |
 | Menüler | dil seçimi → gama → ana menü → kayıt uyarısı → başlangıç ekranı → zorluk seçimi → kampanya başlangıcı (`PAD_SCRIPT` ile) |
-| Video / oynanış | giriş videosu oynatıcısı kilitleniyor (`tools/make_vfs_nointro.sh` ile atlanıyor); kampanya başlangıcı ses motoru kilitlenmesi çözüldü, seviye varlık yüklemesine geçildi; oynanışa ulaşılmadı |
+| Video / oynanış | giriş videosu oynatıcısı kilitleniyor (`tools/make_vfs_nointro.sh` ile atlanıyor); Corinth River yükleniyor, *The New Sun* açılış sinematiği oynuyor ve oynanış başlıyor ("Follow Garza to the Launch Bay"), ~3 kare/s; başlık ekranından sonra ses yok |
 
 Ayrıntılı mühendislik günlüğü: [docs/PROGRESS.md](docs/PROGRESS.md).
 

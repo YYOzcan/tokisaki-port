@@ -784,3 +784,9 @@ With that the opening cutscene plays: Garza walks Sev to the window of *The
 New Sun* ("Come on Sev, let's go. Time for us to deploy!", "Look at that.").
 Applying it to an existing lift: `python3 tools/postlift_fixups.py`, then
 rebuild (two chunks and the new file, under a minute at `-j 8`).
+
+A 12-minute run after the fix: the cutscene ends and gameplay starts -- the
+HUD shows the first objective, "Follow Garza to the Launch Bay", in first
+person on the walkway of *The New Sun* -- at ~3.1 presented frames/s on four
+cores, with no stall to the end of the run. README screenshots:
+`docs/media/new-sun-cutscene-garza.png`, `docs/media/new-sun-first-gameplay.png`.
