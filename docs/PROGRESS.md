@@ -837,3 +837,5 @@ only run since entity updates do (section 37). Next: catch a stalled run
 and read the record (`KZ2_DUMPAT=...:235BB9D0:0x20`) -- a count of
 0xFFFFFFFF would mean a lost increment, a positive count a lost decrement
 or a task that never ran.
+Four more unpinned runs with that dump did not stall (count 1 at 200 s, the
+normal in-flight value); the stall rate is about one run in eight.
