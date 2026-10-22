@@ -808,3 +808,16 @@ cores, with no stall to the end of the run. README screenshots:
   `GetSFXVolume` / `GetSpeechVolume` / `GetMusicVolume` in the EBOOT).
 - The fast SPU helpers were bisected (scalar float, scalar int, byte shifts
   and each multiply) and are not involved.
+
+## 39. Gameplay frame rate and an occasional stall at level start
+
+Without the four-core pinning (all 16 host threads, `nice`), gameplay runs
+at ~4.3-4.6 presented frames/s (pinned to four cores: ~3.1). Two runs of
+eight stopped for good right after the level's first entity batch (0
+frames/s for minutes); the others went on. The one caught with thread dumps
+has the main thread in `0x57A6C0` -> `0x5573A0`, which sleeps 10 us at a
+time until the first word of each record in the list at `0x11C27D8`
+(count, array) drops to 0 and then frees the record's buffers: a pending
+count that something else -- most likely SPU jobs -- decrements when done.
+One decrement never arrived. Next: identify who decrements those counters
+(watch the word with `PPU_CASWATCH` / `SPU_DMA_RANGE` in a stalled run).
