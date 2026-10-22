@@ -790,3 +790,21 @@ HUD shows the first objective, "Follow Garza to the Launch Bay", in first
 person on the walkway of *The New Sun* -- at ~3.1 presented frames/s on four
 cores, with no stall to the end of the run. README screenshots:
 `docs/media/new-sun-cutscene-garza.png`, `docs/media/new-sun-first-gameplay.png`.
+
+## 38. Audio after the title screen (open)
+
+- The title screen's music reaches the cellAudio port (peaks ~0.4-0.6).
+  Measurements in the menus are unreliable: `KZ2_DUMPAT` fires from the
+  frame clock, which pauses during loads, so a dump labelled "23 s" can land
+  much later. A fresh profile and the existing one both have music in the
+  main menu when sampled there; the two `PROFILE.DAT` files differ in six
+  bytes, none of them a volume.
+- In the level the port carries ~1e-37: silence. The voice records
+  (`0x0108xxxx`, 768 bytes each) hold sample data around 0.003-0.02 and
+  volumes ~0.4-0.7, while the bus meters the mixer writes at `0x01171E00`
+  read about -360 dB. The signal is lost between the voices and the buses:
+  a gain stage -- 3D attenuation against the listener, or a group volume --
+  is the next place to look (`ESoundMasterVolumeGroup`, `Ducker`,
+  `GetSFXVolume` / `GetSpeechVolume` / `GetMusicVolume` in the EBOOT).
+- The fast SPU helpers were bisected (scalar float, scalar int, byte shifts
+  and each multiply) and are not involved.
