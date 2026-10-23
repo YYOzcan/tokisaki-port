@@ -1,0 +1,119 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 271ac4e..2b4aa90 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -745,7 +745,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
+     if (y + h > s->h) h = s->h - y;
+     u8* rows = eng_coherence_buffer(w * 4u * h);
+     if (!rows) return;
+-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++    if (!g.be->readback_ordered) g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+     g.be->readback(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+     if (eng_coherence_log())
+         fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X at %u,%u:"
+@@ -1223,7 +1223,7 @@ static int eng_zdepth_to_guest(u32 slot)
+         s_depth_rows = n;
+         s_depth_cap = w * h;
+     }
+-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++    if (!g.be->readback_ordered) g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+     if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
+                              w * (u32)sizeof(float)) != 0)
+         return 0;
+@@ -1315,7 +1315,7 @@ static void eng_surface_writeback(u32 slot)
+     if (s->pitch < s->w * bpp) { s->guest_dirty = 0; return; }
+     u8* rows = eng_coherence_buffer(s->w * bpp * s->h);
+     if (!rows) return;
+-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++    if (!g.be->readback_ordered) g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+     g.be->readback(g.be->user, s->handle, 0, 0, s->w, s->h, rows, s->w * bpp);
+     for (u32 r = 0; r < s->h; r++) {
+         u8* dst = (u8*)eng_guest_ptr(NULL, s->location, s->offset + r * s->pitch, s->w * bpp);
+@@ -2196,14 +2196,14 @@ static int eng_xform_fits(const rsx_dsp_texture* t, u32 pitch, u32 bpp, u32 w, u
+ }
+ 
+ /* RSX_GPU_REINTERPRET_MASK: which kinds may take the GPU path -- bit kind-1
+- * (1 D24S8 as ARGB8, 2 Z16 as DEPTH16/X16, 4 RGBA8 as Y16_X16_FLOAT). Z16 is
+- * off by default: with Killzone 2's shadow map built on the GPU the level
+- * start parks the RSX for good, even with the guest copy still stored at the
+- * next label or idle point -- not understood yet. */
++ * (1 D24S8 as ARGB8, 2 Z16 as DEPTH16/X16, 4 RGBA8 as Y16_X16_FLOAT). Z16 was
++ * off: with Killzone 2's shadow map built on the GPU the level start parked
++ * the RSX for good -- before the SPURS task-id race (Killzone 2 port, section
++ * 53) was fixed; it does not any more. All three are on. */
+ static int eng_xform_mask(void)
+ {
+     static int mask = -1;
+-    if (mask < 0) { const char* e = getenv("RSX_GPU_REINTERPRET_MASK"); mask = e ? (int)strtol(e, 0, 0) : 5; }
++    if (mask < 0) { const char* e = getenv("RSX_GPU_REINTERPRET_MASK"); mask = e ? (int)strtol(e, 0, 0) : 7; }
+     return mask;
+ }
+ 
+@@ -2314,11 +2314,15 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+                 if (kind && eng_xform_fits(&t, z->pitch, bpp, z->w, z->h)) {
+                     const u32 xh = eng_xform_get(kind, &t, z->handle, z->depth_serial);
+                     if (xh) {
+-                        /* Killzone 2 also reads the Z16 shadow map's guest
+-                         * bytes elsewhere: the store is still owed, at the
+-                         * next point the host waits for the GPU anyway (a
+-                         * label release, or the FIFO going idle). */
+-                        if (kind == RSX_BE_XFORM_DEPTH16_R16) g.zdepths[zsrc].wb_pending = 1;
++                        /* The Z16 guest copy is not stored: each store is
++                         * a GPU wait (~8 a frame in Killzone 2's level) and
++                         * nothing visible was found to read it.
++                         * RSX_Z16_GUEST_STORE=1 stores it at the next point
++                         * the host waits for the GPU anyway (a label
++                         * release, or the FIFO going idle). */
++                        static int z16st = -1;
++                        if (z16st < 0) { const char* e = getenv("RSX_Z16_GUEST_STORE"); z16st = e && e[0] == '1'; }
++                        if (kind == RSX_BE_XFORM_DEPTH16_R16 && z16st) g.zdepths[zsrc].wb_pending = 1;
+                         textures[u] = xh; continue;
+                     }
+                 }
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index d9c5991..4b38c87 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -247,6 +247,11 @@ typedef struct rsx_draw_backend {
+     void (*draw_cached)(void* user, rsx_topology topology, u64 key, const void* vertices,
+                         u32 vertex_count, u32 stride, const u32* indices,
+                         u32 index_count);
++    /* Nonzero: readback and depth_readback order themselves after every
++     * operation recorded before them and wait for their own result, so the
++     * engine need not submit_and_wait first (that was a second GPU round
++     * trip per readback). */
++    int readback_ordered;
+ } rsx_draw_backend;
+ 
+ #define RSX_BE_XFORM_DEPTH24_ARGB8  1u   /* D24S8 depth as A8R8G8B8       */
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index ba7f32a..b66ae7d 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -2372,6 +2372,18 @@ static void vk_cb_present(void* ud, u32 buffer_id)
+     (void)ud; (void)buffer_id;
+     if (!s_vk.device) return;
+ 
++    /* The frame comes back to the host only for a dump (or the headless
++     * test hook, last_center): in a window it was a full-frame copy and a
++     * GPU wait on every present for nothing. */
++    static int rb = -1;   /* PS3RECOMP_VK_PRESENT_READBACK: 1 headless, 0 in a window */
++    if (rb < 0) { const char* e = getenv("PS3RECOMP_VK_PRESENT_READBACK"); rb = e ? (e[0] == '1') : !s_vk.windowed; }
++    if (!rb && !s_vk.dump_path) {
++        s_vk.presented++;
++        s_g.last_draws = s_g.draws;
++        s_g.draws = 0;
++        vk_present_window();
++        return;
++    }
+     if (vk_begin()) return;
+     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+     VkBufferImageCopy region = {
+@@ -4086,6 +4098,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
+     .set_depth_bounds     = vk_eng_set_depth_bounds,
+     .draw                 = vk_eng_draw,
+     .draw_cached          = vk_eng_draw_cached,
++    .readback_ordered     = 1,
+     .clear_color          = vk_eng_clear_color,
+     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
+     .present              = vk_eng_present,

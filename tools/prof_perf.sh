@@ -9,6 +9,8 @@ WARM="${1:-210}"; SECS="${2:-20}"; OUT="${3:-${ROOT}/logs/kzprof.txt}"
 [ "${ROOT}/build/kzprof" -nt "${ROOT}/tools/kzprof.c" ] || cc -O2 -o "${ROOT}/build/kzprof" "${ROOT}/tools/kzprof.c"
 export KZ2_RUN_DIR="${KZ2_RUN_DIR:-${ROOT}/run_test}" PS3RECOMP_VK_WINDOW="${PS3RECOMP_VK_WINDOW:-0}"
 export KZ2_FPS="${KZ2_FPS:-1}" KZ2_ALLOW_PTRACE=1
+# as in a window: no full-frame readback per present unless frames are dumped
+export PS3RECOMP_VK_PRESENT_READBACK="${PS3RECOMP_VK_PRESENT_READBACK:-0}"
 export PAD_SCRIPT="${PAD_SCRIPT:-20:0x4000,26:0x4000,32:0x4000,38:0x0008,44:0x4000,50:0x4000,56:0x0008,62:0x4000}"
 "${ROOT}/tools/run.sh" > "${OUT%.txt}.log" 2>&1 &
 PID=$!

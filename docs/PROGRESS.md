@@ -1273,3 +1273,35 @@ its time, a fifth of that waiting for the GPU). Patch 0023:
 
 Gameplay (one instance, power-saver, `SPURS_MAXCONT=7:4 KZ2_FLIP_IMMEDIATE=1`):
 9.1 -> 10.5 frames/s. The FIFO thread is busy ~90% again (GPU waits ~19%).
+
+## 56. Where the FIFO thread waited for the GPU
+
+`PS3RECOMP_VK_SUBMIT_STATS=1` now also splits the batch ring's traffic
+(vertices, indices, VS/PS constants) and counts the waits by caller
+(printed as offsets from `vk_submit_and_wait`; add `nm`'s address of it and
+`addr2line`). In gameplay the FIFO thread waited ~23 times a frame, ~0.94 ms
+each:
+- **8 a frame: the Z16 shadow map stored into guest memory** -- each time
+  the engine waited for the GPU, then the readback waited again.
+- 3-4 a frame: main-memory colour targets stored for the SPU post-processing
+  (`flush_main_targets` at a label release) -- needed.
+- 1 a frame: the present read the whole frame back to the host, which only a
+  frame dump (or the headless test hook) uses.
+
+Patch 0025:
+- `rsx_draw_backend.readback_ordered`: the Vulkan readbacks order themselves
+  after everything recorded and wait for their own result, so the engine's
+  wait before them is skipped (two GPU round trips per readback became one).
+- the present's full-frame readback only for a dump, or with
+  `PS3RECOMP_VK_PRESENT_READBACK=1` (default on headless, off in a window).
+- **Z16 on the GPU, without a guest copy**: `RSX_GPU_REINTERPRET_MASK`
+  defaults to 7 (Z16 included). It was off for "parks the RSX for good" --
+  observed before the SPURS task-id race of section 53 was fixed; it does not
+  any more. The guest copy that was still owed is no longer stored
+  (`RSX_Z16_GUEST_STORE=1` stores it): nothing visible reads it, and the
+  frames compared with and without show the same lighting.
+- the depth-via-guest log (`RSX_ENGINE_RT_LOG`) prints before the GPU path is
+  tried, so it counts candidates, not fallbacks.
+
+Gameplay: 10.8 -> ~12.3 frames/s; FIFO thread drain 70% (GPU wait 6%), parked
+30% -- waiting for the SPU post-processing again.
