@@ -1,13 +1,13 @@
 # Tokisaki Port (Killzone 2 PC Port)
 
-[![Project Status](https://img.shields.io/badge/Status-Boots%20%2F%20first%20frames-orange.svg)]()
+[![Project Status](https://img.shields.io/badge/Status-In--game%20(slow)-orange.svg)]()
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![Target Platform](https://img.shields.io/badge/Target-PC%20(x86__64)-lightgrey.svg)]()
 
 > [!WARNING]
-> **Work in progress — this is not a playable port.**
-> The game boots, streams its data, runs its SPU jobs and walks its menus up to the start of a campaign, but it is far from playable: the campaign level loads and its loading screen renders, but the first in-level frames stall on a command-buffer park nothing patches (docs/PROGRESS.md §20), so nothing past the loading screen is shown yet; the intro movie stalls. Status details below.
-> **Devam eden bir çalışma — oynanabilir bir port değildir.** Oyun açılıyor, verisini okuyor, SPU işlerini çalıştırıyor ve menülerinde bir kampanya başlatmaya kadar ilerliyor; kampanya seviyesi yükleniyor ve yükleme ekranı çiziliyor, ancak seviye içindeki ilk kareler yamalanmayan bir komut tamponu park noktasında takılıyor (docs/PROGRESS.md §20); giriş videosu takılıyor.
+> **Work in progress — playable only in a limited sense.**
+> The campaign starts, the opening cutscene on *The New Sun* plays and you can play the first level with keyboard and mouse or a controller, with sound — but at **~5-6 frames/s** (Radeon 680M; the game's own clock then runs at about a third of real time), with a teal colour cast, and the level start still stalls in roughly one run of six. Details below and in docs/PROGRESS.md §40-48.
+> **Devam eden bir çalışma — ancak sınırlı anlamda oynanabilir.** Kampanya başlıyor, *The New Sun* açılış sinematiği oynuyor ve ilk bölüm klavye+fare ya da kontrolcüyle, sesli olarak oynanabiliyor; ancak **~5-6 kare/s** hızında (Radeon 680M; oyunun kendi saati gerçek zamanın yaklaşık üçte biri hızında akıyor), deniz mavisi bir renk tonu var ve bölüm başlangıcı yaklaşık altı denemeden birinde hâlâ takılıyor.
 >
 > Built on [ps3recomp](https://github.com/sp00nznet/ps3recomp); the boot harness is adapted from [Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal). Developed with an AI coding agent. See [CREDITS.md](CREDITS.md).
 
@@ -31,9 +31,12 @@ Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.15.0, pinne
 | Build & link | **done** — ~118 MB native x86-64 binary (clang, ~3 min at -j8) |
 | Boot | CRT, TLS, SPURS ×2, FIOS, cellGcm 720p, display buffers/tiles/zcull, cellFont, cellSaveData, cellAudio, trophies |
 | Asset streaming | **works** — FIOS reads `data_ps3.psarc`; Edge Zlib requests are inflated on the host |
-| Rendering | title screen and menus with full text on Vulkan, 60-150 presented frames/s; campaign loading screen renders |
-| Front end | language select → gamma → main menu → save warning → start screen → campaign difficulty → campaign start (driven with `PAD_SCRIPT`) |
-| Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); Corinth River loads, the opening cutscene on *The New Sun* plays and gameplay starts ("Follow Garza to the Launch Bay") at ~3 frames/s; audio is silent after the title screen |
+| Rendering | Vulkan, batched submissions; menus at ~250 presented frames/s; the level renders its deferred passes, shadows and post-processing (teal cast: the colour-grading LUT is still an identity fill) |
+| Front end | language select → gamma → main menu → save warning → start screen → campaign difficulty → campaign start |
+| Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); Corinth River loads in ~70 s, the opening cutscene on *The New Sun* plays and gameplay starts ("Follow Garza to the Launch Bay") at **~5-6 frames/s** on the Radeon 680M (~2.5 on the RTX 4050 Laptop, whose clocks stay low under this load) |
+| Audio | menus and level |
+| Input | keyboard + mouse (first-person layout) or an SDL game controller |
+| Stability | the level start stalls in about one run of six (docs/PROGRESS.md §45-47) |
 
 ![Gameplay: first objective on The New Sun, "Follow Garza to the Launch Bay"](docs/media/new-sun-first-gameplay.png)
 
@@ -66,10 +69,21 @@ The repository is named after Kurumi Tokisaki (*Date A Live*), a character who c
 tools/play.sh
 ```
 
-Enter = START, Space = Cross, Esc = Circle, arrow keys = D-pad, R/F = Square,
-T/C = Triangle, Q/E = L1/R1, Tab = SELECT; an SDL game controller also works.
-The game currently runs through the menus to campaign start and stops at the
-first physics step of the level.
+| Key / Tuş | Pad | | Key / Tuş | Pad |
+|---|---|---|---|---|
+| W A S D | left stick (move) | | Mouse / Fare | right stick (look) |
+| Left click / Sol tık | R1 (fire) | | Right click / Sağ tık | L1 (aim) |
+| Space | Cross (jump) | | Left Ctrl | Circle (crouch) |
+| R / F | Square (reload) | | T / C | Triangle (weapon) |
+| G | R2 (grenade) | | Z | L2 (cover) |
+| Left Shift | L3 (sprint) | | V / middle click | R3 (melee) |
+| Enter | START (pause) | | Esc / Backspace | Circle (back) |
+| Arrow keys / Ok tuşları | D-pad | | Tab | SELECT |
+| F1 | release / recapture the mouse | | | |
+
+An SDL game controller also works. On a hybrid laptop the integrated GPU is
+used by default (`KZ2_GPU=dgpu tools/play.sh` for the discrete one);
+`PS3_PAD_MOUSE_SENS` sets the look speed.
 
 ## Credits
 Most of what runs is other people's work: the **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** toolkit and runtime (Ned Heller / sp00nznet and contributors), and the Linux boot harness of **[Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal)**, both MIT. Bugs fixed in `patches/ps3recomp/` were first found by others; see **[CREDITS.md](CREDITS.md)** and **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**. This port is developed by YYOzcan with an AI coding agent (Claude); the reasoning behind every change is in [docs/PROGRESS.md](docs/PROGRESS.md).
@@ -116,7 +130,7 @@ Diagnostics: `tools/snapshot.sh` (all thread stacks under gdb), `tools/sample.sh
 
 ### 📊 Proje Durumu: açılıyor, veri akıtıyor, ilk karelerini çiziyor (ön-alfa)
 
-**[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.14.0, alt modül olarak sabitlendi; bu porta ait düzeltmeler `patches/ps3recomp/` altında) üzerine kuruludur. Ana hedef Linux/Vulkan'dır.
+**[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.15.0, alt modül olarak sabitlendi; bu porta ait düzeltmeler `patches/ps3recomp/` altında) üzerine kuruludur. Ana hedef Linux/Vulkan'dır.
 
 | Aşama | Durum |
 |---|---|
@@ -125,9 +139,12 @@ Diagnostics: `tools/snapshot.sh` (all thread stacks under gdb), `tools/sample.sh
 | Derleme | **tamam** — ~118 MB yerel x86-64 çalıştırılabilir dosya |
 | Açılış | CRT, TLS, 2×SPURS, FIOS, cellGcm 720p, ekran tamponları, cellFont, cellSaveData, cellAudio, kupalar |
 | Varlık akışı | **çalışıyor** — FIOS `data_ps3.psarc` okuyor; Edge Zlib istekleri host'ta açılıyor |
-| Grafik | menüler yazılarıyla Vulkan'da ekrana geliyor, saniyede 30-60+ kare (bazı harfler eksik) |
-| Menüler | dil seçimi → gama → ana menü → kayıt uyarısı → başlangıç ekranı → zorluk seçimi → kampanya başlangıcı (`PAD_SCRIPT` ile) |
-| Video / oynanış | giriş videosu oynatıcısı kilitleniyor (`tools/make_vfs_nointro.sh` ile atlanıyor); Corinth River yükleniyor, *The New Sun* açılış sinematiği oynuyor ve oynanış başlıyor ("Follow Garza to the Launch Bay"), ~3 kare/s; başlık ekranından sonra ses yok |
+| Grafik | Vulkan, toplu gönderim; menüler ~250 kare/s; bölümde ertelenmiş aydınlatma, gölgeler ve son işlem çiziliyor (deniz mavisi ton: renk tablosu hâlâ birim dolgu) |
+| Menüler | dil seçimi → gama → ana menü → kayıt uyarısı → başlangıç ekranı → zorluk seçimi → kampanya başlangıcı |
+| Video / oynanış | giriş videosu oynatıcısı kilitleniyor (`tools/make_vfs_nointro.sh` ile atlanıyor); Corinth River ~70 s'de yükleniyor, *The New Sun* açılış sinematiği oynuyor ve oynanış başlıyor ("Follow Garza to the Launch Bay"): Radeon 680M'de **~5-6 kare/s** (RTX 4050 Laptop'ta ~2,5: saat hızı bu yükte düşük kalıyor) |
+| Ses | menülerde ve bölümde |
+| Kontrol | klavye + fare (FPS düzeni) veya SDL kontrolcü |
+| Kararlılık | bölüm başlangıcı yaklaşık altı denemeden birinde takılıyor (docs/PROGRESS.md §45-47) |
 
 Ayrıntılı mühendislik günlüğü: [docs/PROGRESS.md](docs/PROGRESS.md).
 

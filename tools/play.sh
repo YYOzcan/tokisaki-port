@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# Tokisaki Port -- play in a window (Vulkan), driven from the keyboard.
+# Tokisaki Port -- play in a window (Vulkan), with keyboard and mouse.
 #
-#   Enter        START          Arrow keys   D-pad
-#   Space        Cross          Esc / Bksp   Circle
-#   R / F        Square         T / C        Triangle
-#   Q / 1        L1             E / 3        R1
-#   Tab / `      SELECT
+#   W A S D      move (left stick)     Mouse        look (right stick)
+#   Left click   fire (R1)             Right click  aim / zoom (L1)
+#   Space        jump (Cross)          Left Ctrl    crouch (Circle)
+#   R / F        reload (Square)       T / C        switch weapon (Triangle)
+#   G            grenade (R2)          Z            cover (L2)
+#   Left Shift   sprint (L3)           V / middle   melee (R3)
+#   Q / E        L1 / R1               Arrow keys   D-pad
+#   Enter        START (pause)         Tab / `      SELECT
+#   Esc / Bksp   Circle (back in menus)
+#   F1           release / recapture the mouse
 #
+# The mouse is captured while the window has the focus. PS3_PAD_MOUSE_SENS
+# (default 3) sets the look speed; PS3_PAD_KBM=0 restores the old layout with
+# WASD on the d-pad.
 # A connected game controller works as well (SDL).
 # The window title shows the running build; KZ2_FPS=1 prints presented
 # frames per second to the terminal.

@@ -1053,3 +1053,16 @@ the normal range still go per lane. `tests/test_spu_fma.c` now feeds
 denormal and extended operands too: 0 mismatches against the exact
 reference. Fallback lanes fell to ~70 M a minute (mostly fma results that
 really rounded onto a boundary) and jm_post's busy time by about a fifth.
+
+## 49. Keyboard and mouse as a first-person pad
+
+The keyboard fallback put WASD on the d-pad and had no right stick, L2/R2 or
+L3/R3: without a game controller the level could not be played. With
+`PS3_PAD_KBM` on (the default; patch 0018) WASD is the left stick, the mouse
+the right stick (motion since the last poll, `PS3_PAD_MOUSE_SENS` per pixel,
+default 3), left/right/middle click R1/L1/R3, Left Shift L3, V R3, Left Ctrl
+Circle, G R2, Z L2; the arrows stay the d-pad. The mouse is captured
+(SDL relative mode) while the game window has the keyboard focus; F1
+releases and recaptures it. A connected controller keeps its sticks unless
+the keys or the mouse are in use. The layout is in `tools/play.sh` and the
+README.

@@ -1,0 +1,87 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index e3d6dc0..c944519 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -367,14 +367,57 @@ static void pad_poll_sdl2(void)
+         if (keys[SDL_SCANCODE_SPACE])                                 kbtns |= CELL_PAD_CTRL_CROSS;
+         if (keys[SDL_SCANCODE_ESCAPE] || keys[SDL_SCANCODE_BACKSPACE]) kbtns |= CELL_PAD_CTRL_CIRCLE;
+         if (keys[SDL_SCANCODE_TAB] || keys[SDL_SCANCODE_GRAVE])      kbtns |= CELL_PAD_CTRL_SELECT;
+-        if (keys[SDL_SCANCODE_UP] || keys[SDL_SCANCODE_W])           kbtns |= CELL_PAD_CTRL_UP;
+-        if (keys[SDL_SCANCODE_DOWN] || keys[SDL_SCANCODE_S])         kbtns |= CELL_PAD_CTRL_DOWN;
+-        if (keys[SDL_SCANCODE_LEFT] || keys[SDL_SCANCODE_A])         kbtns |= CELL_PAD_CTRL_LEFT;
+-        if (keys[SDL_SCANCODE_RIGHT] || keys[SDL_SCANCODE_D])        kbtns |= CELL_PAD_CTRL_RIGHT;
++        /* Keyboard and mouse as a pad for a first-person game (PS3_PAD_KBM=0
++         * restores the old layout, WASD on the d-pad): WASD is the left stick,
++         * the mouse the right stick; arrows stay the d-pad. */
++        static int kbm = -1;
++        if (kbm < 0) { const char* e = getenv("PS3_PAD_KBM"); kbm = !(e && e[0] == '0'); }
++        if (keys[SDL_SCANCODE_UP] || (!kbm && keys[SDL_SCANCODE_W]))    kbtns |= CELL_PAD_CTRL_UP;
++        if (keys[SDL_SCANCODE_DOWN] || (!kbm && keys[SDL_SCANCODE_S]))  kbtns |= CELL_PAD_CTRL_DOWN;
++        if (keys[SDL_SCANCODE_LEFT] || (!kbm && keys[SDL_SCANCODE_A]))  kbtns |= CELL_PAD_CTRL_LEFT;
++        if (keys[SDL_SCANCODE_RIGHT] || (!kbm && keys[SDL_SCANCODE_D])) kbtns |= CELL_PAD_CTRL_RIGHT;
+         if (keys[SDL_SCANCODE_Q] || keys[SDL_SCANCODE_1])            kbtns |= CELL_PAD_CTRL_L1;
+         if (keys[SDL_SCANCODE_E] || keys[SDL_SCANCODE_3])            kbtns |= CELL_PAD_CTRL_R1;
+         if (keys[SDL_SCANCODE_R] || keys[SDL_SCANCODE_F])            kbtns |= CELL_PAD_CTRL_SQUARE;
+         if (keys[SDL_SCANCODE_T] || keys[SDL_SCANCODE_C])            kbtns |= CELL_PAD_CTRL_TRIANGLE;
++        int ml_x = 128, ml_y = 128, mr_x = 128, mr_y = 128, kbm_active = 0;
++        if (kbm) {
++            if (keys[SDL_SCANCODE_LCTRL])                             kbtns |= CELL_PAD_CTRL_CIRCLE;
++            if (keys[SDL_SCANCODE_Z])                                 kbtns |= CELL_PAD_CTRL_L2;
++            if (keys[SDL_SCANCODE_G])                                 kbtns |= CELL_PAD_CTRL_R2;
++            if (keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT]) kbtns |= CELL_PAD_CTRL_L3;
++            if (keys[SDL_SCANCODE_V])                                 kbtns |= CELL_PAD_CTRL_R3;
++            if (keys[SDL_SCANCODE_A]) ml_x -= 128;
++            if (keys[SDL_SCANCODE_D]) ml_x += 127;
++            if (keys[SDL_SCANCODE_W]) ml_y -= 128;
++            if (keys[SDL_SCANCODE_S]) ml_y += 127;
++            /* Mouse: captured while the game window has the keyboard focus
++             * (F1 lets it go and takes it back); motion since the last poll
++             * deflects the right stick, PS3_PAD_MOUSE_SENS per pixel. */
++            static int captured = 0, f1_was = 0, released = 0;
++            static float sens = 0.0f;
++            if (sens == 0.0f) { const char* e = getenv("PS3_PAD_MOUSE_SENS"); sens = e ? (float)atof(e) : 3.0f;
++                                if (sens <= 0.0f) sens = 3.0f; }
++            SDL_Window* focus = SDL_GetKeyboardFocus();
++            if (keys[SDL_SCANCODE_F1] && !f1_was) released = !released;
++            f1_was = keys[SDL_SCANCODE_F1];
++            const int want = focus && !released;
++            if (want != captured) { SDL_SetRelativeMouseMode(want ? SDL_TRUE : SDL_FALSE); captured = want; }
++            int dx = 0, dy = 0;
++            const Uint32 mb = SDL_GetRelativeMouseState(&dx, &dy);
++            if (captured) {
++                if (mb & SDL_BUTTON(SDL_BUTTON_LEFT))   kbtns |= CELL_PAD_CTRL_R1;
++                if (mb & SDL_BUTTON(SDL_BUTTON_RIGHT))  kbtns |= CELL_PAD_CTRL_L1;
++                if (mb & SDL_BUTTON(SDL_BUTTON_MIDDLE)) kbtns |= CELL_PAD_CTRL_R3;
++                float fx = dx * sens, fy = dy * sens;
++                if (fx > 127.0f) fx = 127.0f;
++                if (fx < -128.0f) fx = -128.0f;
++                if (fy > 127.0f) fy = 127.0f;
++                if (fy < -128.0f) fy = -128.0f;
++                mr_x = 128 + (int)fx; mr_y = 128 + (int)fy;
++            }
++            kbm_active = (ml_x != 128 || ml_y != 128 || mr_x != 128 || mr_y != 128);
++        }
+ 
+         if (!s_host_state[0].connected) {
+             s_host_state[0].connected = 1;
+@@ -388,6 +431,20 @@ static void pad_poll_sdl2(void)
+         } else {
+             s_host_state[0].buttons |= kbtns;
+         }
++        /* The sticks: keys and mouse win while they are in use; with no game
++         * controller on port 0 they are the only sticks there are. */
++        if (kbm) {
++            const int pad0 = s_sdl_controllers[0] != NULL;
++            if (ml_x != 128 || ml_y != 128 || !pad0) {
++                s_host_state[0].analog_lx = (u8)ml_x; s_host_state[0].analog_ly = (u8)ml_y;
++            }
++            if (mr_x != 128 || mr_y != 128 || !pad0) {
++                s_host_state[0].analog_rx = (u8)mr_x; s_host_state[0].analog_ry = (u8)mr_y;
++            }
++        }
++        (void)kbm_active;
++        if (kbtns & CELL_PAD_CTRL_L2) s_host_state[0].trigger_l2 = 255;
++        if (kbtns & CELL_PAD_CTRL_R2) s_host_state[0].trigger_r2 = 255;
+ 
+         if (kbtns & CELL_PAD_CTRL_UP)       s_host_state[0].press_up = 255;
+         if (kbtns & CELL_PAD_CTRL_DOWN)     s_host_state[0].press_down = 255;
