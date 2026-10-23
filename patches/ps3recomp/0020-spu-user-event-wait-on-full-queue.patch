@@ -1,0 +1,32 @@
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index bcb1df4..b8564a7 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -1648,6 +1648,27 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
+         if (queue) {
+             int rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,
+                 spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
++            /* A full queue answered EBUSY at once, and SPU code that sends
++             * fire-and-forget (Killzone 2's job batches post one completion
++             * per job into a 50-entry queue) lost the event for good: the
++             * PPU counting completions then waited forever. A real receiver
++             * drains its queue far faster than a lifted burst of jobs fills
++             * it; give ours up to SPU_EVENT_FULL_WAIT_MS (default 2000) to
++             * catch up before answering EBUSY. */
++            if (rc != 0) {
++                static int wait_ms = -1;
++                if (wait_ms < 0) { const char* e = getenv("SPU_EVENT_FULL_WAIT_MS"); wait_ms = e ? atoi(e) : 2000; }
++                const ULONGLONG t0 = GetTickCount64();
++                while (rc != 0 && (int)(GetTickCount64() - t0) < wait_ms) {
++                    Sleep(0);
++                    rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,
++                        spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
++                }
++                { static int n; if (n++ < 16)
++                    fprintf(stderr, "[spu-evt] queue %u full for a user event (img=%d port %u): %s after %llu ms\n",
++                            queue, spu->image_id, port, rc == 0 ? "delivered" : "EBUSY",
++                            (unsigned long long)(GetTickCount64() - t0)); }
++            }
+             result = rc == 0 ? CELL_OK : CELL_EBUSY;
+         }
+     }

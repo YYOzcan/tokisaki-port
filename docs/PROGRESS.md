@@ -1108,3 +1108,16 @@ per lifted block: `spu_task_launch_check` (diagnostic bookkeeping on every
 trampoline step), `spu_lookup` (indirect branches), DMA copies. That is
 the next place to work on, together with the level-start stall (sections 45
 and 50).
+
+## 52. The stalled job batch sends its own completions
+
+The module whose job was running at every caught stall (`576019cad526`)
+posts its completions itself, through the SPU interrupt mailbox
+(`wrch SPU_WrOutIntrMbox` at LS 0x161FC, then the answer from
+`SPU_RdInMbox`). The runtime answered a full queue (these are 50 entries)
+with EBUSY at once, so fire-and-forget code would lose the event; a user
+event now waits up to `SPU_EVENT_FULL_WAIT_MS` (2000) for room and logs
+`[spu-evt] queue N full` (patch 0020). In four runs the queue never filled
+and one of them stalled anyway: the job does not get to its send. Next:
+find what that job loops on (its DMA helper is at LS 0x16294, its tag wait
+at 0x453C) in a stalled run.
