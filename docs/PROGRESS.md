@@ -1084,3 +1084,9 @@ thread's `0x4EED70`) a synthesized empty event when they have waited
 `KZ2_LOST_EVENT_S` seconds (default 15, 0 = off) without a single frame
 presented, and logs `[kz2-evq]`. Whether that brings a stalled level back
 is not verified yet -- the runs since did not stall.
+Follow-up: with `KZ2_LOST_EVENT_S=15` a stalled run logged ten synthesized
+events (queue 6, `0x4EBEFC`) and stayed stalled, so the hook is off by
+default now. The stall does not depend on the GPU reinterpretation either
+(`RSX_GPU_REINTERPRET_MASK=0`: one of four runs stalled). It shows most in
+two run directories with the same saves (about half their runs) and in
+roughly one run in six elsewhere; it was one in eight before this session.

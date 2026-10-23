@@ -685,8 +685,9 @@ static int64_t kz2_sys_timer_usleep(ppu_context* ctx)
  * thread's func_004EED70 waits for. None of the three looks at the event's
  * contents -- they count. The root cause (a task that never runs, or a send
  * that is lost) is not found yet. Until it is, a wait at those three call
- * sites that has lasted KZ2_LOST_EVENT_S seconds (default 15; 0 = off) while
+ * sites that has lasted KZ2_LOST_EVENT_S seconds (off by default) while
  * not a single frame was presented gets a synthesized, empty event, logged.
+ * In the one stall it met it fired ten times and the level did not come back.
  * -----------------------------------------------------------------------*/
 static lv2_syscall_fn s_orig_sys_event_queue_receive = nullptr;
 extern "C" unsigned ppu_boot_frames_presented(void);
@@ -696,7 +697,7 @@ static int64_t kz2_sys_event_queue_receive(ppu_context* ctx)
     const uint32_t caller_lr = (uint32_t)ctx->lr;
     static const unsigned limit_s = [] {
         const char* e = getenv("KZ2_LOST_EVENT_S");
-        return e ? (unsigned)strtoul(e, 0, 0) : 15u;
+        return e ? (unsigned)strtoul(e, 0, 0) : 0u;     /* off: it did not bring a stall back */
     }();
     const bool watched = caller_lr == 0x004F78A8 || caller_lr == 0x004EEA9C || caller_lr == 0x004EBEFC;
     if (!limit_s || !watched || ctx->gpr[5] != 0)          /* only untimed waits at those sites */
