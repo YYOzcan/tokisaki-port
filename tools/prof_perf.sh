@@ -15,8 +15,9 @@ PID=$!
 sleep "${WARM}"
 GPID="$(pgrep -P "${PID}" -x killzone2 || echo "${PID}")"
 "${ROOT}/tools/gpu_busy.sh" "${SECS}" > "${OUT%.txt}.gpu" 2>&1 &
+GBPID=$!
 KZPROF_RAW="${OUT%.txt}.raw" "${ROOT}/build/kzprof" "${GPID}" "${SECS}" 1000 80 > "${OUT}"
-wait
+wait "${GBPID}"
 kill -9 "${GPID}" "${PID}" 2>/dev/null
 # the symbols of this binary, so the raw samples can be read after a rebuild
 nm --defined-only "${ROOT}/build/killzone2" | grep ' [tTwW] ' | gzip -1 > "${OUT%.txt}.nm.gz"
