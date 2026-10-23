@@ -592,6 +592,12 @@ static void kz2_adec_open_ex(ppu_context* ctx)
  * the stream record so the title can progress into level loading.
  * -----------------------------------------------------------------------*/
 typedef int64_t (*lv2_syscall_fn)(ppu_context* ctx);
+static uint64_t ps3_ms_now_kz2(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 struct lv2_syscall_table {
     lv2_syscall_fn handlers[1024];
 };
@@ -669,10 +675,63 @@ static int64_t kz2_sys_timer_usleep(ppu_context* ctx)
     return s_orig_sys_timer_usleep ? s_orig_sys_timer_usleep(ctx) : 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Lost SPU task completions (docs/PROGRESS.md section 50)
+ *
+ * About one level start in six stalls with a guest thread waiting forever for
+ * SPU task completion events that never come: func_004F7668 starts a batch
+ * of tasks and counts their completions on an event queue (directly, and in
+ * func_004EEA68), and func_004EBD08 services the queue whose events the main
+ * thread's func_004EED70 waits for. None of the three looks at the event's
+ * contents -- they count. The root cause (a task that never runs, or a send
+ * that is lost) is not found yet. Until it is, a wait at those three call
+ * sites that has lasted KZ2_LOST_EVENT_S seconds (default 15; 0 = off) while
+ * not a single frame was presented gets a synthesized, empty event, logged.
+ * -----------------------------------------------------------------------*/
+static lv2_syscall_fn s_orig_sys_event_queue_receive = nullptr;
+extern "C" unsigned ppu_boot_frames_presented(void);
+
+static int64_t kz2_sys_event_queue_receive(ppu_context* ctx)
+{
+    const uint32_t caller_lr = (uint32_t)ctx->lr;
+    static const unsigned limit_s = [] {
+        const char* e = getenv("KZ2_LOST_EVENT_S");
+        return e ? (unsigned)strtoul(e, 0, 0) : 15u;
+    }();
+    const bool watched = caller_lr == 0x004F78A8 || caller_lr == 0x004EEA9C || caller_lr == 0x004EBEFC;
+    if (!limit_s || !watched || ctx->gpr[5] != 0)          /* only untimed waits at those sites */
+        return s_orig_sys_event_queue_receive(ctx);
+
+    const uint64_t r3 = ctx->gpr[3], r4 = ctx->gpr[4];
+    const uint64_t t0 = ps3_ms_now_kz2();
+    unsigned frames0 = ppu_boot_frames_presented();
+    uint64_t still_since = t0;
+    for (;;) {
+        ctx->gpr[3] = r3; ctx->gpr[4] = r4; ctx->gpr[5] = 1000000;   /* 1 s slices */
+        const int64_t rc = s_orig_sys_event_queue_receive(ctx);
+        if ((uint32_t)rc != 0x8001000Bu) { ctx->gpr[5] = 0; return rc; }     /* not ETIMEDOUT */
+        const uint64_t now = ps3_ms_now_kz2();
+        const unsigned frames = ppu_boot_frames_presented();
+        if (frames != frames0) { frames0 = frames; still_since = now; }
+        if (now - still_since >= limit_s * 1000ull && now - t0 >= limit_s * 1000ull) {
+            const uint32_t ev = (uint32_t)r4;
+            if (ev) for (int k = 0; k < 4; k++) vm_write64(ev + 8u * k, 0);
+            ctx->gpr[4] = ctx->gpr[5] = ctx->gpr[6] = ctx->gpr[7] = 0;
+            ctx->gpr[3] = 0;
+            fprintf(stderr, "[kz2-evq] no frame for %u s and queue %u silent at lr=0x%08X: "
+                            "synthesized a lost SPU task completion\n",
+                    limit_s, (uint32_t)r3, caller_lr);
+            return 0;
+        }
+    }
+}
+
 extern "C" void kz2_hle_register(void)
 {
     s_orig_sys_timer_usleep = g_lv2_syscalls.handlers[141];
     g_lv2_syscalls.handlers[141] = kz2_sys_timer_usleep;
+    s_orig_sys_event_queue_receive = g_lv2_syscalls.handlers[130];
+    g_lv2_syscalls.handlers[130] = kz2_sys_event_queue_receive;
 
     ps3_hle_register_ctx(0x8B5551A4, "cellAdecOpenEx", kz2_adec_open_ex);
     ps3_hle_register_ctx(0xC982A84A, "cellVdecQueryAttrEx", kz2_vdec_query_attr_ex);

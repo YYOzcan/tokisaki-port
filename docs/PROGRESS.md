@@ -1066,3 +1066,21 @@ Circle, G R2, Z L2; the arrows stay the d-pad. The mouse is captured
 releases and recaptures it. A connected controller keeps its sticks unless
 the keys or the mouse are in use. The layout is in `tools/play.sh` and the
 README.
+
+## 50. The level-start stall, again: lost completions of a WWS job batch
+
+Caught with stacks in the run directory where it shows most: the main thread
+waits in `0x4D9100` / `0x4FAAB0` for the semaphore at `*(0xF137F4)`, held by
+the worker in `0x4F7668` (via `0x4DA800`/`0x4FB298`), which started a batch
+of jobs and counts their completion events on an event queue
+(`0x4F7668` itself, then `0x4EEA68`). The events never come. At the stall
+two SPU workers are busy: a job of module `576019cad526` (the batch's own
+jobs, by the look of it) and a jm_post job of `7eb6fb9f6647`; the queue has
+nothing pending (`PS3_EVQSTAT`).
+
+Not fixed. `src/kz2_hle.cpp` now gives the three waits that only count
+completions (`0x4F7668`, `0x4EEA68`, and `0x4EBD08`, which feeds the main
+thread's `0x4EED70`) a synthesized empty event when they have waited
+`KZ2_LOST_EVENT_S` seconds (default 15, 0 = off) without a single frame
+presented, and logs `[kz2-evq]`. Whether that brings a stalled level back
+is not verified yet -- the runs since did not stall.
