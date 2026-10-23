@@ -85,6 +85,7 @@ uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
 
 void cellGcm_request_tick(void);
 int  cellGcm_take_flip_pending_synced(void);
+void cellGcm_complete_flip_now(void);
 extern volatile unsigned g_spurs_pm_cur_wid, g_spurs_pm_cur_lane;   /* spurs_policy.c */
 extern volatile unsigned long long g_spurs_pm_cur_since;
 extern volatile uint32_t g_spurs_last_task_arg[4];                   /* cellSpurs.c */
@@ -200,6 +201,13 @@ static void frame_clock_loop(void)
         if (cellGcm_take_flip_pending_synced()) {
             be.present();
             g_frames_presented.fetch_add(1);
+            /* KZ2_FLIP_IMMEDIATE=1: the flip completes once presented, not
+             * on the next 60 Hz beat (vsync off for the guest). */
+            static const bool flip_now = [] {
+                const char* e = getenv("KZ2_FLIP_IMMEDIATE");
+                return e && e[0] == '1';
+            }();
+            if (flip_now) cellGcm_complete_flip_now();
         }
     };
 

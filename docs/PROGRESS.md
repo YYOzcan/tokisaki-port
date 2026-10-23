@@ -1173,3 +1173,63 @@ started.
 Six runs since in the two-instance setup that stalled about half the time:
 five reached gameplay, one stopped earlier (at 4279 frames, during the
 load) with every taskset clean -- a different stop, not caught yet.
+
+## 54. A real profiler; the cheap float path; jm_post on four SPUs again
+
+`tools/kzprof.c` samples every thread of the game through
+`perf_event_open` (no perf package needed; `kernel.perf_event_paranoid=2`
+lets a user sample its own processes) at 1 kHz of task clock and resolves
+the samples against the binary's symbols. `tools/prof_perf.sh` runs the game
+to gameplay and profiles it (`logs/NAME.txt` report, `NAME.raw` samples,
+`NAME.nm.gz` symbols), `tools/kzprof_mods.py` turns runs into CPU ms per
+presented frame per job module, and `tools/kzprof_ips.py` shows the hottest
+instructions of one function. 1000 samples a second instead of 40 stacks.
+
+What it showed in gameplay (Radeon 680M, the machine in power-saver):
+- the main thread is not the bottleneck: half its busy time is a spin
+  (`func_003BD660`) on SPU job progress counters, and ~2/3 of its time it
+  sleeps in `func_00048208`, a 30 us `sys_timer_usleep` poll of an RSX label;
+- the frame is RSX scene drawing (FIFO thread) followed by jm_post on one
+  SPU, which the FIFO then waits for -- serial;
+- in jm_post, the float ops' manual widening (patch 0017) dominated: ~45
+  x86 instructions per `fm`.
+
+Patch 0022:
+- **float fast path, tier 1**: operands flushed (denormal -> +0), widened by
+  `cvtps2pd`, the result's 29 low bits cleared and narrowed; an exponent-255
+  operand widens to Inf/NaN and a result >= 2^128 narrows to Inf, which sends
+  the whole vector to the manual-widening path (now tier 2), as does a result
+  that only rounding put on a 24-bit boundary or on 2^-126 (TwoSum error for
+  fa/fma). fm 9.1 -> 3.0 ns, fma 13.2 -> 5.3, fa 10.6 -> 4.4 (throughput
+  loop). `tests/test_spu_fma.c` (now with operands whose results land near
+  2^-126 and 2^128): 0 mismatches over 8M vectors per op.
+- **shufb** without the three byte-order swaps (the control byte sits at
+  the result's host byte; its index is the low nibble xor 3), and the
+  constant selectors behind one test; **fi**, **cflts/cfltu/csflt/cuflt**
+  as SSE/AVX2 code instead of out-of-line per-lane loops. `tests/test_spu_conv.c`:
+  0 mismatches over 3M vectors, every scale.
+- per hop of the trampoline drain: the lockstep and tail-return gates
+  inline, the depth guard's ring per thread (one ring all SPU threads wrote
+  was a shared cache line); `spu_lookup` answers from a per-thread cache
+  (every job module registers functions at the same LS addresses, so the
+  hash chains were long); the LS read's image-2 probe is opt-in.
+- the PPU store watch (`barrier_watch_hit`, twice per 64-bit store) is one
+  branch when no watch is set.
+- vertex fetch: the element decoder switches once per element instead of
+  once per component; the reference remap uses a table indexed by
+  `vertex_id - min` when one base index and a narrow range allow it (same
+  first-use order, so the same output; a scratch test against the old code:
+  0 differences); the Z16 depth store converts 8 pixels at a time.
+- `cellGcm_complete_flip_now` + `KZ2_FLIP_IMMEDIATE=1` (boot_main): a
+  presented flip completes at once instead of on the next 60 Hz beat.
+
+**jm_post on four SPUs** (`SPURS_MAXCONT=7:4`, section 46 turned it off for
+stalls): with the task-id fix of section 53 the run that used to stall half
+the time went to gameplay and stayed there; 5.2 -> 8.5 frames/s, with the
+new helpers 9.1. Its rate sat exactly on 60/7 = 8.6: the guest waits for the
+flip, which completed only on the 60 Hz beat.
+
+Tried and dropped: keeping SPU registers in C locals inside lifted functions
+(a post-pass on the lifter's output). The SPU has 128 registers, x86 16: the
+compiler spilled the locals to the stack and added entry/exit copies -- the
+hot jm_post loop grew from 2528 to 3627 instructions.

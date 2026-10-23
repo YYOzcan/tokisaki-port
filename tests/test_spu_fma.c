@@ -7,7 +7,9 @@ static uint64_t s = 0x9E3779B97F4A7C15ull;
 static uint32_t rnd(void) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uint32_t)s; }
 static uint32_t rf(void)
 {
-    switch (rnd() % 7) {
+    switch (rnd() % 9) {
+    case 7: return (rnd() & 0x807FFFFFu) | ((uint32_t)(61 + rnd() % 6) << 23);     /* products near 2^-126 */
+    case 8: return (rnd() & 0x807FFFFFu) | ((uint32_t)(189 + rnd() % 6) << 23);    /* products near 2^128 */
     case 0: return 0;
     case 1: return 0x80000000u;
     case 2: { float f = (float)((int)(rnd() % 2048) - 1024) / 256.0f; uint32_t u; memcpy(&u, &f, 4); return u; }
@@ -23,7 +25,7 @@ static int eq(u128 a, u128 b) { return !memcmp(&a, &b, 16); }
 int main(void)
 {
     long bad = 0;
-    for (long n = 0; n < 4000000; n++) {
+    for (long n = 0; n < 8000000; n++) {
         u128 a = rv(), b = rv(), c = rv();
 #define T(name, x, y) if (!eq(x, y) && bad++ < 20) printf("%s mismatch %08X %08X %08X\n", name, a._u32[0], b._u32[0], c._u32[0]);
         T("fa", spu_fa(a, b), spu_fa_ref(a, b));
