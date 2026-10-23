@@ -1130,3 +1130,15 @@ section 46). In a stall caught with ten stack samples the jm_post worker
 keeps moving through different jobs, four SPU workers are idle, and the
 main thread waits in `0x4EED70`; `SPURS_PM_SELECT_CURRENT=0` (the policy
 module yields after every job) made it worse, three stalls in four.
+
+The chain in that capture, for the next look: the main thread
+(`0x4D9BD0` -> `0x4EED70`) waits on a condition for `+0x210` completions; the
+thread that signals it (`0x803CB8` -> `0x4EBD08`) waits on event queue 6 for
+the completion events; those come from SPURS tasks that `0x4EEA28` starts
+through `cellSpursCreateTaskWithAttribute` (`0x7F80C0`), each dispatched on
+its own host thread (`spu_workload_dispatch_async`). Queue 6 has nothing
+pending, no SPU worker runs such a task, and no `[spu-evt]` drop or
+queue-full line was logged: a task is either never started or ends without
+posting. Next: count, per stalled run, the tasks `0x4EEA28` creates, the
+`[spu_workload] async ... RETURNED` lines for them and the pushes into queue
+6 (`PS3_EVQSTAT=1`), to tell which one goes missing.
