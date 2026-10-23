@@ -1023,3 +1023,19 @@ drops them all.
 Gameplay on the defaults, one instance: **5.2-6.3 presented frames/s**, the
 FIFO thread busy 52-72% (GPU wait 12-13%) and parked 28-48% waiting for
 jm_post, which keeps one SPU ~72% busy. Six runs, no stall.
+
+## 47. Sound in the level: the campaign-start watchdog is no longer needed
+
+The silent level of section 38 was the port's own doing. Since section 13 a
+`sys_timer_usleep` hook forged the stop of the menu-music stream (stream 7)
+at campaign start and, for the master teardown, cleared the sound engine's
+voice list by hand -- the stream never finished stopping on its own then.
+With the SPURS fixes of sections 32 and 43 it does: with the hook off the
+campaign starts, no `[kz2-sound]` line appears, and the level has sound --
+the cellAudio port (`KZ2_DUMPAT=...:58000000:0x4000`, `logs/amp.py`) carries
+samples around 0.005-0.08 where it read ~1e-37 before, while the menu
+music is ~0.3-0.5. The hook is now opt-in (`KZ2_SOUND_WATCHDOG=1`).
+
+One of six runs without it stalled right after the level's first entity
+batch (the others reached gameplay with sound); with it, none of six did.
+That stall was not caught with thread dumps yet.

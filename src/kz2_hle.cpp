@@ -602,7 +602,11 @@ static lv2_syscall_fn s_orig_sys_timer_usleep = nullptr;
 static int64_t kz2_sys_timer_usleep(ppu_context* ctx)
 {
     const uint32_t caller_lr = (uint32_t)ctx->lr;
-    static const bool off = getenv("KZ2_NO_SOUND_WATCHDOG") != nullptr;
+    /* Off by default since the SPURS taskset fixes (docs/PROGRESS.md section
+     * 47): the menu-music stream now finishes stopping on its own, and the
+     * forged stop below left the sound engine's voice lists broken -- the
+     * level was silent. KZ2_SOUND_WATCHDOG=1 brings it back. */
+    static const bool off = !(getenv("KZ2_SOUND_WATCHDOG") && getenv("KZ2_SOUND_WATCHDOG")[0] == '1');
     if (off) return s_orig_sys_timer_usleep ? s_orig_sys_timer_usleep(ctx) : 0;
     if (caller_lr == 0x009AD294 || caller_lr == 0x009AD2CC) {
         static int s_spin_count[16] = {0};
