@@ -1090,3 +1090,21 @@ default now. The stall does not depend on the GPU reinterpretation either
 (`RSX_GPU_REINTERPRET_MASK=0`: one of four runs stalled). It shows most in
 two run directories with the same saves (about half their runs) and in
 roughly one run in six elsewhere; it was one in eight before this session.
+
+## 51. Sparse texture re-hashing; where the frame goes now
+
+The texture cache hashed every cached texture in full at its first use in a
+frame (~10% of the FIFO thread). Upstream's fix from the inFAMOUS 2 port
+(a594fa0, erikomis) is in (patch 0019): 64 bytes of every 2 KB plus the
+last 64 each frame, the full hash when that differs, every eighth frame,
+for textures of 16 KB or less, and after a store the engine made itself
+(`PS3RECOMP_ENG_TEXHASH_FULL=1` restores the old behaviour).
+
+With it the FIFO thread is busy 40-58% of the time and parked 42-60% --
+waiting for jm_post, which now gates the frame. Where jm_post's SPU time
+goes (section 46's profile): the job modules' own code (`9de83b69cfa0`,
+`7eb6fb9f6647`, `a27e818cca34`, `9935c8f700db` ...), and runtime overhead
+per lifted block: `spu_task_launch_check` (diagnostic bookkeeping on every
+trampoline step), `spu_lookup` (indirect branches), DMA copies. That is
+the next place to work on, together with the level-start stall (sections 45
+and 50).
