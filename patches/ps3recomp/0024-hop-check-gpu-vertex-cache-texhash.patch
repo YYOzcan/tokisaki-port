@@ -1,0 +1,440 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index f60d1d6..271ac4e 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -205,6 +205,7 @@ static struct {
+     u64 verts_cap;
+     u32 n_verts;
+     const u8* vptr;     /* the vertices the draw uploads: verts, or a cached copy */
++    u64 vkey;           /* their vertex-cache key when they are a cached copy, else 0 */
+ 
+     /* Canonical ATTR0..15 float4 snapshots for register-based vertices.
+      * Bounded separately from compact GPU staging; never fetch stale arrays. */
+@@ -249,6 +250,32 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
+     return vm_base + ea;
+ }
+ 
++/* Four independent multiply-xor lanes, ~4x the bytes per cycle of the
++ * word-at-a-time FNV below; for content change checks (texture data, vertex
++ * cache keys), not for anything stored across runs. */
++static inline u64 vc_mix(u64 h) { h ^= h >> 31; h *= 0x9E3779B97F4A7C15ull; h ^= h >> 29; return h; }
++static u64 vc_hash(const void* data, size_t n, u64 seed)
++{
++    const u8* p = (const u8*)data;
++    u64 a = seed ^ 0x243F6A8885A308D3ull, b = seed + 0x13198A2E03707344ull,
++        c = ~seed, d = seed * 0xA4093822299F31D1ull;
++    const u64 K = 0x9FB21C651E98DF25ull;
++    size_t i = 0;
++    for (; i + 32 <= n; i += 32) {
++        u64 w0, w1, w2, w3;
++        memcpy(&w0, p + i, 8); memcpy(&w1, p + i + 8, 8);
++        memcpy(&w2, p + i + 16, 8); memcpy(&w3, p + i + 24, 8);
++        a = (a ^ w0) * K; a ^= a >> 32;
++        b = (b ^ w1) * K; b ^= b >> 32;
++        c = (c ^ w2) * K; c ^= c >> 32;
++        d = (d ^ w3) * K; d ^= d >> 32;
++    }
++    for (; i + 8 <= n; i += 8) { u64 w; memcpy(&w, p + i, 8); a = (a ^ w) * K; a ^= a >> 32; }
++    u64 t = 0;
++    for (; i < n; i++) t = (t << 8) | p[i];
++    return vc_mix(a ^ vc_mix(b + 1) ^ vc_mix(c + 2) ^ vc_mix(d + 3) ^ vc_mix(t ^ n));
++}
++
+ static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
+ {
+     const u8* p = (const u8*)data;
+@@ -883,17 +910,8 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
+ {
+     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+     if (!src) { *readable = 0; return 0; }
+-    u64 hash = 1469598103934665603ull;
+-    u32 i = 0;
+-    for (; i + 8 <= span; i += 8) {
+-        u64 word;
+-        memcpy(&word, src + i, sizeof(word));
+-        hash ^= word;
+-        hash *= 1099511628211ull;
+-    }
+-    for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
+     *readable = 1;
+-    return hash;
++    return vc_hash(src, span, 1469598103934665603ull);
+ }
+ 
+ /* The cheap per-frame change check (upstream a594fa0, erikomis): 64 bytes
+@@ -1702,6 +1720,7 @@ static void dc_reset(void)
+     dc.n_arr = dc.n_idx = dc.n_packets = 0;
+     dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_cuts = 0;
+     dc.vptr = NULL;
++    dc.vkey = 0;
+     dc.refs_remapped = 0;
+     dc.fetch_ok = 1;
+     dc.inl = NULL;
+@@ -1800,29 +1819,6 @@ static eng_vc_entry s_vc[ENG_VC_SLOTS];
+ static u64 s_vc_bytes, s_vc_hits, s_vc_miss, s_vc_skip;
+ static int s_vc_on = -1;
+ 
+-static inline u64 vc_mix(u64 h) { h ^= h >> 31; h *= 0x9E3779B97F4A7C15ull; h ^= h >> 29; return h; }
+-static u64 vc_hash(const void* data, size_t n, u64 seed)
+-{
+-    const u8* p = (const u8*)data;
+-    u64 a = seed ^ 0x243F6A8885A308D3ull, b = seed + 0x13198A2E03707344ull,
+-        c = ~seed, d = seed * 0xA4093822299F31D1ull;
+-    const u64 K = 0x9FB21C651E98DF25ull;
+-    size_t i = 0;
+-    for (; i + 32 <= n; i += 32) {
+-        u64 w0, w1, w2, w3;
+-        memcpy(&w0, p + i, 8); memcpy(&w1, p + i + 8, 8);
+-        memcpy(&w2, p + i + 16, 8); memcpy(&w3, p + i + 24, 8);
+-        a = (a ^ w0) * K; a ^= a >> 32;
+-        b = (b ^ w1) * K; b ^= b >> 32;
+-        c = (c ^ w2) * K; c ^= c >> 32;
+-        d = (d ^ w3) * K; d ^= d >> 32;
+-    }
+-    for (; i + 8 <= n; i += 8) { u64 w; memcpy(&w, p + i, 8); a = (a ^ w) * K; a ^= a >> 32; }
+-    u64 t = 0;
+-    for (; i < n; i++) t = (t << 8) | p[i];
+-    return vc_mix(a ^ vc_mix(b + 1) ^ vc_mix(c + 2) ^ vc_mix(d + 3) ^ vc_mix(t ^ n));
+-}
+-
+ /* 0: not cacheable (an attribute reads outside one contiguous span). */
+ static u64 eng_vc_key(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 n)
+ {
+@@ -2013,6 +2009,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+             if (ce->verts && ce->n == dc.n_refs && ce->stride == layout->stride) {
+                 s_vc_hits++;
+                 dc.vptr = ce->verts;
++                dc.vkey = key;
+                 dc.n_verts = dc.n_refs;
+                 return;
+             }
+@@ -3044,8 +3041,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
+         }
+         fprintf(s_pd.draws_log, "\n");
+     }
+-    g.be->draw(g.be->user, topology, dc.vptr ? dc.vptr : dc.verts, uploaded, layout.stride,
+-               indexed ? g.indices : NULL, indexed ? n_draw : 0);
++    if (dc.vkey && g.be->draw_cached && uploaded == dc.n_verts)
++        g.be->draw_cached(g.be->user, topology, dc.vkey, dc.vptr, uploaded, layout.stride,
++                          indexed ? g.indices : NULL, indexed ? n_draw : 0);
++    else
++        g.be->draw(g.be->user, topology, dc.vptr ? dc.vptr : dc.verts, uploaded, layout.stride,
++                   indexed ? g.indices : NULL, indexed ? n_draw : 0);
+     /* Counted only when the draw ran the guest's OWN programs, which is what
+      * the test hook means: a draw through the built-in pair is a draw, not
+      * evidence that the decompile-translate-compile path worked. */
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index 45bc901..d9c5991 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -241,6 +241,12 @@ typedef struct rsx_draw_backend {
+      * backend cannot, and the engine takes the guest-memory route. */
+     u32 (*reinterpret)(void* user, u32 kind, u32 src, u32 w, u32 h, u32 dst,
+                        u32 remap, u32 rsx_fmt);
++    /* Optional: draw() for vertices the engine has seen before. `key` names
++     * the vertex bytes exactly (the engine's vertex-cache key: same key, same
++     * bytes), so a backend may keep its own copy and skip the upload. */
++    void (*draw_cached)(void* user, rsx_topology topology, u64 key, const void* vertices,
++                        u32 vertex_count, u32 stride, const u32* indices,
++                        u32 index_count);
+ } rsx_draw_backend;
+ 
+ #define RSX_BE_XFORM_DEPTH24_ARGB8  1u   /* D24S8 depth as A8R8G8B8       */
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index ff9e89f..ba7f32a 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -595,6 +595,11 @@ static struct {
+     unsigned long long rp_draws, rp_passes;   /* PS3RECOMP_VK_SUBMIT_STATS */
+ } s_b;
+ 
++static unsigned long long s_ring_bytes;    /* PS3RECOMP_VK_SUBMIT_STATS */
++static unsigned long long s_ring_vtx, s_ring_idx, s_ring_vsc, s_ring_psc;
++/* who waited: return addresses of vk_submit_and_wait's callers, counted */
++static struct { void* ra; unsigned n; } s_wait_ra[16];
++
+ #define VK_GROW(arr, n, cap) do {                                            \
+     if ((n) >= (cap)) {                                                      \
+         u32 nc_ = (cap) ? (cap) * 2u : 64u;                                  \
+@@ -813,6 +818,7 @@ static void vk_batch_shutdown(void)
+     vk_batch_retire();
+     vk_destroy_buffer(&s_b.ring);
+     vk_destroy_buffer(&s_b.rb);
++    { extern void vk_vc_shutdown(void); vk_vc_shutdown(); }
+     for (u32 k = 0; k < VK_SLOTS; k++) {
+         vk_slot* S = &s_b.sl[k];
+         if (S->dpool) pvkDestroyDescriptorPool(s_vk.device, S->dpool, NULL);
+@@ -858,6 +864,13 @@ volatile unsigned long long g_vk_wait_ns;
+ /* Submit the open batch and wait for it. */
+ static int vk_submit_and_wait(void)
+ {
++    {   static int st = -1;
++        if (st < 0) st = getenv("PS3RECOMP_VK_SUBMIT_STATS") ? 1 : 0;
++        if (st) {
++            void* ra = __builtin_return_address(0);
++            for (u32 i = 0; i < 16; i++)
++                if (s_wait_ra[i].ra == ra || !s_wait_ra[i].ra) { s_wait_ra[i].ra = ra; s_wait_ra[i].n++; break; }
++        } }
+     if (!s_b.open) {
+         for (u32 k = 0; k < s_b.nslots; k++) vk_slot_wait(k);
+         return 0;
+@@ -898,10 +911,19 @@ static int vk_submit_and_wait(void)
+         n++; nops += ops;
+         if (!win_start) win_start = now;
+         if (now - win_start >= 5.0) {
+-            fprintf(stderr, "[vk] %u submits (%u operations) in %.1f s, %.1f ms waiting (%.3f ms each),"
+-                            " %llu draws in %llu render passes\n",
+-                    n, nops, now - win_start, acc_ms, acc_ms / n, s_b.rp_draws, s_b.rp_passes);
++            fprintf(stderr, "[vk] %u waits (%u operations) in %.1f s, %.1f ms waiting (%.3f ms each),"
++                            " %llu draws in %llu render passes, %.1f MB through the ring\n",
++                    n, nops, now - win_start, acc_ms, acc_ms / n, s_b.rp_draws, s_b.rp_passes,
++                    s_ring_bytes / 1048576.0);
++            fprintf(stderr, "[vk] ring MB: vertices %.1f, indices %.1f, vs constants %.1f, ps constants %.1f; waits by caller:",
++                    s_ring_vtx / 1048576.0, s_ring_idx / 1048576.0, s_ring_vsc / 1048576.0, s_ring_psc / 1048576.0);
++            for (u32 i = 0; i < 16 && s_wait_ra[i].ra; i++)   /* offsets from vk_submit_and_wait, for nm */
++                fprintf(stderr, " %+lld x%u", (long long)((const char*)s_wait_ra[i].ra - (const char*)(void*)vk_submit_and_wait),
++                        s_wait_ra[i].n);
++            fprintf(stderr, "\n");
++            memset(s_wait_ra, 0, sizeof s_wait_ra);
+             s_b.rp_draws = s_b.rp_passes = 0;
++            s_ring_bytes = s_ring_vtx = s_ring_idx = s_ring_vsc = s_ring_psc = 0;
+             n = 0; nops = 0; acc_ms = 0; win_start = now;
+         }
+     }
+@@ -959,6 +981,7 @@ static VkDeviceSize vk_ring_alloc(VkDeviceSize bytes)
+ {
+     const VkDeviceSize at = (s_b.ring_off + s_b.align - 1u) / s_b.align * s_b.align;
+     s_b.ring_off = at + bytes;
++    s_ring_bytes += bytes;
+     return at;
+ }
+ 
+@@ -3829,10 +3852,82 @@ static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P, VkImageVie
+     return set;
+ }
+ 
++/* ---- vertices kept on the GPU ----------------------------------------------
++ * The engine names the vertex bytes of a draw it has seen before with a key
++ * (draw_cached); those are copied once into a persistent buffer and bound
++ * from there afterwards, instead of through the batch ring every frame. The
++ * buffer fills front to back; when it is full everything is waited for and
++ * it starts over. PS3RECOMP_VK_VCACHE=0 turns it off. */
++#define VK_VC_BYTES (256u << 20)
++#define VK_VC_SLOTS 16384u
++static struct {
++    int on;                       /* -1 unknown, 0 off/failed, 1 on */
++    vk_buffer buf;
++    VkDeviceSize top;
++    struct { u64 key; VkDeviceSize off, bytes; } map[VK_VC_SLOTS];
++    u32 used;
++} s_vc = { .on = -1 };
++
++/* The offset of the key's vertices in s_vc.buf, copying them there first if
++ * needed; ~0 when they cannot be kept. */
++static VkDeviceSize vk_vc_get(u64 key, const void* vertices, VkDeviceSize bytes)
++{
++    if (s_vc.on < 0) {
++        const char* e = getenv("PS3RECOMP_VK_VCACHE");
++        s_vc.on = !(e && e[0] == '0');
++        if (s_vc.on && (vk_create_host_buffer_ex(&s_vc.buf, VK_VC_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 1) ||
++                        !s_vc.buf.coherent)) {
++            vk_destroy_buffer(&s_vc.buf);
++            s_vc.on = 0;
++        }
++        VK_LOG("vertex cache on the GPU: %s\n", s_vc.on ? "on (256 MB)" : "off");
++    }
++    if (!s_vc.on || !key || bytes > VK_VC_BYTES / 4) return ~(VkDeviceSize)0;
++    u32 i = (u32)(key ^ (key >> 32)) & (VK_VC_SLOTS - 1u);
++    for (u32 probe = 0; probe < 32; probe++, i = (i + 1u) & (VK_VC_SLOTS - 1u)) {
++        if (s_vc.map[i].key == key && s_vc.map[i].bytes == bytes) return s_vc.map[i].off;
++        if (!s_vc.map[i].key) break;
++    }
++    const VkDeviceSize at = (s_vc.top + 255u) & ~(VkDeviceSize)255u;
++    if (at + bytes > VK_VC_BYTES || s_vc.used >= VK_VC_SLOTS / 2 || s_vc.map[i].key) {
++        /* full: start over once nothing in flight can read the old contents */
++        vk_submit_and_wait();
++        memset(s_vc.map, 0, sizeof s_vc.map);
++        s_vc.top = 0;
++        s_vc.used = 0;
++        return ~(VkDeviceSize)0;      /* this draw goes through the ring */
++    }
++    memcpy((u8*)s_vc.buf.ptr + at, vertices, (size_t)bytes);
++    s_vc.map[i].key = key; s_vc.map[i].off = at; s_vc.map[i].bytes = bytes;
++    s_vc.top = at + bytes;
++    s_vc.used++;
++    return at;
++}
++
++void vk_vc_shutdown(void)
++{
++    vk_destroy_buffer(&s_vc.buf);
++    memset(&s_vc, 0, sizeof s_vc);
++    s_vc.on = -1;
++}
++
++static void vk_eng_draw_k(rsx_topology topology, u64 vkey, const void* vertices, u32 vertex_count,
++                          u32 stride, const u32* indices, u32 index_count);
+ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
+                         u32 stride, const u32* indices, u32 index_count)
+ {
+     (void)user;
++    vk_eng_draw_k(topology, 0, vertices, vertex_count, stride, indices, index_count);
++}
++static void vk_eng_draw_cached(void* user, rsx_topology topology, u64 key, const void* vertices,
++                               u32 vertex_count, u32 stride, const u32* indices, u32 index_count)
++{
++    (void)user;
++    vk_eng_draw_k(topology, key, vertices, vertex_count, stride, indices, index_count);
++}
++static void vk_eng_draw_k(rsx_topology topology, u64 vkey, const void* vertices, u32 vertex_count,
++                          u32 stride, const u32* indices, u32 index_count)
++{
+     if (!s_e2.pipeline || !vertices || !vertex_count || !stride) return;
+     if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return;
+     vk_eng_pipe* P = &s_epipe[s_e2.pipeline - 1];
+@@ -3873,12 +3968,20 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+     const VkDeviceSize ibytes = (indices && index_count) ? (VkDeviceSize)index_count * 4u : 0;
+     const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u;
+     const u32 psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
+-    if (vk_batch_room(vbytes + ibytes + vsb + psb + 4u * s_b.align, 1)) {
++    /* kept vertices first: starting the cache over waits, which would expire ring space */
++    const VkDeviceSize kept = vkey ? vk_vc_get(vkey, vertices, vbytes) : ~(VkDeviceSize)0;
++    const int in_vc = kept != ~(VkDeviceSize)0;
++    if (vk_batch_room((in_vc ? 0 : vbytes) + ibytes + vsb + psb + 4u * s_b.align, 1)) {
+         if (!(s_e2.warned & 128u)) { VK_LOG("engine: a draw does not fit the batch ring, skipped\n"); s_e2.warned |= 128u; }
+         return;
+     }
+-    const VkDeviceSize voff = vk_ring_alloc(vbytes);
+-    memcpy((u8*)s_b.ring.ptr + voff, vertices, (size_t)vbytes);
++    VkDeviceSize voff = kept;
++    if (!in_vc) {
++        voff = vk_ring_alloc(vbytes);
++        memcpy((u8*)s_b.ring.ptr + voff, vertices, (size_t)vbytes);
++        s_ring_vtx += vbytes;
++    }
++    s_ring_idx += ibytes;
+     VkDeviceSize ioff = 0;
+     if (ibytes) {
+         ioff = vk_ring_alloc(ibytes);
+@@ -3888,11 +3991,13 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+         s_e2.vs_off = vk_ring_alloc(vsb);
+         memcpy((u8*)s_b.ring.ptr + s_e2.vs_off, s_e2.vs_data, vsb);
+         s_e2.vs_gen = s_b.gen + 1u;
++        s_ring_vsc += vsb;
+     }
+     if (s_e2.ps_gen != s_b.gen + 1u) {
+         s_e2.ps_off = vk_ring_alloc(psb);
+         memcpy((u8*)s_b.ring.ptr + s_e2.ps_off, s_e2.ps_data, psb);
+         s_e2.ps_gen = s_b.gen + 1u;
++        s_ring_psc += psb;
+     }
+     const VkDescriptorSet set = vk_eng_write_descriptors(P, dummy_cube, s_e2.vs_off, vsb,
+                                                          s_e2.ps_off, psb);
+@@ -3941,7 +4046,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+     pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout,
+                              0, 1, &set, 0, NULL);
+-    pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &s_b.ring.buf, &voff);
++    pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, in_vc ? &s_vc.buf.buf : &s_b.ring.buf, &voff);
+     if (ibytes) {
+         pvkCmdBindIndexBuffer(s_vk.cmd, s_b.ring.buf, ioff, VK_INDEX_TYPE_UINT32);
+         pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
+@@ -3980,6 +4085,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
+     .set_stencil_ref      = vk_eng_set_stencil_ref,
+     .set_depth_bounds     = vk_eng_set_depth_bounds,
+     .draw                 = vk_eng_draw,
++    .draw_cached          = vk_eng_draw_cached,
+     .clear_color          = vk_eng_clear_color,
+     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
+     .present              = vk_eng_present,
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 508f3f0..925a7e3 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1630,11 +1630,13 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
+  * unrelated overlays using the same address. Registration precedes execution. */
+ static struct { uint32_t entry; int image_id; } s_stack_reset[16];
+ static unsigned s_stack_reset_count;
++unsigned g_spu_stack_reset_n;      /* = s_stack_reset_count, for the inline hop check */
+ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
+ {
+     if (s_stack_reset_count < 16) {
+         s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
+         s_stack_reset[s_stack_reset_count++].image_id = image_id;
++        g_spu_stack_reset_n = s_stack_reset_count;
+     }
+ }
+ 
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index e3e50d3..27659d1 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -806,6 +806,21 @@ static inline int spu_tailret_on(void)
+ { return g_spu_tailret_on > 0 || (g_spu_tailret_on < 0 && spu_tailret_enabled()); }
+ static inline void yz_lockstep_tick_gate(spu_context* ctx)
+ { if (g_yz_lockstep_on != 0) yz_lockstep_tick(ctx); }
++/* The per-hop check, inline: what spu_task_launch_check does when no
++ * diagnostic is on (it was ~10 ms of SPU time per Killzone 2 frame as an
++ * out-of-line call reading half a dozen environment gates per hop). */
++extern int g_spu_hop_diag;
++extern unsigned g_spu_stack_reset_n;
++void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*));
++void spu_job_ls0_end(spu_context* ctx);
++static inline void spu_hop_check(spu_context* ctx, void* fn)
++{
++    if (__builtin_expect(g_spu_hop_diag != 0, 0)) { spu_task_launch_check(ctx, fn); return; }
++    if (g_spu_stack_reset_n && ctx->host_depth && !ctx->policy_mode)
++        spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
++    if (ctx->steps++ && !((uint32_t)ctx->pc & SPU_LS_MASK) && !ctx->policy_mode && ctx->image_id > 0)
++        spu_job_ls0_end(ctx);
++}
+ /* Take a pending SPU interrupt (spu_drain.c): srr0 <- ctx->pc, int_enable <- 0,
+  * decode the guest-planted branch at LS 0 into ctx->pc, and return the
+  * dispatcher to run instead of the interrupted transfer. Returns `tf`
+@@ -883,7 +898,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
+             g_spu_trampoline_fn = 0;                            \
+             yz_lockstep_tick_gate(ctx);                        \
+-            spu_task_launch_check((ctx), (void*)_tf);          \
++            spu_hop_check((ctx), (void*)_tf);                  \
+             if ((ctx)->int_enable &&                            \
+                 ((ctx)->event_status & (ctx)->event_mask))      \
+                 _tf = spu_take_interrupt((ctx), _tf);          \
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 428ee39..bb87dbf 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -57,8 +57,24 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
+     return k;
+ }
+ 
++/* spu_hop_check (spu_context.h) runs this full check only while a per-hop
++ * diagnostic is on; -1 until the first call reads the environment. */
++int g_spu_hop_diag = -1;
++
++/* A SPURS job that branched to LS 0: finished (see below). */
++void spu_job_ls0_end(spu_context* ctx)
++{
++    static int _n = 0;
++    if (_n++ < 8)
++        fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n", ctx->image_id);
++    spu_halt(ctx);
++}
++
+ void spu_task_launch_check(spu_context* ctx, void* fn)
+ {
++    if (g_spu_hop_diag < 0)
++        g_spu_hop_diag = (getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") || getenv("SPU_STEPTRACE") ||
++                          getenv("SPU_JOBDRAIN") || getenv("SPURS_PM_FLOW")) ? 1 : 0;
+     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+@@ -419,7 +435,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+             g_spu_trampoline_fn = 0;
+             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
+             yz_lockstep_tick_gate(ctx);
+-            spu_task_launch_check(ctx, (void*)fn);
++            spu_hop_check(ctx, (void*)fn);
+             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
+                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */

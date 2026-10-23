@@ -678,10 +678,14 @@ int main(int argc, char** argv)
      * jobs instead of returning to the kernel after each one (KZ3 fix list
      * R6; docs/PROGRESS.md section 31). */
     setenv("SPURS_PM_SELECT_CURRENT", "1", 0);
-    /* SPURS_MAXCONT=7:4 (jm_post on four SPUs) used to be the default here.
-     * The title builds jm_post for one SPU, and on a fast GPU the level start
-     * stalled in about half the runs with a post-processing job running
-     * on and on (docs/PROGRESS.md section 46); it is opt-in now. */
+    /* jm_post on four SPUs. Off since section 46 for level-start stalls,
+     * which were the task-id race fixed in section 53: with it fixed, nine
+     * runs to gameplay did not stall, and the frame rate rises from ~5 to ~9
+     * (docs/PROGRESS.md section 54). SPURS_MAXCONT=7:1 restores one SPU. */
+    setenv("SPURS_MAXCONT", "7:4", 0);
+    /* A presented flip completes at once, not on the next 60 Hz beat: a
+     * frame of 6.1 vblanks no longer waits for the 7th (section 54). */
+    setenv("KZ2_FLIP_IMMEDIATE", "1", 0);
     /* On a hybrid laptop the integrated GPU renders this title faster than
      * the discrete one, which stays at low clocks under its stop-and-go load
      * (section 44). A desktop's discrete GPU is still preferred. */
