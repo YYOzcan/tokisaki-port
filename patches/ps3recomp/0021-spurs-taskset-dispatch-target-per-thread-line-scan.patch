@@ -1,0 +1,126 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index f65b542..b4b25e0 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1132,11 +1132,16 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                  * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
+                 const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
+                 size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
+-                if (sz)
++                if (sz) {
+                     /* Async: SPURS tasks are persistent workers — running them
+-                     * inline would block this PPU thread forever (deadlock). */
++                     * inline would block this PPU thread forever (deadlock).
++                     * The task is named on this thread, not through the
++                     * globals another thread may be rewriting meanwhile. */
++                    extern void spu_workload_dispatch_target(uint32_t, uint32_t);
++                    spu_workload_dispatch_target(taskset_ea, i);
+                     spu_workload_dispatch_async(host_elf, (uint32_t)sz,
+                                                 (uint32_t)(uintptr_t)context);
++                }
+             }
+             return CELL_OK;
+         }
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index a6df655..9c6a1fe 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -382,6 +382,7 @@ static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
+ static volatile LONG s_ts_lock;
+ /* Set while spu_taskset_task_exited dispatches under ts_lock (see below). */
+ static SPU_THREAD_LOCAL_WL int s_ts_dispatch_locked;
++void spu_workload_dispatch_target(uint32_t taskset_ea, uint32_t taskid);   /* below */
+ static uint8_t* ts_running(uint32_t taskset_ea)
+ {
+     for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return s_ts_run[i].running;
+@@ -463,6 +464,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                         "(after task %u exited)\n", go[k].t, taskset_ea, go[k].elf, done_task);
+         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = go[k].t;
++        spu_workload_dispatch_target(taskset_ea, go[k].t);
+         s_ts_dispatch_locked = 1;        /* running bit already set, ts_lock held */
+         spu_workload_dispatch_async(vm_base + go[k].elf, (uint32_t)go[k].sz, go[k].ctx);
+         s_ts_dispatch_locked = 0;
+@@ -1129,8 +1131,45 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
+  * line holding a parked taskset's signalled bitset is committed; a commit
+  * that did not signal them only costs a spurious wake, which the wait loop
+  * re-checks. */
++/* Diagnostics: every tracked taskset's bitsets (ready, pending, enabled,
++ * and the tasks this runtime has running), e.g. when the frame stops. */
++void spu_taskset_dump_all(const char* why)
++{
++    extern uint8_t* vm_base;
++    for (int i = 0; i < TS_TRACK; i++) {
++        const uint32_t ea = s_ts_run[i].ea;
++        if (!ea) continue;
++        const uint8_t* ts = vm_base + ea;
++        fprintf(stderr, "[taskset-dump] %s 0x%08X ready ", why, ea);
++        for (int k = 0; k < 16; k++) fprintf(stderr, "%02X", ts[0x10 + k]);
++        fprintf(stderr, " pend ");
++        for (int k = 0; k < 16; k++) fprintf(stderr, "%02X", ts[0x20 + k]);
++        fprintf(stderr, " enab ");
++        for (int k = 0; k < 16; k++) fprintf(stderr, "%02X", ts[0x30 + k]);
++        fprintf(stderr, " run ");
++        for (int k = 0; k < 16; k++) fprintf(stderr, "%02X", s_ts_run[i].running[k]);
++        fprintf(stderr, " sig ");
++        for (int k = 0; k < 16; k++) fprintf(stderr, "%02X", ts[CSTS_SIGNALLED + k]);
++        fprintf(stderr, "\n");
++    }
++}
++
+ void spu_taskset_line_committed(uint32_t line)
+ {
++    /* An SPU committed to a taskset's first line, where the ready, pending
++     * and enabled bitsets live: start what it readied. Real SPURS has idle
++     * SPUs polling those bits; here tasks were started only when one exited,
++     * so a follow-up task readied after the last exit's scan never ran.
++     * Killzone 2's Havok step readies its follow-ups that way, and about one
++     * level start in eight waited for them forever (docs/PROGRESS.md section
++     * 53). SPU_TASKSET_LINE_SCAN=0 turns it off. */
++    {
++        static int scan = -1;
++        if (scan < 0) { const char* e = getenv("SPU_TASKSET_LINE_SCAN"); scan = !(e && e[0] == '0'); }
++        int known = 0;
++        for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == line) { known = 1; break; }
++        if (scan && known && !s_ts_dispatch_locked) spu_taskset_task_exited(line, 128);
++    }
+     for (int i = 0; i < SPU_PARKED_MAX; i++) {
+         const uint64_t k = s_parked[i];
+         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
+@@ -1243,9 +1282,26 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+     return 0;
+ }
+ 
++/* The task a dispatch is for, handed over on the dispatching thread. The
++ * single-slot globals g_ydkj_real_taskset_ea/g_ydkj_real_taskid were set by
++ * cellSpursCreateTask on a PPU thread and by the exit scheduler on SPU
++ * threads at the same time, and read back at the capture below: a job could
++ * take another task's id, run, and on exit clear that other task's bits --
++ * leaving its own marked running with nothing running it. Killzone 2's Havok
++ * step then waited forever for that task (docs/PROGRESS.md section 53). */
++static SPU_THREAD_LOCAL_WL uint32_t t_disp_ts, t_disp_tid;
++static SPU_THREAD_LOCAL_WL int t_disp_set;
++void spu_workload_dispatch_target(uint32_t taskset_ea, uint32_t taskid)
++{
++    t_disp_ts = taskset_ea; t_disp_tid = taskid; t_disp_set = 1;
++}
++
+ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+                                 uint32_t args_ea)
+ {
++    const int have_target = t_disp_set;
++    const uint32_t target_ts = t_disp_ts, target_tid = t_disp_tid;
++    t_disp_set = 0;
+     if (!image || image_size == 0) return 0;
+ 
+     uint64_t fp = spu_workload_fingerprint(image, image_size);
+@@ -1289,7 +1345,8 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+      * the next CreateTask overwriting the single-slot globals -- with two audio
+      * tasks that made both run task 1's descriptor. */
+     { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+-      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
++      j->taskset_ea = have_target ? target_ts : g_ydkj_real_taskset_ea;
++      j->taskid = have_target ? target_tid : g_ydkj_real_taskid; }
+     /* Mark the task running NOW, not when its host thread gets going: in
+      * between, another task of the set could exit, and the exit scheduler
+      * (spu_taskset_task_exited) would see this one enabled, ready and not

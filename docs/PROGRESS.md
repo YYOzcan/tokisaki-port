@@ -1142,3 +1142,34 @@ queue-full line was logged: a task is either never started or ends without
 posting. Next: count, per stalled run, the tasks `0x4EEA28` creates, the
 `[spu_workload] async ... RETURNED` lines for them and the pushes into queue
 6 (`PS3_EVQSTAT=1`), to tell which one goes missing.
+
+## 53. The level-start stall found: a SPURS task started under another task's id
+
+Counting per stalled run (`PS3_EVQSTAT=1`, the `CreateTask` / `dispatch HIT`
+/ `RETURNED` lines) showed the stall is not a lost event: the last thing
+that happens is a Havok physics step (tasks of ELF `0xC42A80`, follow-ups of
+`0xC59980`), and the queue the waits count on gets nothing more. A dump of
+every tracked taskset once two 5-second windows pass without a frame
+(`[taskset-dump] no-frames`, boot_main + `spu_taskset_dump_all`) showed
+the Havok taskset with tasks 1 and 2 **enabled, ready and marked running by
+the runtime -- with no thread running them**.
+
+Cause: a dispatched task learned which task it was from two single-slot
+globals (`g_ydkj_real_taskset_ea`, `g_ydkj_real_taskid`) that
+`cellSpursCreateTask` sets on a PPU thread and the exit scheduler sets on
+SPU threads, then read back in `spu_workload_dispatch_async`. Two
+dispatches at once and a job took the other's id: it ran with the other
+task's context, and on exit cleared the other task's bits, leaving its own
+marked running forever. The physics step waited for it.
+
+Fix (patch 0021): the dispatching thread names the task in thread-local
+storage (`spu_workload_dispatch_target`), which the dispatch reads first.
+Also, an SPU commit to a taskset's first line (its ready/pending/enabled
+bitsets) now runs the start scan too (`spu_taskset_line_committed`;
+`SPU_TASKSET_LINE_SCAN=0` turns it off) -- real SPURS has idle SPUs polling
+those bits, and here a task readied after the last exit's scan was never
+started.
+
+Six runs since in the two-instance setup that stalled about half the time:
+five reached gameplay, one stopped earlier (at 4279 frames, during the
+load) with every taskset clean -- a different stop, not caught yet.

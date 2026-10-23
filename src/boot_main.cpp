@@ -89,7 +89,8 @@ extern volatile unsigned g_spurs_pm_cur_wid, g_spurs_pm_cur_lane;   /* spurs_pol
 extern volatile unsigned long long g_spurs_pm_cur_since;
 extern volatile uint32_t g_spurs_last_task_arg[4];                   /* cellSpurs.c */
 uint32_t cellGcm_fifo_walker_get(void);
-void rsx_draw_engine_idle_flush(void);                                 /* rsx_draw_engine.c */
+void rsx_draw_engine_idle_flush(void);
+void spu_taskset_dump_all(const char* why);                             /* spu_workload.c */                                 /* rsx_draw_engine.c */
 unsigned long long ps3_ms_now(void);
 void cellGcm_rsx_process_fifo(void);
 
@@ -283,6 +284,11 @@ static void frame_clock_loop(void)
                         (n - fps_n0) * 1000.0 / (double)(now - fps_t0), n,
                         (int)g_spurs_pm_cur_wid, g_spurs_pm_cur_lane,
                         ps3_ms_now() - g_spurs_pm_cur_since);
+                /* Two windows without a frame: dump the SPURS tasksets once. */
+                { static int still = 0, dumped = 0;
+                  still = (n == fps_n0 && n > 1000) ? still + 1 : 0;
+                  if (still >= 2 && !dumped) { dumped = 1;
+                      spu_taskset_dump_all("no-frames"); } }
                 fps_t0 = now; fps_n0 = n;
             }
         }
