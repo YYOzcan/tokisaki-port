@@ -1039,3 +1039,17 @@ music is ~0.3-0.5. The hook is now opt-in (`KZ2_SOUND_WATCHDOG=1`).
 One of six runs without it stalled right after the level's first entity
 batch (the others reached gameplay with sound); with it, none of six did.
 That stall was not caught with thread dumps yet.
+
+## 48. SPU float fast path: denormal and extended-range operands
+
+`SPU_FF_WHY=1` tallies why float lanes leave the AVX2 fast path (and prints
+24 examples). In gameplay ~490 M lanes a minute did, all of two kinds: `fm`
+with an extended-range operand (biased exponent 255, e.g. `x * 0x7FFFF800`)
+and `fma` with a denormal one (integer bit patterns). Neither needs the exact
+path: SPU singles treat a denormal operand as a signed zero and exponent 255
+as an ordinary larger number, both exact in double. Operands are now flushed
+and widened by hand instead of with `cvtps_pd` (patch 0017); results outside
+the normal range still go per lane. `tests/test_spu_fma.c` now feeds
+denormal and extended operands too: 0 mismatches against the exact
+reference. Fallback lanes fell to ~70 M a minute (mostly fma results that
+really rounded onto a boundary) and jm_post's busy time by about a fifth.

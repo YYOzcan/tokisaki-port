@@ -7,12 +7,14 @@ static uint64_t s = 0x9E3779B97F4A7C15ull;
 static uint32_t rnd(void) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uint32_t)s; }
 static uint32_t rf(void)
 {
-    switch (rnd() & 7) {
+    switch (rnd() % 7) {
     case 0: return 0;
     case 1: return 0x80000000u;
     case 2: { float f = (float)((int)(rnd() % 2048) - 1024) / 256.0f; uint32_t u; memcpy(&u, &f, 4); return u; }
     case 3: { float f = (float)(rnd() % 256) / 255.0f; uint32_t u; memcpy(&u, &f, 4); return u; }
     case 4: return (rnd() & 0x807FFFFFu) | ((uint32_t)(100 + rnd() % 56) << 23);   /* near 1.0 */
+    case 5: return (rnd() & 1) ? (rnd() & 0x807FFFFFu)                              /* denormal */
+                               : (rnd() | 0x7F800000u);                             /* extended */
     default: return rnd();
     }
 }
