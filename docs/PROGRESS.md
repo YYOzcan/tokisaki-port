@@ -940,3 +940,58 @@ A per-doubleword PUTLLC commit (keep a PPU plain store that lands between
 the compare and the copy) was tried and reverted: the level start crashed in
 `memcpy` into the stack region twice and stalled once -- a line written
 piecemeal is visible half-written for longer than the 128-byte copy.
+
+## 44. Where the FIFO thread's time goes (KZ2_RSX_TIMES)
+
+`KZ2_RSX_TIMES=1` makes the runner's frame clock print, every 5 s, how the
+FIFO thread spent its time: inside drains (and how much of that was waiting
+for the GPU), and between drains with the FIFO empty (waiting for the PPU),
+parked on a jump to itself (waiting for an SPU job to patch it) or other.
+In gameplay it read **drain 93-100%, GPU wait 30-39%, parked 0-7%**: the FIFO
+thread is the bottleneck, and the guest main thread's long waits on GCM
+label 0x4B are waits for it. (A shorter sleep between drains,
+`KZ2_DRAIN_US`, changed nothing.)
+
+Changes since (patch 0015):
+- **Consecutive draws into one framebuffer share a render pass instance**
+  (rasterization order already orders their attachment writes, and every
+  other operation closes the pass): ~5 draws per pass in the level.
+  `PS3RECOMP_VK_RP_MERGE=0` turns it off. The image is unchanged; the GPU
+  wait barely moved, so per-draw passes and barriers were not what the GPU
+  was spending its time on.
+- **The batch ring lives in device-local, host-visible memory** when the
+  device has it (VRAM through the BAR on the RTX 4050): vertex fetches and
+  constant reads no longer cross PCIe. With two instances running the GPU
+  wait fell from ~35% to 8-20%; alone it stays near 30% because the NVIDIA
+  GPU drops to ~450 MHz under one instance's bursty load (section 40).
+  `PS3RECOMP_VK_RING_VRAM=0` keeps it in host memory.
+- `PS3RECOMP_VK_PREFER=integrated` (`KZ2_GPU=igpu tools/play.sh`) picks an
+  integrated GPU. On the Radeon 680M gameplay runs at **6-8.5 frames/s**
+  (FIFO thread: drain ~97%, GPU wait ~15%) against 4-5 on the RTX 4050.
+- **Linear textures decode by rows**: `rsx_texture_decode` walked every texel
+  through `decode_texel`; linear images that only byte-swap components (R16,
+  R16G16(F), RGBA16F, R32F, RGBA32F) or rotate A8R8G8B8 now take a row loop.
+  The Z16 shadow map that still goes through guest memory every frame
+  (section 41) was the FIFO thread's largest CPU cost. Compared against the
+  original decoder on random data for 18 formats: identical.
+
+## 45. Stalls left: jm_post on several SPUs, and Z16 on the GPU
+
+- **Z16 read as DEPTH16/X16 on the GPU** (`RSX_GPU_REINTERPRET_MASK=7`)
+  parks the RSX for good at the level start, 4 runs of 4, even with the
+  taskset fixes and with the guest copy still stored at the next label or
+  whenever the FIFO goes idle (`rsx_draw_engine_idle_flush`). DEPTH16 alone
+  is enough. Not understood; Z16 stays on the guest-memory path.
+- On the integrated GPU (a faster FIFO thread) the level start stalls in
+  about half the runs; on the RTX 4050, none of ten runs since section 43
+  stalled. The stalled runs show the main thread in `0x4EED70` waiting for
+  the completions of a batch of SPU tasks (`+0x210` of them, on a condition
+  signalled by the thread that services event queue 6, which has nothing
+  pending: `PS3_EVQSTAT`), the RSX parked, and one SPU worker running a
+  jm_post job (`jobmod_7eb6fb9f6647` or `9de83b69cfa0`) that keeps going --
+  a job polling for something. Killzone 2 builds jm_post for one SPU
+  (contention 1); since section 34 it runs on up to four
+  (`SPURS_MAXCONT=7:4`), where a job can poll for work a job behind it in the
+  list has not done yet. With `SPURS_MAXCONT=7:1` two integrated-GPU runs did
+  not stall (at 3.6-5 frames/s); with 7:2 one of two did. The default stays
+  the discrete GPU with 7:4.

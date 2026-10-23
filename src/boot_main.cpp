@@ -88,7 +88,8 @@ int  cellGcm_take_flip_pending_synced(void);
 extern volatile unsigned g_spurs_pm_cur_wid, g_spurs_pm_cur_lane;   /* spurs_policy.c */
 extern volatile unsigned long long g_spurs_pm_cur_since;
 extern volatile uint32_t g_spurs_last_task_arg[4];                   /* cellSpurs.c */
-uint32_t cellGcm_fifo_walker_get(void);                              /* cellGcmSys.c */
+uint32_t cellGcm_fifo_walker_get(void);
+void rsx_draw_engine_idle_flush(void);                                 /* rsx_draw_engine.c */
 unsigned long long ps3_ms_now(void);
 void cellGcm_rsx_process_fifo(void);
 
@@ -188,15 +189,51 @@ static void frame_clock_loop(void)
     auto drain = [&]() {
         if (!rsx_ok) return;
         cellGcm_rsx_process_fifo();
+        {   /* stopped: empty, or parked on a jump to itself */
+            const uint32_t g = cellGcm_fifo_walker_get();
+            const uint32_t p = __builtin_bswap32(*(uint32_t*)(vm_base + 0xE8002000u));
+            const uint32_t w = __builtin_bswap32(*(uint32_t*)(vm_base + 0x40300000u + g));
+            if (g == p || ((w & 0xE0000003u) == 0x20000000u && (w & 0x1FFFFFFCu) == g))
+                rsx_draw_engine_idle_flush();
+        }
         if (cellGcm_take_flip_pending_synced()) {
             be.present();
             g_frames_presented.fetch_add(1);
         }
     };
 
+    /* KZ2_DRAIN_US: how long the FIFO thread sleeps between drains. Killzone 2
+     * parks the RSX on sub-buffers its SPU jobs patch many times a frame, and
+     * every park is noticed only at the next drain. */
+    static const unsigned drain_us = [] {
+        const char* e = getenv("KZ2_DRAIN_US");
+        return e ? (unsigned)strtoul(e, 0, 0) : 1000u;
+    }();
+    /* KZ2_RSX_TIMES=1: every 5 s, where the FIFO thread's time went -- drains
+     * (CPU), GPU waits inside them, and the sleeps between drains split by
+     * what the FIFO was doing: empty (waiting for the PPU to submit), parked
+     * on a jump to itself (waiting for an SPU job to patch it), or other. */
+    static const bool times = getenv("KZ2_RSX_TIMES") != nullptr;
+    extern volatile unsigned long long g_vk_wait_ns;
+    auto now_ns = []() -> uint64_t {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    };
+    uint64_t t_drain = 0, t_empty = 0, t_park = 0, t_other = 0, t_win0 = now_ns(), wait0 = g_vk_wait_ns;
+    int state = 2;                      /* 0 empty, 1 parked, 2 other */
     uint64_t next_tick = now_ms();
     for (;;) {
+        const uint64_t s0 = times ? now_ns() : 0;
+#ifdef _WIN32
         Sleep(1);
+#else
+        usleep(drain_us);
+#endif
+        if (times) {
+            const uint64_t d = now_ns() - s0;
+            (state == 0 ? t_empty : state == 1 ? t_park : t_other) += d;
+        }
+        const uint64_t d0 = times ? now_ns() : 0;
         drain();
         peek_tick();
         dumpat_tick();
@@ -214,6 +251,22 @@ static void frame_clock_loop(void)
             fired++;
         }
         if (fired >= 240) next_tick = now;
+        if (times) {
+            t_drain += now_ns() - d0;
+            const uint32_t g = cellGcm_fifo_walker_get();
+            const uint32_t p = __builtin_bswap32(*(uint32_t*)(vm_base + 0xE8002000u));
+            const uint32_t w = __builtin_bswap32(*(uint32_t*)(vm_base + 0x40300000u + g));
+            state = (g == p) ? 0 : ((w & 0xE0000003u) == 0x20000000u && (w & 0x1FFFFFFCu) == g) ? 1 : 2;
+            const uint64_t tn = now_ns();
+            if (tn - t_win0 >= 5000000000ull) {
+                const double tot = (double)(tn - t_win0) / 100.0;
+                const uint64_t gw = g_vk_wait_ns - wait0;
+                fprintf(stderr, "[rsx-times] drain %.0f%% (gpu wait %.0f%%) | idle: fifo empty %.0f%%, parked %.0f%%, other %.0f%%\n",
+                        (double)t_drain / tot, (double)gw / tot, (double)t_empty / tot,
+                        (double)t_park / tot, (double)t_other / tot);
+                t_drain = t_empty = t_park = t_other = 0; t_win0 = tn; wait0 = g_vk_wait_ns;
+            }
+        }
 
         if (rsx_ok) {
             if (be.pump() != 0) {
