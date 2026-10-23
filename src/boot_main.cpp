@@ -662,12 +662,16 @@ int main(int argc, char** argv)
     /* In the level the frame is gated by jm_post (workload 7), the SPU
      * post-processing job list. Its policy module keeps running while it has
      * jobs instead of returning to the kernel after each one (KZ3 fix list
-     * R6), and it may use up to four SPUs instead of one -- the WWS job
-     * manager claims jobs atomically per SPU row. 1.5 -> ~2.1 frames/s on
-     * four host cores (docs/PROGRESS.md sections 31 and 34). Four used to
-     * stall; that was the taskset scheduler race fixed in section 32. */
+     * R6; docs/PROGRESS.md section 31). */
     setenv("SPURS_PM_SELECT_CURRENT", "1", 0);
-    setenv("SPURS_MAXCONT", "7:4", 0);
+    /* SPURS_MAXCONT=7:4 (jm_post on four SPUs) used to be the default here.
+     * The title builds jm_post for one SPU, and on a fast GPU the level start
+     * stalled in about half the runs with a post-processing job running
+     * on and on (docs/PROGRESS.md section 46); it is opt-in now. */
+    /* On a hybrid laptop the integrated GPU renders this title faster than
+     * the discrete one, which stays at low clocks under its stop-and-go load
+     * (section 44). A desktop's discrete GPU is still preferred. */
+    setenv("PS3RECOMP_VK_PREFER", "integrated-on-laptop", 0);
 
     uint32_t entry = ppu_load_elf(argv[1]);
     if (!entry) {

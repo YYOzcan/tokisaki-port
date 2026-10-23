@@ -995,3 +995,31 @@ Changes since (patch 0015):
   list has not done yet. With `SPURS_MAXCONT=7:1` two integrated-GPU runs did
   not stall (at 3.6-5 frames/s); with 7:2 one of two did. The default stays
   the discrete GPU with 7:4.
+
+## 46. jm_post back on one SPU; the integrated GPU by default on laptops
+
+The stalls of section 45 point at the four-SPU jm_post override:
+- the stalled runs show a jm_post job running on and on while the main
+  thread waits for SPU task completions that never come;
+- Killzone 2 gives jm_post a maximum contention of 1 -- its post-processing
+  jobs are written to run one after another -- and `SPURS_MAXCONT=7:4`
+  (section 34) let up to four run at once;
+- with `7:1` five integrated-GPU runs did not stall (with 7:4 about half
+  did; with 7:2 one of two).
+The override is gone: jm_post runs on one SPU as the title asks
+(`SPURS_MAXCONT=7:4` still works, opt-in). The cost is real on the RTX 4050
+(~4.5 -> ~2.5 frames/s, the RSX then waits for jm_post) but small on the
+Radeon 680M, so `PS3RECOMP_VK_PREFER=integrated-on-laptop` is the new
+default: the integrated GPU is preferred when the discrete one is a laptop
+part (its name says "Laptop"); a desktop keeps its discrete GPU.
+`KZ2_GPU=dgpu|igpu tools/play.sh` overrides.
+
+Also (patch 0016): `mfc_for`, the lookup of an SPU context's DMA engine that
+every channel access does, took a shared lock each time -- ~11% of a busy
+SPU thread in the post-processing jobs. Each thread now remembers its last
+(context, engine) pair; any release of an engine bumps a generation that
+drops them all.
+
+Gameplay on the defaults, one instance: **5.2-6.3 presented frames/s**, the
+FIFO thread busy 52-72% (GPU wait 12-13%) and parked 28-48% waiting for
+jm_post, which keeps one SPU ~72% busy. Six runs, no stall.

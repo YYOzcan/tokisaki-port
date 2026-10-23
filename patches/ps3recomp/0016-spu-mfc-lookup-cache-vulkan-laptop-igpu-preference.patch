@@ -1,0 +1,84 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index f7e7ca5..ebb0eb9 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -339,6 +339,18 @@ static int vk_pick_device(void)
+ 
+     int best = -1, best_rank = -1;
+     const char* forced = getenv("PS3RECOMP_VK_DEVICE");
++    /* PS3RECOMP_VK_PREFER=integrated-on-laptop: prefer the integrated GPU
++     * only when the discrete one is a laptop part (its name says so). */
++    const char* pref = getenv("PS3RECOMP_VK_PREFER");
++    int prefer_igpu = pref && !strcmp(pref, "integrated");
++    if (pref && !strcmp(pref, "integrated-on-laptop")) {
++        for (u32 i = 0; i < n; i++) {
++            VkPhysicalDeviceProperties q;
++            pvkGetPhysicalDeviceProperties(devs[i], &q);
++            if (q.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && strstr(q.deviceName, "Laptop"))
++                prefer_igpu = 1;
++        }
++    }
+     for (u32 i = 0; i < n; i++) {
+         VkPhysicalDeviceProperties p;
+         pvkGetPhysicalDeviceProperties(devs[i], &p);
+@@ -360,9 +372,7 @@ static int vk_pick_device(void)
+         /* PS3RECOMP_VK_PREFER=integrated: an integrated GPU first. On a hybrid
+          * laptop the discrete one can be the slower choice for this
+          * submit-and-read-back load (Killzone 2: its clocks stay low). */
+-        { const char* pref = getenv("PS3RECOMP_VK_PREFER");
+-          if (pref && !strcmp(pref, "integrated") && p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
+-              rank += 100; }
++        if (prefer_igpu && p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) rank += 100;
+         if (rank > best_rank) { best = (int)i; best_rank = rank; }
+     }
+     if (best < 0) {
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 538d2a7..71f2322 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -291,8 +291,28 @@ typedef struct spu_mfc_slot {
+ 
+ static spu_mfc_slot* s_mfc_slots;
+ static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
+-
++/* Every channel access looks its engine up, and the shared lock it took for
++ * that was ~11% of a busy SPU thread in Killzone 2's post-processing jobs.
++ * Each thread remembers its last (context, engine); any release bumps the
++ * generation and drops every remembered pair. Safe because only a context's
++ * executing thread uses its engine, and a context is released only after
++ * that thread stopped using it. */
++static volatile unsigned s_mfc_gen = 1;
++static __thread spu_context* t_mfc_ctx;
++static __thread mfc_engine*  t_mfc_eng;
++static __thread unsigned     t_mfc_gen;
++
++static mfc_engine* mfc_for_slow(spu_context* ctx);
+ static mfc_engine* mfc_for(spu_context* ctx)
++{
++    const unsigned gen = __atomic_load_n(&s_mfc_gen, __ATOMIC_ACQUIRE);
++    if (t_mfc_ctx == ctx && t_mfc_gen == gen) return t_mfc_eng;
++    mfc_engine* e = mfc_for_slow(ctx);
++    t_mfc_ctx = ctx; t_mfc_eng = e; t_mfc_gen = gen;
++    return e;
++}
++
++static mfc_engine* mfc_for_slow(spu_context* ctx)
+ {
+     AcquireSRWLockShared(&s_mfc_claim_lock);
+     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+@@ -330,6 +350,7 @@ void spu_mfc_release(spu_context* ctx)
+ {
+     if (!ctx) return;
+     AcquireSRWLockExclusive(&s_mfc_claim_lock);
++    __atomic_add_fetch(&s_mfc_gen, 1, __ATOMIC_RELEASE);
+     for (spu_mfc_slot** link = &s_mfc_slots; *link; link = &(*link)->next) {
+         if ((*link)->ctx != ctx) continue;
+         spu_mfc_slot* slot = *link;
+@@ -345,6 +366,7 @@ void spu_mfc_release(spu_context* ctx)
+ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
+ {
+     AcquireSRWLockExclusive(&s_mfc_claim_lock);
++    __atomic_add_fetch(&s_mfc_gen, 1, __ATOMIC_RELEASE);
+     for (spu_mfc_slot** link = &s_mfc_slots; *link;) {
+         spu_mfc_slot* slot = *link;
+         uintptr_t owner = (uintptr_t)slot->ctx;
