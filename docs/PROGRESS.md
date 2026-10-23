@@ -1121,3 +1121,12 @@ event now waits up to `SPU_EVENT_FULL_WAIT_MS` (2000) for room and logs
 and one of them stalled anyway: the job does not get to its send. Next:
 find what that job loops on (its DMA helper is at LS 0x16294, its tag wait
 at 0x453C) in a stalled run.
+
+Two more observations on the stall. The run directories that "stall more"
+have byte-identical saves; what they share is being the second of two
+instances started 12 s apart, i.e. the more loaded one -- a single instance
+stalls far less often (about one run in eight of the single runs since
+section 46). In a stall caught with ten stack samples the jm_post worker
+keeps moving through different jobs, four SPU workers are idle, and the
+main thread waits in `0x4EED70`; `SPURS_PM_SELECT_CURRENT=0` (the policy
+module yields after every job) made it worse, three stalls in four.
