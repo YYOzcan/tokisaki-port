@@ -25,6 +25,14 @@ static int eq(u128 a, u128 b) { return !memcmp(&a, &b, 16); }
 int main(void)
 {
     long bad = 0;
+    /* pass 0: default MXCSR; pass 1: the mode lifted code runs in (round
+     * toward zero, DAZ, FTZ; g_spu_fp_rz) */
+    for (int pass = 0; pass < 2; pass++) {
+    if (pass) {
+        g_spu_fp_saved = _mm_getcsr();
+        _mm_setcsr((g_spu_fp_saved & ~0x6000u) | 0x6000u | 0x0040u | 0x8000u);
+        g_spu_fp_rz = 1;
+    }
     for (long n = 0; n < 8000000; n++) {
         u128 a = rv(), b = rv(), c = rv();
 #define T(name, x, y) if (!eq(x, y) && bad++ < 20) printf("%s mismatch %08X %08X %08X\n", name, a._u32[0], b._u32[0], c._u32[0]);
@@ -34,6 +42,7 @@ int main(void)
         T("fma", spu_fma(a, b, c), spu_fma_ref(a, b, c));
         T("fms", spu_fms(a, b, c), spu_fms_ref(a, b, c));
         T("fnms", spu_fnms(a, b, c), spu_fnms_ref(a, b, c));
+    }
     }
     printf("%ld mismatches\n", bad);
     return bad != 0;

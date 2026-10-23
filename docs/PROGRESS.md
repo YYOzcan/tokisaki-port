@@ -1233,3 +1233,43 @@ Tried and dropped: keeping SPU registers in C locals inside lifted functions
 (a post-pass on the lifter's output). The SPU has 128 registers, x86 16: the
 compiler spilled the locals to the stack and added entry/exit copies -- the
 hot jm_post loop grew from 2528 to 3627 instructions.
+
+## 55. The FIFO thread: batches in flight, a vertex cache; SPU floats in MXCSR mode
+
+With jm_post on four SPUs the FIFO thread became the limit (drain ~80% of
+its time, a fifth of that waiting for the GPU). Patch 0023:
+- **batches in flight** (Vulkan backend): three slots, each with its own
+  command buffer, fence, descriptor pool, deferred destructions and third of
+  the (now 192 MB) ring. A batch is submitted without waiting once it holds
+  `PS3RECOMP_VK_ASYNC_OPS` operations (default 192) or its ring part is full,
+  and the present no longer waits either (the swapchain's acquire semaphore
+  waits for the slot that used it last); only a readback waits, for every
+  slot. The legacy (pre-engine) paths, which share one vertex buffer and
+  descriptor set, wait for everything first.
+- **vertex cache** (draw engine): a draw's key hashes its layout, every
+  fetched attribute's format, its references and the guest bytes they read;
+  a key seen twice keeps its decoded vertices, and an entry unused for 120
+  frames is dropped (`RSX_VTX_CACHE=0` off, `RSX_VTX_CACHE_STATS=1`). In
+  gameplay 93% of the draws hit (~40 MB held); the FIFO thread's own code fell
+  from 42 to 33 ms of CPU per frame.
+- index lists become references 8 at a time (AVX2, byte swap + widen +
+  interleave with the base index; a group holding the restart index goes
+  through the scalar loop), and the attributes are fetched attribute by
+  attribute with one loop per type (`rsx_vertex_fetch_all`, compared against
+  the per-vertex path: 0 differences over 20000 random plans).
+- **SPU floats in MXCSR mode**: the outermost `spu_run_with_halt` on a
+  thread sets round-toward-zero + denormals-are-zero + flush-to-zero (and
+  `g_spu_fp_rz`), which inside the normal range is exactly the SPU's single
+  precision: fa/fm/fma become one `addps`/`mulps`/`vfmadd` plus a range test
+  (an exponent-255 operand, or a result of magnitude FLT_MAX, where a
+  round-toward-zero overflow lands, takes the exact paths, which stay exact in
+  this mode); zero results get their sign cleared. Double precision and
+  `frds` put the thread's own MXCSR back for their duration. `SPU_FP_RZ=0`
+  keeps the old paths. Both float tests now run in both modes: 0 mismatches
+  (fa/fs/fm/fma/fms/fnms 16M vectors, conversions and fi 6M). fm/fa/fma
+  2.0/1.9/2.8 ns (tier 1: 3.6/5.2/5.8). The post-processing module
+  `a27e818cca34` fell from 86 to 61 ms of CPU per frame, `9de83b69cfa0` from
+  25 to 17.
+
+Gameplay (one instance, power-saver, `SPURS_MAXCONT=7:4 KZ2_FLIP_IMMEDIATE=1`):
+9.1 -> 10.5 frames/s. The FIFO thread is busy ~90% again (GPU waits ~19%).

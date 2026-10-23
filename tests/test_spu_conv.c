@@ -21,6 +21,12 @@ static int eq(u128 a, u128 b) { return !memcmp(&a, &b, 16); }
 int main(void)
 {
     long bad = 0;
+    for (int pass = 0; pass < 2; pass++) {          /* pass 1: the lifted code's MXCSR mode */
+    if (pass) {
+        g_spu_fp_saved = _mm_getcsr();
+        _mm_setcsr((g_spu_fp_saved & ~0x6000u) | 0x6000u | 0x0040u | 0x8000u);
+        g_spu_fp_rz = 1;
+    }
     for (long n = 0; n < 3000000; n++) {
         u128 a = rv(), b = rv(), c = rv();
         if (n & 1) for (int i = 0; i < 4; i++) c._u32[i] &= 0x1F1F1F1Fu;   /* plain selectors */
@@ -32,6 +38,7 @@ int main(void)
         T("cfltu", spu_cfltu(a, i8), spu_cfltu_ref(a, i8));
         T("csflt", spu_csflt(a, i8), spu_csflt_ref(a, i8));
         T("cuflt", spu_cuflt(a, i8), spu_cuflt_ref(a, i8));
+    }
     }
     printf("%ld mismatches\n", bad);
     return bad != 0;
