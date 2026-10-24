@@ -75,6 +75,30 @@ loc_009A2284:
         "void func_003BD660(ppu_context* ctx) {\n"
         "        /* kz2 postlift: progress wait on the host */ if (kz2_spu_progress_wait(ctx)) return;\n",
     ),
+    # Direct mouse look (src/kz2_mouse.cpp): the player aim update takes the
+    # mouse motion itself once per frame -- marked where the local player's
+    # look input is read, applied where the new pitch and the turn input are
+    # final -- instead of through the right stick's curve and ramp.
+    (
+        "func_0016E620",
+        "void func_0016E620(ppu_context* ctx) {\n",
+        'extern "C" void kz2_mouse_look_mark(ppu_context*);\n'
+        'extern "C" void kz2_mouse_look_apply(ppu_context*);\n'
+        "void func_0016E620(ppu_context* ctx) {\n",
+    ),
+    (
+        "func_0016E620",
+        '        ctx->lr = 0x0016E794; func_00080A78(ctx); DRAIN_TRAMPOLINE(ctx);\nloc_0016E794:\n',
+        '        ctx->lr = 0x0016E794; func_00080A78(ctx); DRAIN_TRAMPOLINE(ctx);\n'
+        "        /* kz2 postlift: mouse look, local player */ kz2_mouse_look_mark(ctx);\n"
+        "loc_0016E794:\n",
+    ),
+    (
+        "func_0016E620",
+        'loc_0016F400:\n        ctx->gpr[3] = (int64_t)(int32_t)(0xA0);\n        { uint64_t _a = ctx->gpr[1]; uint64_t _r = _a + (uint64_t)(int64_t)(0xA0); ctx->gpr[4] = _r; ctx->xer = (ctx->xer & ~(1u << 29)) | ((_r < _a) ? (1u << 29) : 0u); }\n        { uint64_t ea = (ctx->gpr[3] + ctx->gpr[1]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[31] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }\n',
+        'loc_0016F400:\n        ctx->gpr[3] = (int64_t)(int32_t)(0xA0);\n        { uint64_t _a = ctx->gpr[1]; uint64_t _r = _a + (uint64_t)(int64_t)(0xA0); ctx->gpr[4] = _r; ctx->xer = (ctx->xer & ~(1u << 29)) | ((_r < _a) ? (1u << 29) : 0u); }\n        { uint64_t ea = (ctx->gpr[3] + ctx->gpr[1]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[31] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }\n'
+        "        /* kz2 postlift: mouse look */ kz2_mouse_look_apply(ctx);\n",
+    ),
 ]
 
 

@@ -107,6 +107,7 @@ add_executable(killzone2
     src/kz2_hle.cpp
     src/kz2_ftrace.cpp
     src/kz2_fiber.cpp
+    src/kz2_mouse.cpp
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_loader.cpp"
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_hle.cpp"
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"

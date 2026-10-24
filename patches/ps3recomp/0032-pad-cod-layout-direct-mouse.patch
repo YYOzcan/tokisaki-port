@@ -1,0 +1,213 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index b54836a..52e9424 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -287,6 +287,39 @@ static u8 pad_sdl_trigger_to_u8(int raw)
+     return (u8)val;
+ }
+ 
++static unsigned long long pad_now_ms(void);
++
++/* Mouse state shared by the keyboard/mouse pad and the direct look API. */
++static int s_mouse_captured = 0;
++static volatile unsigned long long s_mouse_direct_ms = 0;   /* last cellPad_take_mouse_motion */
++#define PAD_MOUSE_DIRECT_MS 300
++/* Mouse wheel notches seen by the window's event pump (rsx_vulkan_backend.c). */
++volatile int g_pad_wheel_ticks = 0;
++
++static float pad_mouse_sens(void)
++{
++    static float sens = 0.0f;
++    if (sens == 0.0f) { const char* e = getenv("PS3_PAD_MOUSE_SENS"); sens = e ? (float)atof(e) : 3.0f;
++                        if (sens <= 0.0f) sens = 3.0f; }
++    return sens;
++}
++
++/* Direct mouse look: the relative motion (counts) since the last call, for a
++ * title whose look code is hooked to turn the view by it once per frame.
++ * Returns 0 (and no motion) while the mouse is not captured. Calling it keeps
++ * the mouse off the right stick for PAD_MOUSE_DIRECT_MS. `sens` gets
++ * PS3_PAD_MOUSE_SENS (default 3), `invert` PS3_PAD_MOUSE_INVERT. */
++int cellPad_take_mouse_motion(int* dx, int* dy, float* sens, int* invert)
++{
++    static int inv = -1;
++    if (inv < 0) { const char* e = getenv("PS3_PAD_MOUSE_INVERT"); inv = e && e[0] == '1'; }
++    *dx = *dy = 0; *sens = pad_mouse_sens(); *invert = inv;
++    s_mouse_direct_ms = pad_now_ms();
++    if (!s_mouse_captured) return 0;
++    SDL_GetRelativeMouseState(dx, dy);
++    return 1;
++}
++
+ static void pad_poll_sdl2(void)
+ {
+     SDL_GameControllerUpdate();
+@@ -365,52 +398,89 @@ static void pad_poll_sdl2(void)
+     const Uint8* keys = SDL_GetKeyboardState(NULL);
+     if (keys) {
+         u16 kbtns = 0;
+-        if (keys[SDL_SCANCODE_RETURN] || keys[SDL_SCANCODE_KP_ENTER]) kbtns |= CELL_PAD_CTRL_START;
+-        if (keys[SDL_SCANCODE_SPACE])                                 kbtns |= CELL_PAD_CTRL_CROSS;
+-        if (keys[SDL_SCANCODE_ESCAPE] || keys[SDL_SCANCODE_BACKSPACE]) kbtns |= CELL_PAD_CTRL_CIRCLE;
+-        if (keys[SDL_SCANCODE_TAB] || keys[SDL_SCANCODE_GRAVE])      kbtns |= CELL_PAD_CTRL_SELECT;
+-        /* Keyboard and mouse as a pad for a first-person game (PS3_PAD_KBM=0
+-         * restores the old layout, WASD on the d-pad): WASD is the left stick,
+-         * the mouse the right stick; arrows stay the d-pad. */
++        /* Keyboard and mouse as a pad for a first-person game, laid out like a
++         * PC shooter (PS3_PAD_KBM=0 restores the old layout, WASD on the
++         * d-pad): WASD left stick, mouse look, arrows the d-pad. Buttons are
++         * named for the DualShock 3; the comments give their usual shooter
++         * meaning (Killzone 2's defaults).
++         *   LMB R1 fire        RMB L1 aim         Space/Enter Cross jump, confirm
++         *   Shift L3 sprint    V, MMB, X1 R3 melee   G, X2 R2 grenade
++         *   R, E, F Square reload/use   C, Ctrl Circle crouch   Q, Z L2 cover
++         *   1 2 3, wheel Triangle switch weapon   Tab Select   Enter, P Start
++         *   Esc Start in play (pause), Circle in menus (back)   Backspace Circle */
+         static int kbm = -1;
+         if (kbm < 0) { const char* e = getenv("PS3_PAD_KBM"); kbm = !(e && e[0] == '0'); }
++        if (keys[SDL_SCANCODE_SPACE])                                 kbtns |= CELL_PAD_CTRL_CROSS;
++        if (keys[SDL_SCANCODE_RETURN] || keys[SDL_SCANCODE_KP_ENTER]) kbtns |= CELL_PAD_CTRL_START;
++        if (keys[SDL_SCANCODE_BACKSPACE])                            kbtns |= CELL_PAD_CTRL_CIRCLE;
++        if (keys[SDL_SCANCODE_TAB] || keys[SDL_SCANCODE_GRAVE])      kbtns |= CELL_PAD_CTRL_SELECT;
+         if (keys[SDL_SCANCODE_UP] || (!kbm && keys[SDL_SCANCODE_W]))    kbtns |= CELL_PAD_CTRL_UP;
+         if (keys[SDL_SCANCODE_DOWN] || (!kbm && keys[SDL_SCANCODE_S]))  kbtns |= CELL_PAD_CTRL_DOWN;
+         if (keys[SDL_SCANCODE_LEFT] || (!kbm && keys[SDL_SCANCODE_A]))  kbtns |= CELL_PAD_CTRL_LEFT;
+         if (keys[SDL_SCANCODE_RIGHT] || (!kbm && keys[SDL_SCANCODE_D])) kbtns |= CELL_PAD_CTRL_RIGHT;
+-        if (keys[SDL_SCANCODE_Q] || keys[SDL_SCANCODE_1])            kbtns |= CELL_PAD_CTRL_L1;
+-        if (keys[SDL_SCANCODE_E] || keys[SDL_SCANCODE_3])            kbtns |= CELL_PAD_CTRL_R1;
+-        if (keys[SDL_SCANCODE_R] || keys[SDL_SCANCODE_F])            kbtns |= CELL_PAD_CTRL_SQUARE;
+-        if (keys[SDL_SCANCODE_T] || keys[SDL_SCANCODE_C])            kbtns |= CELL_PAD_CTRL_TRIANGLE;
+         int ml_x = 128, ml_y = 128, mr_x = 128, mr_y = 128, kbm_active = 0;
+-        if (kbm) {
+-            if (keys[SDL_SCANCODE_LCTRL])                             kbtns |= CELL_PAD_CTRL_CIRCLE;
+-            if (keys[SDL_SCANCODE_Z])                                 kbtns |= CELL_PAD_CTRL_L2;
++        /* In play = the title's look code took the mouse a moment ago. */
++        const unsigned long long took = s_mouse_direct_ms;
++        const int direct = took && pad_now_ms() - took < PAD_MOUSE_DIRECT_MS;
++        if (!kbm) {
++            if (keys[SDL_SCANCODE_ESCAPE])                            kbtns |= CELL_PAD_CTRL_CIRCLE;
++            if (keys[SDL_SCANCODE_Q] || keys[SDL_SCANCODE_1])         kbtns |= CELL_PAD_CTRL_L1;
++            if (keys[SDL_SCANCODE_E] || keys[SDL_SCANCODE_3])         kbtns |= CELL_PAD_CTRL_R1;
++            if (keys[SDL_SCANCODE_R] || keys[SDL_SCANCODE_F])         kbtns |= CELL_PAD_CTRL_SQUARE;
++            if (keys[SDL_SCANCODE_T] || keys[SDL_SCANCODE_C])         kbtns |= CELL_PAD_CTRL_TRIANGLE;
++        } else {
++            if (keys[SDL_SCANCODE_ESCAPE]) kbtns |= direct ? CELL_PAD_CTRL_START : CELL_PAD_CTRL_CIRCLE;
++            if (keys[SDL_SCANCODE_P])                                 kbtns |= CELL_PAD_CTRL_START;
++            if (keys[SDL_SCANCODE_R] || keys[SDL_SCANCODE_E] || keys[SDL_SCANCODE_F])
++                kbtns |= CELL_PAD_CTRL_SQUARE;
++            if (keys[SDL_SCANCODE_C] || keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL])
++                kbtns |= CELL_PAD_CTRL_CIRCLE;
++            if (keys[SDL_SCANCODE_Q] || keys[SDL_SCANCODE_Z])         kbtns |= CELL_PAD_CTRL_L2;
+             if (keys[SDL_SCANCODE_G])                                 kbtns |= CELL_PAD_CTRL_R2;
+             if (keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT]) kbtns |= CELL_PAD_CTRL_L3;
+             if (keys[SDL_SCANCODE_V])                                 kbtns |= CELL_PAD_CTRL_R3;
++            if (keys[SDL_SCANCODE_1] || keys[SDL_SCANCODE_2] || keys[SDL_SCANCODE_3] ||
++                keys[SDL_SCANCODE_KP_1] || keys[SDL_SCANCODE_KP_2] || keys[SDL_SCANCODE_KP_3])
++                kbtns |= CELL_PAD_CTRL_TRIANGLE;
++            /* The wheel switches weapons too: each notch the window saw
++             * (g_pad_wheel_ticks, counted by the renderer's event pump) is
++             * one Triangle press, held for a few polls so the title sees it. */
++            {   static int wheel_seen = 0, wheel_hold = 0;
++                const int w = g_pad_wheel_ticks;
++                if (w != wheel_seen && wheel_hold == 0) { wheel_seen = w; wheel_hold = 12; }
++                if (wheel_hold > 0) { if (wheel_hold > 4) kbtns |= CELL_PAD_CTRL_TRIANGLE; wheel_hold--; }
++                if (wheel_hold == 0 && w != wheel_seen) wheel_seen = w;   /* notches during a press: one switch */
++            }
+             if (keys[SDL_SCANCODE_A]) ml_x -= 128;
+             if (keys[SDL_SCANCODE_D]) ml_x += 127;
+             if (keys[SDL_SCANCODE_W]) ml_y -= 128;
+             if (keys[SDL_SCANCODE_S]) ml_y += 127;
+             /* Mouse: captured while the game window has the keyboard focus
+-             * (F1 lets it go and takes it back); motion since the last poll
+-             * deflects the right stick, PS3_PAD_MOUSE_SENS per pixel. */
+-            static int captured = 0, f1_was = 0, released = 0;
+-            static float sens = 0.0f;
+-            if (sens == 0.0f) { const char* e = getenv("PS3_PAD_MOUSE_SENS"); sens = e ? (float)atof(e) : 3.0f;
+-                                if (sens <= 0.0f) sens = 3.0f; }
++             * (F1 lets it go and takes it back). Two ways to look:
++             * - direct: the title's own look code takes the motion each frame
++             *   (cellPad_take_mouse_motion, src/kz2_mouse.cpp) and turns the
++             *   view by exactly that much -- no stick curve, dead zone or
++             *   acceleration. While it is taking motion, the mouse leaves the
++             *   right stick alone.
++             * - stick: motion since the last poll deflects the right stick,
++             *   PS3_PAD_MOUSE_SENS per pixel -- for views the direct path does
++             *   not reach (it falls back here PAD_MOUSE_DIRECT_MS after the
++             *   last take). */
++            static int f1_was = 0, released = 0;
+             SDL_Window* focus = SDL_GetKeyboardFocus();
+             if (keys[SDL_SCANCODE_F1] && !f1_was) released = !released;
+             f1_was = keys[SDL_SCANCODE_F1];
+             const int want = focus && !released;
+-            if (want != captured) { SDL_SetRelativeMouseMode(want ? SDL_TRUE : SDL_FALSE); captured = want; }
++            if (want != s_mouse_captured) { SDL_SetRelativeMouseMode(want ? SDL_TRUE : SDL_FALSE); s_mouse_captured = want; }
+             int dx = 0, dy = 0;
+-            const Uint32 mb = SDL_GetRelativeMouseState(&dx, &dy);
+-            if (captured) {
++            const Uint32 mb = direct ? SDL_GetMouseState(NULL, NULL) : SDL_GetRelativeMouseState(&dx, &dy);
++            if (s_mouse_captured) {
+                 if (mb & SDL_BUTTON(SDL_BUTTON_LEFT))   kbtns |= CELL_PAD_CTRL_R1;
+                 if (mb & SDL_BUTTON(SDL_BUTTON_RIGHT))  kbtns |= CELL_PAD_CTRL_L1;
+                 if (mb & SDL_BUTTON(SDL_BUTTON_MIDDLE)) kbtns |= CELL_PAD_CTRL_R3;
++                if (mb & SDL_BUTTON(SDL_BUTTON_X1))     kbtns |= CELL_PAD_CTRL_R3;
++                if (mb & SDL_BUTTON(SDL_BUTTON_X2))     kbtns |= CELL_PAD_CTRL_R2;
++                const float sens = pad_mouse_sens();
+                 float fx = dx * sens, fy = dy * sens;
+                 if (fx > 127.0f) fx = 127.0f;
+                 if (fx < -128.0f) fx = -128.0f;
+@@ -497,6 +567,16 @@ static void pad_shutdown_backend(void)
+ 
+ #endif /* PAD_BACKEND_SDL2 */
+ 
++#if !PAD_BACKEND_SDL2
++/* No mouse without SDL: the direct look API reports nothing. */
++volatile int g_pad_wheel_ticks = 0;
++int cellPad_take_mouse_motion(int* dx, int* dy, float* sens, int* invert)
++{
++    *dx = *dy = 0; *sens = 3.0f; *invert = 0;
++    return 0;
++}
++#endif
++
+ /* ---------------------------------------------------------------------------
+  * Poll dispatcher
+  * -----------------------------------------------------------------------*/
+diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
+index 89c58ab..0c7be7e 100644
+--- a/libs/input/cellPad.h
++++ b/libs/input/cellPad.h
+@@ -179,6 +179,12 @@ s32 cellPadEnd(void);
+ /* NID: 0x8B72CBA1 */
+ s32 cellPadGetData(u32 port_no, CellPadData* data);
+ 
++/* Direct mouse look for a title hooked to take the view delta itself (see
++ * cellPad.c): relative motion since the last call, 0 while not captured. */
++int cellPad_take_mouse_motion(int* dx, int* dy, float* sens, int* invert);
++/* Mouse wheel notches, counted by the window event pump. */
++extern volatile int g_pad_wheel_ticks;
++
+ /* NID: 0x8B8013DA */
+ s32 cellPadGetInfo2(CellPadInfo2* info);
+ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info);
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 500acc8..16be852 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -4353,6 +4353,8 @@ void rsx_vulkan_backend_shutdown(void)
+     memset(&s_vk, 0, sizeof s_vk);
+ }
+ 
++extern volatile int g_pad_wheel_ticks;   /* libs/input/cellPad.c */
++
+ int rsx_vulkan_backend_pump_messages(void)
+ {
+     if (!s_vk.windowed) return 0;
+@@ -4363,6 +4365,8 @@ int rsx_vulkan_backend_pump_messages(void)
+          * in the keyboard layout, and quitting on it ended the game whenever a
+          * player backed out of a menu. */
+         if (e.type == SDL_QUIT) quit = 1;
++        /* Wheel notches for the keyboard/mouse pad (weapon switch). */
++        if (e.type == SDL_MOUSEWHEEL && e.wheel.y != 0) g_pad_wheel_ticks++;
+     }
+     return quit ? -1 : 0;
+ }

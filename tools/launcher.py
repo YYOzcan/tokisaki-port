@@ -115,7 +115,7 @@ class Launcher(tk.Tk):
                             font=("DejaVu Sans Condensed", 10))
         self.c.create_window(x, oy + 140, window=cb, anchor="w")
 
-        self.c.create_text(28, H - 58, text="F1: fareyi bırak  ·  Esc: geri  ·  WASD + fare",
+        self.c.create_text(28, H - 58, text="Sol tık ateş · Sağ tık nişan · Shift koş · V yakın dövüş · G bomba · 1/2/3/tekerlek silah · R şarjör · C eğil · Q siper · Esc duraklat · F1 fareyi bırak",
                            anchor="w", fill=STEEL, font=("DejaVu Sans Condensed", 10))
         self.status_id = self.c.create_text(x, H - 30, text="● HAZIR", anchor="w",
                                             fill=STEEL, font=("DejaVu Sans Condensed", 11, "bold"))
