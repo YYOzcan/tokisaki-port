@@ -86,6 +86,9 @@ uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
 void cellGcm_request_tick(void);
 int  cellGcm_take_flip_pending_synced(void);
 void cellGcm_complete_flip_now(void);
+/* present only in a -fprofile-generate build (KZ2_SPU_PGO=gen) */
+extern "C" int  __llvm_profile_write_file(void) __attribute__((weak));
+extern "C" void __llvm_profile_reset_counters(void) __attribute__((weak));
 extern volatile unsigned g_spurs_pm_cur_wid, g_spurs_pm_cur_lane;   /* spurs_policy.c */
 extern volatile unsigned long long g_spurs_pm_cur_since;
 extern volatile uint32_t g_spurs_last_task_arg[4];                   /* cellSpurs.c */
@@ -286,6 +289,20 @@ static void frame_clock_loop(void)
             static const bool fps_log = getenv("KZ2_FPS") != nullptr;
             static uint64_t fps_t0 = now;
             static unsigned fps_n0 = 0;
+            /* KZ2_PGO=<start>,<end> (frames): with a -fprofile-generate build
+             * (CMake KZ2_SPU_PGO=gen), zero the profile counters at frame
+             * <start> and write the profile at <end> -- the runs are killed,
+             * so nothing is written at exit. */
+            { static int a = -1, b = -1, st = 0;
+              if (a < 0) { const char* e = getenv("KZ2_PGO"); a = 0;
+                           if (e) sscanf(e, "%d,%d", &a, &b); }
+              const unsigned nf = g_frames_presented.load();
+              if (a > 0 && st == 0 && nf >= (unsigned)a && __llvm_profile_reset_counters) {
+                  __llvm_profile_reset_counters(); st = 1;
+                  fprintf(stderr, "[pgo] counters reset at frame %u\n", nf); }
+              if (b > 0 && st == 1 && nf >= (unsigned)b && __llvm_profile_write_file) {
+                  st = 2; fprintf(stderr, "[pgo] profile written at frame %u (rc %d)\n", nf,
+                                  __llvm_profile_write_file()); } }
             if (fps_log && now - fps_t0 >= 5000) {
                 const unsigned n = g_frames_presented.load();
                 fprintf(stderr, "[fps] %.1f presented/s (%u total) | spurs pm wid %d lane %u for %llu ms\n",

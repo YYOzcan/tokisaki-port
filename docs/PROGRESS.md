@@ -1366,3 +1366,33 @@ changed.
 With these the FIFO thread's own code fell further, but gameplay stays at
 ~13.5-14 frames/s: the FIFO thread now waits for the SPU post-processing a
 third of the time (`[rsx-times] parked 31-33%`).
+
+## 59. The frame is a relay; a 15-minute session
+
+The timeline (`tools/kzprof_timeline.py`) shows the frame as a relay between
+two parties that rarely overlap: the FIFO thread draws the scene while the
+SPUs are mostly idle, then the post-processing jobs (`e569adaf4ffe`, then
+`a27e818cca34` on four SPUs) run while the FIFO thread waits for them, then
+the FIFO thread finishes the frame. Both halves are on the critical path:
+~45 ms of FIFO work and ~25 ms of SPU work per ~72 ms frame.
+
+Tried in this round:
+- **sparse vertex-span hashing** (patch 0028): spans of 16 KB or more go
+  into the vertex-cache key as 64 bytes of every 2 KB plus the last 64; their
+  full hash is checked every 8 frames, and a change the samples missed drops
+  the copy (`stale by the full check` in `RSX_VTX_CACHE_STATS`). The backend's
+  GPU copy is named by the key and the full hash together, so it cannot
+  outlive a change. `RSX_VTX_SPARSE=0` hashes everything. `vc_hash` 12 -> 10%
+  of the FIFO thread.
+- **the main thread's progress wait on the host** (`kz2_spu_progress_wait`,
+  applied to `func_003BD660` by `tools/postlift_fixups.py`): the same wait
+  with `pause` between passes. No frame-rate change; kept (it no longer runs
+  flat out on a core an SPU worker shares). `KZ2_SPIN_WAIT=0` restores it.
+- `-mtune=znver3` for the lifted SPU code: no gain (`a27e818cca34` 54 -> 57 ms).
+- the FIFO thread's remaining libc time has no single owner (eu-stack:
+  per-draw memsets and copies spread over `sink_end`, `vk_begin`, the
+  descriptor writes).
+
+**15-minute session** (`tools/longrun.sh 900`): from the title to gameplay
+and on, ~14 frames/s throughout, resident memory 862 -> 882 MB over the last
+ten minutes, no stop.

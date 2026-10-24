@@ -40,3 +40,4 @@ logs/
 build*/
 gamedata/
 run_test/
+pgo/
