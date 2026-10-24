@@ -1,0 +1,231 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index ed42653..01d3d81 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -142,6 +142,9 @@ typedef struct vk_image {
+     VkImage        img;
+     VkDeviceMemory mem;
+     VkImageView    view;
++    u64            pkey[3];   /* sampled texture: its creation parameters, for the
++                                 reuse pool (vk_tpool_*); 0 = not poolable */
++    VkDeviceSize   psize;
+ } vk_image;
+ 
+ #define VK_SAMPLER_CACHE 32
+@@ -452,6 +455,49 @@ static void vk_destroy_image(vk_image* im)
+     memset(im, 0, sizeof *im);
+ }
+ 
++/* Sampled textures are created and released by the dozen every frame
++ * (Killzone 2: ~45 per frame), and on NVIDIA each vkCreateImage +
++ * vkAllocateMemory + view costs ~0.25 ms of driver ioctls -- a fifth of the
++ * FIFO thread. A released texture's image, memory and view are kept here once
++ * the GPU is done with it, and the next texture with the same parameters
++ * takes them. PS3RECOMP_VK_TEXPOOL_MB caps the memory kept (default 256). */
++#define VK_TPOOL_MAX 1024
++static vk_image s_tpool[VK_TPOOL_MAX];
++static u32 s_tpool_n;
++static VkDeviceSize s_tpool_bytes;
++static void vk_tpool_put(vk_image* im)
++{
++    static VkDeviceSize cap = 0;
++    if (!cap) { const char* e = getenv("PS3RECOMP_VK_TEXPOOL_MB");
++                cap = (VkDeviceSize)(e ? atoi(e) : 256) << 20; if (!cap) cap = 1; }
++    if (!im->pkey[0] || cap <= 1) { vk_destroy_image(im); return; }
++    while ((s_tpool_n == VK_TPOOL_MAX || s_tpool_bytes + im->psize > cap) && s_tpool_n) {
++        s_tpool_bytes -= s_tpool[0].psize;          /* oldest out */
++        vk_destroy_image(&s_tpool[0]);
++        memmove(&s_tpool[0], &s_tpool[1], (size_t)(--s_tpool_n) * sizeof s_tpool[0]);
++    }
++    s_tpool[s_tpool_n++] = *im;
++    s_tpool_bytes += im->psize;
++    memset(im, 0, sizeof *im);
++}
++static int vk_tpool_take(const u64 key[3], vk_image* out)
++{
++    for (u32 i = s_tpool_n; i-- > 0;)
++        if (!memcmp(s_tpool[i].pkey, key, sizeof s_tpool[i].pkey)) {
++            *out = s_tpool[i];
++            s_tpool_bytes -= s_tpool[i].psize;
++            memmove(&s_tpool[i], &s_tpool[i + 1], (size_t)(s_tpool_n - i - 1) * sizeof s_tpool[0]);
++            s_tpool_n--;
++            return 1;
++        }
++    return 0;
++}
++static void vk_tpool_flush(void)
++{
++    for (u32 i = 0; i < s_tpool_n; i++) vk_destroy_image(&s_tpool[i]);
++    s_tpool_n = 0; s_tpool_bytes = 0;
++}
++
+ static int vk_create_host_buffer_ex(vk_buffer* b, VkDeviceSize size, VkBufferUsageFlags usage,
+                                     int prefer_device_local);
+ static int s_last_buffer_dl;      /* the last host buffer went to device-local memory */
+@@ -599,6 +645,20 @@ static struct {
+ 
+ static unsigned long long s_ring_bytes;    /* PS3RECOMP_VK_SUBMIT_STATS */
+ static unsigned long long s_ring_vtx, s_ring_idx, s_ring_vsc, s_ring_psc, s_ring_tex;
++/* PS3RECOMP_VK_SUBMIT_STATS: time in the driver-heavy entry points. */
++static int s_vkt_on = -1;
++static unsigned long long s_vkt[6], s_vkn[6];
++typedef struct { int k; unsigned long long t0; } vk_tscope;
++static inline unsigned long long vk_tns(void)
++{ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec; }
++static inline void vk_tscope_end(vk_tscope* t) { if (t->k >= 0) { s_vkt[t->k] += vk_tns() - t->t0; s_vkn[t->k]++; } }
++static inline vk_tscope vk_tscope_begin(int k)
++{
++    if (s_vkt_on < 0) s_vkt_on = getenv("PS3RECOMP_VK_SUBMIT_STATS") ? 1 : 0;
++    vk_tscope t = { s_vkt_on ? k : -1, s_vkt_on ? vk_tns() : 0 }; return t;
++}
++#define VK_TIMED(k) vk_tscope _vts __attribute__((cleanup(vk_tscope_end))) = vk_tscope_begin(k)
++
+ /* who waited: return addresses of vk_submit_and_wait's callers, counted */
+ static struct { void* ra; unsigned n; } s_wait_ra[16];
+ 
+@@ -628,7 +688,7 @@ static void vk_defer_image(vk_image* im)
+         if (S->gimg_n < S->gimg_cap) { S->gimg[S->gimg_n++] = *im; memset(im, 0, sizeof *im); return; }
+         pvkDeviceWaitIdle(s_vk.device);   /* out of memory: the slow, safe way */
+     }
+-    vk_destroy_image(im);
++    vk_tpool_put(im);
+ }
+ static void vk_defer_framebuffer(VkFramebuffer fb)
+ {
+@@ -670,7 +730,7 @@ static void vk_defer_module(VkShaderModule m)
+  * and reset its descriptor pool. */
+ static void vk_slot_retire(vk_slot* S)
+ {
+-    for (u32 i = 0; i < S->gimg_n; i++) vk_destroy_image(&S->gimg[i]);
++    for (u32 i = 0; i < S->gimg_n; i++) vk_tpool_put(&S->gimg[i]);   /* destroys what is not poolable */
+     for (u32 i = 0; i < S->gfb_n; i++) pvkDestroyFramebuffer(s_vk.device, S->gfb[i], NULL);
+     for (u32 i = 0; i < S->gpipe_n; i++) pvkDestroyPipeline(s_vk.device, S->gpipe[i], NULL);
+     for (u32 i = 0; i < S->gmod_n; i++) pvkDestroyShaderModule(s_vk.device, S->gmod[i], NULL);
+@@ -908,7 +968,8 @@ static int vk_submit_and_wait(void)
+     if (stats) clock_gettime(CLOCK_MONOTONIC, &t0);
+     struct timespec w0, w1;
+     clock_gettime(CLOCK_MONOTONIC, &w0);
+-    VkResult r = pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence);
++    VkResult r;
++    { VK_TIMED(0); r = pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence); }
+     if (r == VK_SUCCESS) r = vk_wait_fence(&s_vk.fence);
+     clock_gettime(CLOCK_MONOTONIC, &w1);
+     g_vk_wait_ns += (unsigned long long)((w1.tv_sec - w0.tv_sec) * 1000000000ll + (w1.tv_nsec - w0.tv_nsec));
+@@ -933,6 +994,10 @@ static int vk_submit_and_wait(void)
+             fprintf(stderr, "[vk] ring MB: vertices %.1f, indices %.1f, vs constants %.1f, ps constants %.1f, texture uploads %.1f; waits by caller:",
+                     s_ring_vtx / 1048576.0, s_ring_idx / 1048576.0, s_ring_vsc / 1048576.0, s_ring_psc / 1048576.0,
+                     s_ring_tex / 1048576.0);
++            fprintf(stderr, " | ms: submit %.1f (%llu), tex create %.1f (%llu), tex upload %.1f (%llu), descriptors %.1f (%llu), fb %.1f (%llu), draw %.1f (%llu);",
++                    s_vkt[0] / 1e6, s_vkn[0], s_vkt[1] / 1e6, s_vkn[1], s_vkt[2] / 1e6, s_vkn[2],
++                    s_vkt[3] / 1e6, s_vkn[3], s_vkt[4] / 1e6, s_vkn[4], s_vkt[5] / 1e6, s_vkn[5]);
++            memset(s_vkt, 0, sizeof s_vkt); memset(s_vkn, 0, sizeof s_vkn);
+             for (u32 i = 0; i < 16 && s_wait_ra[i].ra; i++)   /* offsets from vk_submit_and_wait, for nm */
+                 fprintf(stderr, " %+lld x%u", (long long)((const char*)s_wait_ra[i].ra - (const char*)(void*)vk_submit_and_wait),
+                         s_wait_ra[i].n);
+@@ -962,7 +1027,9 @@ static int vk_submit_async(void)
+     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
+     pvkResetFences(s_vk.device, 1, &s_vk.fence);
+-    if (pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence) != VK_SUCCESS) {
++    VkResult rs_;
++    { VK_TIMED(0); rs_ = pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence); }
++    if (rs_ != VK_SUCCESS) {
+         VK_LOG("batch submission failed\n");
+         vk_batch_retire();
+         return -1;
+@@ -2369,7 +2436,9 @@ static void vk_present_window(void)
+         .signalSemaphoreCount = 1, .pSignalSemaphores = &s_vk.sc_done[idx],
+     };
+     pvkResetFences(s_vk.device, 1, &s_vk.fence);
+-    if (pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence) != VK_SUCCESS) {
++    VkResult rs_;
++    { VK_TIMED(0); rs_ = pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence); }
++    if (rs_ != VK_SUCCESS) {
+         VK_LOG("vkQueueSubmit (window) failed\n"); vk_batch_retire(); return;
+     }
+     if (s_b.nslots > 1) {
+@@ -2865,6 +2934,7 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                  u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
+ {
++    VK_TIMED(1);
+     (void)user;
+     u32 bpp;
+     const VkFormat vf = vk_eng_format(fmt, &bpp);
+@@ -2885,18 +2955,24 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+-    VkMemoryRequirements req;
+-    u32 type;
+-    if (pvkCreateImage(s_vk.device, &ici, NULL, &o->im.img) != VK_SUCCESS) goto fail;
+-    pvkGetImageMemoryRequirements(s_vk.device, o->im.img, &req);
+-    if (vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type) &&
+-        vk_find_memory_type(req.memoryTypeBits, 0, &type)) goto fail;
+-    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+-                                 .allocationSize = req.size, .memoryTypeIndex = type };
+-    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS ||
+-        pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, 0) != VK_SUCCESS ||
+-        vk_eng_make_view(o->im.img, vf, mips, vk_remap(remap, rsx_fmt), cube, &o->im.view))
+-        goto fail;
++    const u64 pkey[3] = { ((u64)vf << 32) | ((u64)mips << 8) | (u64)cube | (1ull << 63),
++                          ((u64)w << 32) | h, ((u64)remap << 32) | rsx_fmt };
++    if (!vk_tpool_take(pkey, &o->im)) {
++        VkMemoryRequirements req;
++        u32 type;
++        if (pvkCreateImage(s_vk.device, &ici, NULL, &o->im.img) != VK_SUCCESS) goto fail;
++        pvkGetImageMemoryRequirements(s_vk.device, o->im.img, &req);
++        if (vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type) &&
++            vk_find_memory_type(req.memoryTypeBits, 0, &type)) goto fail;
++        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++                                     .allocationSize = req.size, .memoryTypeIndex = type };
++        if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS ||
++            pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, 0) != VK_SUCCESS ||
++            vk_eng_make_view(o->im.img, vf, mips, vk_remap(remap, rsx_fmt), cube, &o->im.view))
++            goto fail;
++        memcpy(o->im.pkey, pkey, sizeof pkey);
++        o->im.psize = req.size;
++    }
+     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->cube = (u8)cube;
+     o->bpp = bc ? 0 : bpp; o->block = bc ? bpp : 0;
+     /* UNDEFINED -> GENERAL for every level and face before the uploads arrive. */
+@@ -2913,6 +2989,7 @@ fail:
+ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u32 w, u32 h,
+                                   const void* src, u32 row_bytes, u32 rows)
+ {
++    VK_TIMED(2);
+     (void)user;
+     vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
+     if (!o || !src || !row_bytes || !rows || face >= (o->cube ? 6u : 1u)) return;
+@@ -3652,6 +3729,7 @@ static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; s_e2.pi
+ 
+ static void vk_eng2_shutdown(void* user)
+ {
++    vk_tpool_flush();
+     for (u32 i = 1; i <= VK_ENG_MAX_PIPE; i++) vk_eng_pipeline_release(user, i);
+     vk_eng_drop_framebuffers();
+     for (u32 f = 0; f < VK_ENG_RT_FORMATS; f++)
+@@ -3738,6 +3816,7 @@ static void vk_eng_set_depth_bounds(void* user, float min, float max)
+ static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, VkImageView dview,
+                                         u32 dkey, u32 w, u32 h)
+ {
++    VK_TIMED(4);
+     u32 key[RSX_BE_MAX_COLOR_TARGETS + 1] = { 0 };
+     for (u32 i = 0; i < n; i++) key[i] = rt[i];
+     key[RSX_BE_MAX_COLOR_TARGETS] = dkey;
+@@ -3846,6 +3925,7 @@ static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P, VkImageVie
+                                                 VkDeviceSize vs_off, u32 vsb,
+                                                 VkDeviceSize ps_off, u32 psb)
+ {
++    VK_TIMED(3);
+     const int split = P->cube_mask != 0;
+     const VkDescriptorSetLayout layout = split ? s_e2.split_layout : s_g.set_layout;
+     if (!layout || !s_b.dpool) return VK_NULL_HANDLE;
+@@ -3982,6 +4062,7 @@ static void vk_eng_draw_cached(void* user, rsx_topology topology, u64 key, const
+ static void vk_eng_draw_k(rsx_topology topology, u64 vkey, const void* vertices, u32 vertex_count,
+                           u32 stride, const u32* indices, u32 index_count)
+ {
++    VK_TIMED(5);
+     if (!s_e2.pipeline || !vertices || !vertex_count || !stride) return;
+     if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return;
+     vk_eng_pipe* P = &s_epipe[s_e2.pipeline - 1];
