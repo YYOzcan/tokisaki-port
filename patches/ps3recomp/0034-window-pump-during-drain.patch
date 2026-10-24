@@ -1,0 +1,142 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 5534e0a..95fcab2 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1562,6 +1562,9 @@ void cellGcm_ref_on_poll(void)
+         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
+ }
+ 
++/* Set by a windowed backend: pump the window's events if it is time to. */
++void (*volatile g_rsx_pump_hook)(void) = 0;
++
+ void cellGcm_rsx_process_fifo(void)
+ {
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+@@ -1686,6 +1689,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * catch up, and the reason is the whole diagnosis. */
+     const char* why = "caught-up";
+     while (s_fifo_getoff != put && budget-- > 0) {
++        /* A long drain must not starve the window (input, "not responding"):
++         * the presenting backend pumps its events when it is due. */
++        if ((budget & 1023) == 0 && g_rsx_pump_hook) g_rsx_pump_hook();
+         u32 ea = gcm_io2ea(s_fifo_getoff);
+         if (!ea) {
+             /* get is sitting on an IO offset with no mapping -- the title
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 69f0505..ed42653 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -62,6 +62,7 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <pthread.h>
+ #include <time.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -691,6 +692,18 @@ static void vk_slot_select(u32 k)
+     s_b.ring_lim = s_b.ring_base + part;
+ }
+ 
++/* Wait for a fence without starving the window: in 4 ms slices, pumping the
++ * window's events in between (a frame that keeps the GPU busy for long used to
++ * leave keys unread and the window "not responding"). */
++static void vk_pump_if_due(void);
++static VkResult vk_wait_fence(VkFence* f)
++{
++    VkResult r;
++    while ((r = pvkWaitForFences(s_vk.device, 1, f, VK_TRUE, 4000000ull)) == VK_TIMEOUT)
++        vk_pump_if_due();
++    return r;
++}
++
+ /* Wait for slot k's batch and retire it. */
+ static void vk_slot_wait(u32 k)
+ {
+@@ -698,7 +711,7 @@ static void vk_slot_wait(u32 k)
+     if (!S->busy) return;
+     struct timespec w0, w1;
+     clock_gettime(CLOCK_MONOTONIC, &w0);
+-    pvkWaitForFences(s_vk.device, 1, &S->fence, VK_TRUE, UINT64_MAX);
++    vk_wait_fence(&S->fence);
+     clock_gettime(CLOCK_MONOTONIC, &w1);
+     extern volatile unsigned long long g_vk_wait_ns;
+     g_vk_wait_ns += (unsigned long long)((w1.tv_sec - w0.tv_sec) * 1000000000ll + (w1.tv_nsec - w0.tv_nsec));
+@@ -896,7 +909,7 @@ static int vk_submit_and_wait(void)
+     struct timespec w0, w1;
+     clock_gettime(CLOCK_MONOTONIC, &w0);
+     VkResult r = pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence);
+-    if (r == VK_SUCCESS) r = pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
++    if (r == VK_SUCCESS) r = vk_wait_fence(&s_vk.fence);
+     clock_gettime(CLOCK_MONOTONIC, &w1);
+     g_vk_wait_ns += (unsigned long long)((w1.tv_sec - w0.tv_sec) * 1000000000ll + (w1.tv_nsec - w0.tv_nsec));
+     /* the queue runs in order: everything submitted before has completed too */
+@@ -2363,7 +2376,7 @@ static void vk_present_window(void)
+         s_present_slot = s_b.cur;
+         vk_batch_advance();          /* the present waits on sc_done, not on us */
+     } else {
+-        pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
++        vk_wait_fence(&s_vk.fence);
+         vk_batch_retire();
+     }
+ 
+@@ -4378,21 +4391,51 @@ void rsx_vulkan_backend_shutdown(void)
+ }
+ 
+ extern volatile int g_pad_wheel_ticks;   /* libs/input/cellPad.c */
++extern void (*volatile g_rsx_pump_hook)(void);   /* cellGcmSys.c: FIFO drain */
+ 
+-int rsx_vulkan_backend_pump_messages(void)
++/* The window's events are pumped on the thread that drives the frame (the
++ * first to call rsx_vulkan_backend_pump_messages) -- between drains, and also
++ * inside long drains and GPU waits once 4 ms have passed (vk_pump_if_due), so
++ * the keyboard state stays current and the window keeps answering the
++ * desktop's pings however slow a frame is. */
++static pthread_t s_pump_thread;
++static volatile int s_pump_thread_set, s_quit_seen;
++static unsigned long long s_last_pump_ns;
++
++static unsigned long long vk_now_ns(void)
++{
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
++}
++
++static void vk_pump_events(void)
+ {
+-    if (!s_vk.windowed) return 0;
+-    int quit = 0;
+     SDL_Event e;
+     while (SDL_PollEvent(&e)) {
+-        /* Only closing the window quits: Esc is a pad button (Circle, back)
+-         * in the keyboard layout, and quitting on it ended the game whenever a
+-         * player backed out of a menu. */
+-        if (e.type == SDL_QUIT) quit = 1;
++        /* Only closing the window quits: Esc is a pad button in the keyboard
++         * layout, and quitting on it ended the game. */
++        if (e.type == SDL_QUIT) s_quit_seen = 1;
+         /* Wheel notches for the keyboard/mouse pad (weapon switch). */
+         if (e.type == SDL_MOUSEWHEEL && e.wheel.y != 0) g_pad_wheel_ticks++;
+     }
+-    return quit ? -1 : 0;
++    s_last_pump_ns = vk_now_ns();
++}
++
++static void vk_pump_if_due(void)
++{
++    if (!s_vk.windowed || !s_pump_thread_set || !pthread_equal(pthread_self(), s_pump_thread)) return;
++    if (vk_now_ns() - s_last_pump_ns >= 4000000ull) vk_pump_events();
++}
++
++int rsx_vulkan_backend_pump_messages(void)
++{
++    if (!s_vk.windowed) return 0;
++    if (!s_pump_thread_set) {
++        s_pump_thread = pthread_self(); s_pump_thread_set = 1;
++        g_rsx_pump_hook = vk_pump_if_due;
++    }
++    vk_pump_events();
++    return s_quit_seen ? -1 : 0;
+ }
+ 
+ void rsx_vulkan_backend_present(void)
