@@ -85,6 +85,20 @@ An SDL game controller also works. On a hybrid laptop the integrated GPU is
 used by default (`KZ2_GPU=dgpu tools/play.sh` for the discrete one);
 `PS3_PAD_MOUSE_SENS` sets the look speed.
 
+**Frame rate / Kare hızı.** The level runs at ~13-14 frames/s on a Ryzen 7
+170 laptop in its *power-saver* profile; the CPU is the limit (the RSX
+emulation thread and the SPU post-processing take turns), so a balanced or
+performance power profile gives more. The game advances at most 1/15 s per
+frame: from 15 frames/s its clock runs at real time. Optional for your own
+build: profile-guided optimisation of the lifted SPU code (`cmake -B build
+-DKZ2_SPU_PGO=gen`, build, run with `KZ2_PGO=5500,7000` past those frames,
+`llvm-profdata merge -o pgo/spu.profdata build/pgo/*.profraw`, then
+`-DKZ2_SPU_PGO=use` and build again) -- ~9% off the heaviest SPU job.
+/ Bölüm, güç tasarrufu modundaki Ryzen 7 170 dizüstünde ~13-14 kare/s
+çalışıyor; sınır işlemci, dengeli/performans güç profili daha fazlasını verir.
+Oyun kare başına en fazla 1/15 s ilerler: 15 kare/s'den itibaren saati gerçek
+zamanda akar.
+
 ## Credits
 Most of what runs is other people's work: the **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** toolkit and runtime (Ned Heller / sp00nznet and contributors), and the Linux boot harness of **[Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal)**, both MIT. Bugs fixed in `patches/ps3recomp/` were first found by others; see **[CREDITS.md](CREDITS.md)** and **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**. This port is developed by YYOzcan with an AI coding agent (Claude); the reasoning behind every change is in [docs/PROGRESS.md](docs/PROGRESS.md).
 

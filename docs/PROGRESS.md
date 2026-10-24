@@ -1396,3 +1396,21 @@ Tried in this round:
 **15-minute session** (`tools/longrun.sh 900`): from the title to gameplay
 and on, ~14 frames/s throughout, resident memory 862 -> 882 MB over the last
 ten minutes, no stop.
+
+## 60. Profile-guided SPU code; making SPURS react faster is slower
+
+**PGO for the lifted SPU code** (CMake `KZ2_SPU_PGO=gen|use`, runtime
+`KZ2_PGO=<start>,<end>`): an instrumented build zeroes its counters at frame
+`<start>` and writes the profile at `<end>` (the runs are killed, so nothing
+is written at exit); `llvm-profdata merge` into `pgo/spu.profdata` (ignored
+by git: it is derived from the title's code) and `use`. `a27e818cca34` 54 ->
+49 ms, `9935c8f700db` 14 -> 12 ms of CPU per frame; the frame rate stays at
+~14 because the FIFO half of the relay is as long.
+
+**SPURS reacting faster** (patch 0029, `SPURS_LINE_WAKE=1`): an SPU commit to
+an instance's workload line (ready counts, signals) woke the kernel thread at
+once instead of at its next 1 ms pass -- 13.9 -> 12.5-13.4 frames/s, the same
+direction as the 250 us pass of section 57: more passes start more idle
+policy modules, which take SPU slots. Off by default. Per 5 s
+(`SPURS_PM_STATS=1`): jm_post (w7) 9,354 policy runs, 7.6 s busy; w0 15,896
+short runs, 0.9 s; the two idle workloads ~1,900 runs each at ~7 us.
