@@ -1,0 +1,49 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 55a77b2..e4f19c8 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -105,8 +105,10 @@ static EventFlagSync s_ef_sync[MAX_EVENT_FLAGS];
+  * on its SPU task once or twice per 5.3 ms audio block, fell behind, and
+  * GH3's songs played ~60% silence (heard as static). */
+ static volatile long s_ef_ppu_waiters;
++static void spurs_inst_line_committed(uint32_t line);
+ static void ef_line_committed(uint32_t line)
+ {
++    spurs_inst_line_committed(line);
+     if (!s_ef_ppu_waiters) return;
+     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
+         EventFlagSync* s = &s_ef_sync[i];
+@@ -455,6 +457,23 @@ static struct SpursInst {
+     u32 cursor, pass_no;
+ } s_inst[MAX_SPURS_INST];
+ static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
++
++/* SPURS_LINE_WAKE=1: an SPU committed to an instance's first line -- the
++ * workloads' ready counts and signals -- wakes its kernel thread now instead
++ * of at its next 1 ms pass. Off: in Killzone 2 the extra passes start more
++ * idle policy modules, and the level ran slower (13.9 -> 12.5-13.4 frames/s),
++ * as with a shorter pass interval. */
++static void spurs_inst_line_committed(uint32_t line)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("SPURS_LINE_WAKE"); on = e && e[0] == '1'; }
++    if (!on) return;
++    for (int i = 0; i < MAX_SPURS_INST; i++)
++        if (s_inst[i].kernel_live && (s_inst[i].ea & ~127u) == line) {
++            WakeAllConditionVariable(&s_inst[i].wake);
++            break;
++        }
++}
+ static SRWLOCK s_workload_registry_lock = SRWLOCK_INIT;
+ 
+ static s32 spurs_scheduler_start(struct SpursInst* si);
+@@ -1829,6 +1848,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+ 
+ static s32 spurs_scheduler_start(struct SpursInst* si)
+ {
++    /* commits to the instance's workload line wake the kernel thread */
++    { extern void (*g_spu_line_commit_hook)(uint32_t);
++      g_spu_line_commit_hook = ef_line_committed; }
+     si->stopping = 0; si->cursor = si->pass_no = 0;
+     memset(si->active, 0, sizeof(si->active));
+     memset(si->idle, 0, sizeof(si->idle));
