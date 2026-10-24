@@ -6,8 +6,8 @@
 
 > [!WARNING]
 > **Work in progress — playable only in a limited sense.**
-> The campaign starts, the opening cutscene on *The New Sun* plays and you can play the first level with keyboard and mouse or a controller, with sound — but at **~5-6 frames/s** (Radeon 680M; the game's own clock then runs at about a third of real time), and the level start can still stop during the load now and then (the Havok physics stall behind most of those is fixed). Details below and in docs/PROGRESS.md §40-53.
-> **Devam eden bir çalışma — ancak sınırlı anlamda oynanabilir.** Kampanya başlıyor, *The New Sun* açılış sinematiği oynuyor ve ilk bölüm klavye+fare ya da kontrolcüyle, sesli olarak oynanabiliyor; ancak **~5-6 kare/s** hızında (Radeon 680M; oyunun kendi saati gerçek zamanın yaklaşık üçte biri hızında akıyor), ve bölüm yüklenirken ara sıra hâlâ takılabiliyor (bu takılmaların çoğunun sebebi olan Havok fizik sorunu düzeltildi).
+> The campaign starts, the opening cutscene on *The New Sun* plays and you can play the first level with keyboard and mouse or a controller, with sound — at **~13-14 frames/s** (Radeon 680M, laptop in power-saver; the game advances at most 1/15 s per frame, so its clock runs at ~90% of real time and at full speed from 15 frames/s). The level start can still stop during the load now and then. Details below and in docs/PROGRESS.md §40-57.
+> **Devam eden bir çalışma — ancak sınırlı anlamda oynanabilir.** Kampanya başlıyor, *The New Sun* açılış sinematiği oynuyor ve ilk bölüm klavye+fare ya da kontrolcüyle, sesli olarak oynanabiliyor: **~13-14 kare/s** (Radeon 680M, dizüstü güç tasarrufu modunda; oyun kare başına en fazla 1/15 s ilerlediği için saati gerçek zamanın ~%90'ı hızında akıyor, 15 kare/s'den itibaren tam hızda). Bölüm yüklenirken ara sıra hâlâ takılabiliyor.
 >
 > Built on [ps3recomp](https://github.com/sp00nznet/ps3recomp); the boot harness is adapted from [Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal). Developed with an AI coding agent. See [CREDITS.md](CREDITS.md).
 
@@ -33,7 +33,7 @@ Built on **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** (v0.15.0, pinne
 | Asset streaming | **works** — FIOS reads `data_ps3.psarc`; Edge Zlib requests are inflated on the host |
 | Rendering | Vulkan, batched submissions; menus at ~250 presented frames/s; the level renders its deferred passes, shadows and post-processing (teal cast: the colour-grading LUT is still an identity fill) |
 | Front end | language select → gamma → main menu → save warning → start screen → campaign difficulty → campaign start |
-| Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); Corinth River loads in ~70 s, the opening cutscene on *The New Sun* plays and gameplay starts ("Follow Garza to the Launch Bay") at **~5-6 frames/s** on the Radeon 680M (~2.5 on the RTX 4050 Laptop, whose clocks stay low under this load) |
+| Movies / gameplay | intro movie player deadlocks (skipped via `tools/make_vfs_nointro.sh`); Corinth River loads in ~70 s, the opening cutscene on *The New Sun* plays and gameplay starts ("Follow Garza to the Launch Bay") at **~13-14 frames/s** on the Radeon 680M in power-saver (§54-57: SPU floats in MXCSR round-toward-zero mode, a vertex cache, batches in flight, Z16 targets on the GPU, jm_post on four SPUs) |
 | Audio | menus and level |
 | Input | keyboard + mouse (first-person layout) or an SDL game controller |
 | Stability | the Havok-step stall at level start is fixed (§53); an occasional stop during the level load remains |
@@ -141,7 +141,7 @@ Diagnostics: `tools/snapshot.sh` (all thread stacks under gdb), `tools/sample.sh
 | Varlık akışı | **çalışıyor** — FIOS `data_ps3.psarc` okuyor; Edge Zlib istekleri host'ta açılıyor |
 | Grafik | Vulkan, toplu gönderim; menüler ~250 kare/s; bölümde ertelenmiş aydınlatma, gölgeler ve son işlem çiziliyor (deniz mavisi ton: renk tablosu hâlâ birim dolgu) |
 | Menüler | dil seçimi → gama → ana menü → kayıt uyarısı → başlangıç ekranı → zorluk seçimi → kampanya başlangıcı |
-| Video / oynanış | giriş videosu oynatıcısı kilitleniyor (`tools/make_vfs_nointro.sh` ile atlanıyor); Corinth River ~70 s'de yükleniyor, *The New Sun* açılış sinematiği oynuyor ve oynanış başlıyor ("Follow Garza to the Launch Bay"): Radeon 680M'de **~5-6 kare/s** (RTX 4050 Laptop'ta ~2,5: saat hızı bu yükte düşük kalıyor) |
+| Video / oynanış | giriş videosu oynatıcısı kilitleniyor (`tools/make_vfs_nointro.sh` ile atlanıyor); Corinth River ~70 s'de yükleniyor, *The New Sun* açılış sinematiği oynuyor ve oynanış başlıyor ("Follow Garza to the Launch Bay"): güç tasarrufu modundaki Radeon 680M'de **~13-14 kare/s** (§54-57: MXCSR sıfıra-yuvarlama modunda SPU float'ları, köşe önbelleği, uçuştaki partiler, GPU'da Z16, dört SPU'da jm_post) |
 | Ses | menülerde ve bölümde |
 | Kontrol | klavye + fare (FPS düzeni) veya SDL kontrolcü |
 | Kararlılık | bölüm başındaki Havok fizik takılması düzeltildi (§53); yüklemede ara sıra bir durma kalıyor |
