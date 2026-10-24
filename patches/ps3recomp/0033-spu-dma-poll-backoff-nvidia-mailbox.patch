@@ -1,0 +1,114 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 16be852..69f0505 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -107,7 +107,7 @@
+  * headless run never depends on a driver that can present. */
+ #define VK_WSI_INSTANCE_FNS(X) \
+     X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR) \
+-    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR)
++    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR)
+ #define VK_WSI_DEVICE_FNS(X) \
+     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) \
+     X(vkAcquireNextImageKHR) X(vkQueuePresentKHR)
+@@ -2230,6 +2230,30 @@ static int vk_create_swapchain(void)
+     for (size_t k = 0; k < 4; k++)
+         if (caps.supportedCompositeAlpha & alphas[k]) { alpha = alphas[k]; break; }
+ 
++    /* Present mode. FIFO (vsync) is the one every driver has, and the default
++     * on most GPUs; on NVIDIA -- a hybrid laptop's GeForce presents through
++     * PRIME -- MAILBOX when it has it: the newest frame replaces a waiting one
++     * instead of queueing behind the display's refresh, a frame less of input
++     * lag at no tearing. PS3RECOMP_VK_PRESENT=fifo|mailbox|immediate picks. */
++    VkPresentModeKHR pmode = VK_PRESENT_MODE_FIFO_KHR;
++    {   VkPhysicalDeviceProperties dp; pvkGetPhysicalDeviceProperties(s_vk.phys, &dp);
++        const char* e = getenv("PS3RECOMP_VK_PRESENT");
++        VkPresentModeKHR want = VK_PRESENT_MODE_FIFO_KHR;
++        if (e && !strcmp(e, "mailbox"))        want = VK_PRESENT_MODE_MAILBOX_KHR;
++        else if (e && !strcmp(e, "immediate")) want = VK_PRESENT_MODE_IMMEDIATE_KHR;
++        else if (!e && dp.vendorID == 0x10DE)  want = VK_PRESENT_MODE_MAILBOX_KHR;
++        u32 nm = 0; VkPresentModeKHR modes[16];
++        if (want != VK_PRESENT_MODE_FIFO_KHR && pvkGetPhysicalDeviceSurfacePresentModesKHR &&
++            pvkGetPhysicalDeviceSurfacePresentModesKHR(s_vk.phys, s_vk.surface, &nm, NULL) == VK_SUCCESS) {
++            if (nm > 16) nm = 16;
++            if (pvkGetPhysicalDeviceSurfacePresentModesKHR(s_vk.phys, s_vk.surface, &nm, modes) >= 0)
++                for (u32 k = 0; k < nm; k++) if (modes[k] == want) pmode = want;
++        }
++        static int said;
++        if (!said) { said = 1; VK_LOG("present mode %s\n", pmode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" :
++                                       pmode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo"); }
++    }
++
+     VkSwapchainKHR old = s_vk.swapchain;
+     VkSwapchainCreateInfoKHR sci = {
+         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+@@ -2239,7 +2263,7 @@ static int vk_create_swapchain(void)
+         .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .preTransform = caps.currentTransform, .compositeAlpha = alpha,
+-        .presentMode = VK_PRESENT_MODE_FIFO_KHR,   /* the one mode every driver has */
++        .presentMode = pmode,
+         .clipped = VK_TRUE, .oldSwapchain = old,
+     };
+     VkSwapchainKHR sc = VK_NULL_HANDLE;
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 88441ae..66e4f19 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -21,7 +21,7 @@
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+-#include <stdio.h>
++#include <time.h>
+ #include "../platform/win32_compat.h"
+ 
+ #ifdef __cplusplus
+@@ -1230,18 +1230,22 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+         }
+     }
+ 
+-    /* A job re-issuing the SAME transfer forever is wedged, not slow: nothing
+-     * about its state can change if the DMA is all it is doing. This used to
+-     * count only REJECTED transfers, so once the EA check started committing
+-     * pages on demand the counter never advanced and a spinning job simply hung
+-     * the chain walker instead. Count repeats whether or not the transfer
+-     * succeeds, and halt at a known pc rather than hanging silently. */
+-    { static uint32_t s_last_ea, s_last_lsa, s_rep;
+-      static uint32_t s_limit = 0;
+-      if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
+-                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u; }
++    /* The same transfer over and over. It used to mean "wedged" and the SPU was
++     * halted after 256 repeats -- but it is just as often a job POLLING main
++     * memory for a flag another processor will set (a GET of the same line in
++     * a loop): Killzone 2's image 17 does exactly that around level loads
++     * (pc 0x041B0), and halting it left the frame waiting for a job that would
++     * never end -- the picture stopped at the chapter 2 weapon pick-up and on
++     * Skirmish map loads. So a repeat now backs off (a short sleep once it has
++     * gone on for a while, so the poll does not take a core from the work it
++     * waits for); halting is opt-in, SPU_DMA_REPEAT_LIMIT=<n> (the old 256). */
++    { static __thread uint32_t s_last_ea, s_last_lsa, s_rep;
++      static uint32_t s_limit = 1;   /* 1 = not read yet, 0 = never halt */
++      if (s_limit == 1) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
++                          s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 0u; if (s_limit == 1) s_limit = 2; }
+       if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
+-          if (++s_rep >= s_limit) {
++          ++s_rep;
++          if (s_limit && s_rep >= s_limit) {
+               s_rep = 0;   /* re-arm: the chain may run this job again */
+               extern void spu_halt(spu_context*);
+               fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
+@@ -1250,6 +1254,13 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+                       (uint32_t)ea);
+               fflush(stderr);
+               spu_halt(spu);
++          } else if (s_rep >= 64) {
++#ifdef _WIN32
++              Sleep(s_rep >= 4096 ? 1 : 0);
++#else
++              struct timespec ts = { 0, s_rep >= 4096 ? 200000 : 20000 };
++              nanosleep(&ts, NULL);
++#endif
+           }
+       } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
+ 

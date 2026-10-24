@@ -25,6 +25,16 @@ PALE = "#e8e2d6"
 W, H = 1120, 630
 
 
+def nvidia_gpu():
+    """The NVIDIA GPU's name (nvidia-smi), or "" when there is none."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        return out.splitlines()[0].strip() if out else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 class Launcher(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -33,9 +43,10 @@ class Launcher(tk.Tk):
         self.resizable(False, False)
         self.configure(bg=INK)
         self.proc = None
-        self.gpu = tk.StringVar(value="igpu")
+        self.nv = nvidia_gpu()
+        self.gpu = tk.StringVar(value="dgpu" if self.nv else "igpu")
         self.sens = tk.DoubleVar(value=3.0)
-        self.safe = tk.BooleanVar(value=True)
+        self.safe = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="HAZIR")
 
         icon = GAME / "ICON0.PNG"
@@ -97,7 +108,9 @@ class Launcher(tk.Tk):
         oy = y + 250
         self.c.create_text(x, oy, text="GRAFİK İŞLEMCİ", anchor="w", fill=STEEL,
                            font=("DejaVu Sans Condensed", 10, "bold"))
-        for i, (val, label) in enumerate((("igpu", "ENTEGRE (önerilen)"), ("dgpu", "HARİCİ"))):
+        dlabel = ("NVIDIA " + self.nv.replace("NVIDIA ", "").replace("GeForce ", "").replace(" Laptop GPU", "")
+                  if self.nv else "HARİCİ")
+        for i, (val, label) in enumerate((("igpu", "ENTEGRE"), ("dgpu", dlabel))):
             rb = tk.Radiobutton(self, text=label, value=val, variable=self.gpu, bg=INK, fg=PALE,
                                 selectcolor=INK, activebackground=INK, activeforeground=RED_HOT,
                                 highlightthickness=0, bd=0, font=("DejaVu Sans Condensed", 11))
@@ -165,6 +178,14 @@ class Launcher(tk.Tk):
         env["KZ2_FPS"] = "1"
         env["PS3_PAD_MOUSE_SENS"] = f"{self.sens.get():g}"
         env["PS3RECOMP_VK_PREFER"] = "integrated" if self.gpu.get() == "igpu" else "discrete"
+        if self.gpu.get() == "dgpu" and self.nv:
+            # Hybrid laptop (cardwire/PRIME): render on the GeForce, present
+            # through the integrated GPU. The Vulkan loader then lists only the
+            # NVIDIA device; the backend picks MAILBOX present on NVIDIA.
+            env["__NV_PRIME_RENDER_OFFLOAD"] = "1"
+            env["__VK_LAYER_NV_optimus"] = "NVIDIA_only"
+            env["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
+            env.setdefault("__GL_SHADER_DISK_CACHE", "1")
         if self.safe.get():
             env["SPURS_MAXCONT"] = "7:1"     # jm_post on one SPU, as the title builds it
         if campaign:
