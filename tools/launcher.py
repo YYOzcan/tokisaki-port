@@ -35,6 +35,7 @@ class Launcher(tk.Tk):
         self.proc = None
         self.gpu = tk.StringVar(value="igpu")
         self.sens = tk.DoubleVar(value=3.0)
+        self.safe = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="HAZIR")
 
         icon = GAME / "ICON0.PNG"
@@ -108,8 +109,13 @@ class Launcher(tk.Tk):
                       activebackground=RED_HOT, bd=0, sliderrelief="flat",
                       font=("DejaVu Sans Condensed", 9))
         self.c.create_window(x, oy + 94, window=sc, anchor="w")
+        cb = tk.Checkbutton(self, text="KARARLI MOD  (son işlem tek SPU'da: bölüm geçişlerinde\ndonmaya karşı; kapalıyken daha hızlı)",
+                            variable=self.safe, bg=INK, fg=PALE, selectcolor=INK, justify="left",
+                            activebackground=INK, activeforeground=RED_HOT, highlightthickness=0, bd=0,
+                            font=("DejaVu Sans Condensed", 10))
+        self.c.create_window(x, oy + 140, window=cb, anchor="w")
 
-        self.c.create_text(x, H - 58, text="F1: fareyi bırak  ·  Esc: geri  ·  WASD + fare",
+        self.c.create_text(28, H - 58, text="F1: fareyi bırak  ·  Esc: geri  ·  WASD + fare",
                            anchor="w", fill=STEEL, font=("DejaVu Sans Condensed", 10))
         self.status_id = self.c.create_text(x, H - 30, text="● HAZIR", anchor="w",
                                             fill=STEEL, font=("DejaVu Sans Condensed", 11, "bold"))
@@ -159,6 +165,8 @@ class Launcher(tk.Tk):
         env["KZ2_FPS"] = "1"
         env["PS3_PAD_MOUSE_SENS"] = f"{self.sens.get():g}"
         env["PS3RECOMP_VK_PREFER"] = "integrated" if self.gpu.get() == "igpu" else "discrete"
+        if self.safe.get():
+            env["SPURS_MAXCONT"] = "7:1"     # jm_post on one SPU, as the title builds it
         if campaign:
             env["PAD_SCRIPT"] = CAMPAIGN_SCRIPT
             env["KZ2_RUN_DIR"] = str(ROOT / "run_test")   # the saves the script was made for

@@ -1414,3 +1414,37 @@ direction as the 250 us pass of section 57: more passes start more idle
 policy modules, which take SPU slots. Off by default. Per 5 s
 (`SPURS_PM_STATS=1`): jm_post (w7) 9,354 policy runs, 7.6 s busy; w0 15,896
 short runs, 0.9 s; the two idle workloads ~1,900 runs each at ~7 us.
+
+## 61. Played by hand: input fixes, a launcher, the stop at Corinth River (open)
+
+The first sessions played by hand (2026-10-24) found what the scripted runs
+could not:
+- **Esc quit the game** (patch 0030): the Vulkan window loop took Esc for
+  "close", while the keyboard layout uses it for Circle (back) -- backing out
+  of a menu ended the game. Only closing the window quits now.
+- **stuck keys in menus** (patch 0031): without a game controller a key's
+  pressure value was set to 255 and never cleared, and Killzone 2 reads
+  pressure -- it saw the key held for good; also `SDL_PumpEvents` ran on the
+  guest thread while the renderer pumps on its own. Pressure now follows the
+  keys, and only the window's thread pumps.
+- `tools/launcher.py` (desktop entry *Killzone 2*): play, campaign quick start
+  (PAD_SCRIPT), GPU, mouse speed, and a "stable mode", on by default:
+  `SPURS_MAXCONT=7:1`, jm_post on one SPU as the title builds it.
+
+**Open: the picture stops at level transitions.** Three hand sessions, three
+stops, each where a new level loads:
+- the campaign, right after the weapon pick-up that ends the prologue: the
+  game saves the checkpoint, frames stop; the main thread waits in
+  `func_00048208` for an RSX label (`[HOTREAD] spinning on 0xE80004B0`),
+  every taskset clean;
+- a Skirmish map load from the menu: `[rsx-times]` shows the FIFO thread
+  parked 99% -- on a jump to itself, waiting for the guest to patch it;
+- continuing from that checkpoint (Corinth River): frames stop and so do the
+  FIFO thread's 5 s reports -- it does not get out of `drain()` -- while SPU
+  tasksets keep running.
+The scripted runs never crossed a transition (the player stands at the start
+of the prologue). Prime suspect: jm_post on four SPUs (`SPURS_MAXCONT=7:4`,
+the default again since section 54), which stalled the level start half the
+time in section 45 until the task-id fix of section 53. Not yet confirmed:
+reach a transition with `7:1` (the launcher's stable mode) and with
+`KZ2_RSX_TIMES=1`.
