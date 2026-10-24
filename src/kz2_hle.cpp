@@ -754,3 +754,46 @@ extern "C" void kz2_hle_register(void)
     ps3_hle_register_ctx(0x8A85674D, "_cellSpursLFQueuePushBody", kz2_lfqueue_push_body);
 }
 
+
+/* ---------------------------------------------------------------------------
+ * func_003BD660 (applied by tools/postlift_fixups.py): the main thread's wait
+ * for a job batch's progress -- until the smallest of the seven u16 counters
+ * at *(u32*)r3 + (r4 << 4) + 0x42..0x4E reaches r5. The lifted loop re-read
+ * them flat out, ~40% of the main thread in the level, on a core it shares
+ * with an SPU worker (SMT) and out of the laptop's power budget. The same
+ * wait here pauses between passes (and yields now and then); the registers it
+ * leaves are the ones the guest loop leaves (r0 the minimum, r4 the scaled
+ * index, r9 the counter block; the rest are volatile across the call).
+ * KZ2_SPIN_WAIT=0 keeps the lifted loop.
+ * -------------------------------------------------------------------------*/
+#include <sched.h>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+extern "C" int kz2_spu_progress_wait(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("KZ2_SPIN_WAIT"); on = !(e && e[0] == '0'); }
+    if (!on) return 0;
+    auto rd16 = [](uint32_t ea) -> uint32_t {
+        uint16_t v; memcpy(&v, vm_base + ea, 2); return __builtin_bswap16(v); };
+    const uint32_t r3 = (uint32_t)ctx->gpr[3];
+    const uint32_t off = ((uint32_t)ctx->gpr[4] << 4) & 0xFFFFFFF0u;     /* rlwinm r4,r4,4,0,27 */
+    const uint32_t target = (uint32_t)ctx->gpr[5];
+    ctx->gpr[4] = off;
+    for (unsigned pass = 1;; pass++) {
+        uint32_t head; memcpy(&head, vm_base + r3, 4);
+        const uint32_t base = __builtin_bswap32(head) + off + 0x40u;
+        uint32_t m = rd16(base + 2);
+        std::atomic_thread_fence(std::memory_order_acquire);           /* lwsync */
+        for (uint32_t o = 4; o <= 0xE; o += 2) { const uint32_t v = rd16(base + o); if (v < m) m = v; }
+        if (m >= target) {
+            ctx->gpr[0] = m; ctx->gpr[9] = base;
+            return 1;
+        }
+#if defined(__x86_64__)
+        _mm_pause();
+#endif
+        if ((pass & 255) == 0) sched_yield();
+    }
+}

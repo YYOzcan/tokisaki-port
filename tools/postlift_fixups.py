@@ -65,6 +65,16 @@ loc_009A2284:
         "void func_00072600(ppu_context* ctx) {\n"
         "        /* kz2 postlift: fiber wait on the host */ kz2_fiber_wait(ctx); return;\n",
     ),
+    # The main thread's wait for a job batch's progress counters: the host
+    # version pauses between passes instead of re-reading flat out on a core
+    # an SPU worker shares (src/kz2_hle.cpp, kz2_spu_progress_wait).
+    (
+        "func_003BD660",
+        "void func_003BD660(ppu_context* ctx) {\n",
+        'extern "C" int kz2_spu_progress_wait(ppu_context*);\n'
+        "void func_003BD660(ppu_context* ctx) {\n"
+        "        /* kz2 postlift: progress wait on the host */ if (kz2_spu_progress_wait(ctx)) return;\n",
+    ),
 ]
 
 

@@ -1,0 +1,156 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 8f0a363..ad85f8b 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1818,9 +1818,9 @@ static int dc_reserve_indices(u32 count)
+ #define ENG_VC_PROBE 8u
+ #define ENG_VC_AGE   120u
+ #define ENG_VC_MIN   16u           /* smaller draws: hashing costs what decoding does */
+-typedef struct { u64 key; u8* verts; u32 n, stride, last_frame, seen; } eng_vc_entry;
++typedef struct { u64 key; u8* verts; u32 n, stride, last_frame, seen; u64 full; u32 full_frame; } eng_vc_entry;
+ static eng_vc_entry s_vc[ENG_VC_SLOTS];
+-static u64 s_vc_bytes, s_vc_hits, s_vc_miss, s_vc_skip;
++static u64 s_vc_bytes, s_vc_hits, s_vc_miss, s_vc_skip, s_vc_stale;
+ static int s_vc_on = -1;
+ 
+ static u64 eng_refs_hash(const rsx_vertex_ref* refs, u32 n)
+@@ -1830,7 +1830,11 @@ static u64 eng_refs_hash(const rsx_vertex_ref* refs, u32 n)
+ 
+ /* 0: not cacheable (an attribute reads outside one contiguous span).
+  * refs_hash: eng_refs_hash(refs, n) when known, else 0. */
+-static u64 eng_vc_key(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 n, u64 refs_hash)
++#define ENG_VC_FULL_EVERY 8u
++/* full_out: also the full hash of every span (NULL: not needed now; then
++ * *sparse_used says whether any span was hashed sparsely). */
++static u64 eng_vc_key(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 n, u64 refs_hash,
++                      u64* full_out, int* sparse_used)
+ {
+     struct { u32 type, size, stride, offset, location, freq, mod; float def[4]; } d;
+     struct { const u8* lo; const u8* hi; } span[RSX_DSP_NUM_VERTEX_ATTR];
+@@ -1860,8 +1864,26 @@ static u64 eng_vc_key(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* r
+     }
+     const u64 rh = refs_hash ? refs_hash : eng_refs_hash(refs, n);
+     h = vc_hash(&rh, sizeof rh, h);
+-    for (u32 k = 0; k < nspan; k++)
+-        h = vc_hash(span[k].lo, (size_t)(span[k].hi - span[k].lo), h);
++    /* A span of 16 KB or more is hashed sparsely here, 64 bytes of every
++     * 2 KB and the last 64 (the texture cache's rule); the whole of it goes
++     * into *full_out, which a hit checks every ENG_VC_FULL_EVERY frames.
++     * RSX_VTX_SPARSE=0 hashes everything into the key. */
++    static int sparse = -1;
++    if (sparse < 0) { const char* e = getenv("RSX_VTX_SPARSE"); sparse = !(e && e[0] == '0'); }
++    u64 full = 0x9E37ull;
++    for (u32 k = 0; k < nspan; k++) {
++        const size_t len = (size_t)(span[k].hi - span[k].lo);
++        if (sparse && len >= 16384u) {
++            for (size_t o = 0; o + 64 <= len; o += 2048) h = vc_hash(span[k].lo + o, 64, h);
++            h = vc_hash(span[k].hi - 64, 64, h);
++            h = vc_hash(&len, sizeof len, h);
++            if (full_out) full = vc_hash(span[k].lo, len, full);
++            else *sparse_used = 1;
++        } else {
++            h = vc_hash(span[k].lo, len, h);
++        }
++    }
++    if (full_out) *full_out = full;
+     return h ? h : 1;
+ }
+ 
+@@ -1900,10 +1922,10 @@ static void eng_vc_age(void)
+     static u32 last_print;
+     if (stats && g.frames - last_print >= 600u) {
+         last_print = g.frames;
+-        fprintf(stderr, "[vtx-cache] hits %llu, misses %llu, uncacheable %llu, %.1f MB held\n",
++        fprintf(stderr, "[vtx-cache] hits %llu, misses %llu, uncacheable %llu, stale by the full check %llu, %.1f MB held\n",
+                 (unsigned long long)s_vc_hits, (unsigned long long)s_vc_miss,
+-                (unsigned long long)s_vc_skip, s_vc_bytes / 1048576.0);
+-        s_vc_hits = s_vc_miss = s_vc_skip = 0;
++                (unsigned long long)s_vc_skip, (unsigned long long)s_vc_stale, s_vc_bytes / 1048576.0);
++        s_vc_hits = s_vc_miss = s_vc_skip = s_vc_stale = 0;
+     }
+ }
+ 
+@@ -2136,15 +2158,31 @@ have_refs:
+     eng_vc_entry* ce = NULL;
+     if (s_vc_on && layout->stride && dc.n_refs >= ENG_VC_MIN && !dc.inl) {
+         eng_vc_age();
+-        const u64 key = eng_vc_key(&dc.fetch_plan, dc.refs, dc.n_refs, dc.refs_hash);
++        int sparse_used = 0;
++        const u64 key = eng_vc_key(&dc.fetch_plan, dc.refs, dc.n_refs, dc.refs_hash, NULL, &sparse_used);
+         if (!key) s_vc_skip++;
+         else {
+             ce = eng_vc_find(key);
+             ce->last_frame = g.frames;
++            /* sparsely keyed: the whole bytes again now and then; a change the
++             * samples missed drops the copy (a miss, decoded below) */
++            if (ce->verts && sparse_used && (u32)(g.frames - ce->full_frame) >= ENG_VC_FULL_EVERY) {
++                u64 full = 0;
++                eng_vc_key(&dc.fetch_plan, dc.refs, dc.n_refs, dc.refs_hash, &full, NULL);
++                ce->full_frame = g.frames;
++                if (full != ce->full) {
++                    s_vc_bytes -= (u64)ce->n * ce->stride;
++                    free(ce->verts); ce->verts = NULL;
++                    ce->full = full;
++                    s_vc_stale++;
++                }
++            }
+             if (ce->verts && ce->n == dc.n_refs && ce->stride == layout->stride) {
+                 s_vc_hits++;
+                 dc.vptr = ce->verts;
+-                dc.vkey = key;
++                /* the backend's copy is named by the full bytes too: a change
++                 * the sparse key missed gets a new name there */
++                dc.vkey = (key ^ (ce->full * 0x9E3779B97F4A7C15ull)) | 1u;
+                 dc.n_verts = dc.n_refs;
+                 return;
+             }
+@@ -2168,6 +2206,8 @@ have_refs:
+         const size_t bytes = (size_t)dc.n_refs * layout->stride;
+         ce->verts = (u8*)malloc(bytes);
+         if (ce->verts) {
++            eng_vc_key(&dc.fetch_plan, dc.refs, dc.n_refs, dc.refs_hash, &ce->full, NULL);
++            ce->full_frame = g.frames;
+             memcpy(ce->verts, dc.verts, bytes);
+             ce->n = dc.n_refs;
+             ce->stride = layout->stride;
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 62a4c41..f134235 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -597,7 +597,7 @@ static struct {
+ } s_b;
+ 
+ static unsigned long long s_ring_bytes;    /* PS3RECOMP_VK_SUBMIT_STATS */
+-static unsigned long long s_ring_vtx, s_ring_idx, s_ring_vsc, s_ring_psc;
++static unsigned long long s_ring_vtx, s_ring_idx, s_ring_vsc, s_ring_psc, s_ring_tex;
+ /* who waited: return addresses of vk_submit_and_wait's callers, counted */
+ static struct { void* ra; unsigned n; } s_wait_ra[16];
+ 
+@@ -917,15 +917,16 @@ static int vk_submit_and_wait(void)
+                             " %llu draws in %llu render passes, %.1f MB through the ring\n",
+                     n, nops, now - win_start, acc_ms, acc_ms / n, s_b.rp_draws, s_b.rp_passes,
+                     s_ring_bytes / 1048576.0);
+-            fprintf(stderr, "[vk] ring MB: vertices %.1f, indices %.1f, vs constants %.1f, ps constants %.1f; waits by caller:",
+-                    s_ring_vtx / 1048576.0, s_ring_idx / 1048576.0, s_ring_vsc / 1048576.0, s_ring_psc / 1048576.0);
++            fprintf(stderr, "[vk] ring MB: vertices %.1f, indices %.1f, vs constants %.1f, ps constants %.1f, texture uploads %.1f; waits by caller:",
++                    s_ring_vtx / 1048576.0, s_ring_idx / 1048576.0, s_ring_vsc / 1048576.0, s_ring_psc / 1048576.0,
++                    s_ring_tex / 1048576.0);
+             for (u32 i = 0; i < 16 && s_wait_ra[i].ra; i++)   /* offsets from vk_submit_and_wait, for nm */
+                 fprintf(stderr, " %+lld x%u", (long long)((const char*)s_wait_ra[i].ra - (const char*)(void*)vk_submit_and_wait),
+                         s_wait_ra[i].n);
+             fprintf(stderr, "\n");
+             memset(s_wait_ra, 0, sizeof s_wait_ra);
+             s_b.rp_draws = s_b.rp_passes = 0;
+-            s_ring_bytes = s_ring_vtx = s_ring_idx = s_ring_vsc = s_ring_psc = 0;
++            s_ring_bytes = s_ring_vtx = s_ring_idx = s_ring_vsc = s_ring_psc = s_ring_tex = 0;
+             n = 0; nops = 0; acc_ms = 0; win_start = now;
+         }
+     }
+@@ -2542,6 +2543,7 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
+     }
+     for (u32 y = 0; y < rows; y++)
+         memcpy(dst + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
++    s_ring_tex += bytes;
+     int rc = vk_begin();
+     if (!rc) {
+         VkBufferImageCopy region = {
