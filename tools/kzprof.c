@@ -25,16 +25,16 @@
 #define MAXT 256
 #define PAGES 64                     /* ring data pages per thread */
 
-typedef struct { uint64_t ip; uint32_t tid; } sample_t;
+typedef struct { uint64_t ip; uint64_t t; uint32_t tid; } sample_t;
 static sample_t* s_samp; static size_t s_n, s_cap;
 
 typedef struct { int fd; int tid; void* base; uint64_t busy; char name[32]; } th_t;
 static th_t s_th[MAXT]; static int s_nth;
 
-static void add(uint64_t ip, uint32_t tid)
+static void add(uint64_t ip, uint32_t tid, uint64_t t)
 {
     if (s_n == s_cap) { s_cap = s_cap ? s_cap * 2 : 1 << 16; s_samp = realloc(s_samp, s_cap * sizeof *s_samp); }
-    s_samp[s_n].ip = ip; s_samp[s_n++].tid = tid;
+    s_samp[s_n].ip = ip; s_samp[s_n].t = t; s_samp[s_n++].tid = tid;
 }
 
 static void drain(th_t* t)
@@ -49,9 +49,10 @@ static void drain(th_t* t)
         if (h.size > sizeof buf || h.size < sizeof h) break;
         for (unsigned i = 0; i < h.size; i++) buf[i] = data[(tail + i) % size];
         if (h.type == PERF_RECORD_SAMPLE) {
-            uint64_t ip; uint32_t pid, tid;
+            uint64_t ip, tm; uint32_t pid, tid;
             memcpy(&ip, buf + 8, 8); memcpy(&pid, buf + 16, 4); memcpy(&tid, buf + 20, 4);
-            add(ip, tid); t->busy++;
+            memcpy(&tm, buf + 24, 8);
+            add(ip, tid, tm); t->busy++;
         }
         tail += h.size;
     }
@@ -88,7 +89,7 @@ int main(int argc, char** argv)
         int tid = atoi(e->d_name);
         struct perf_event_attr at; memset(&at, 0, sizeof at);
         at.size = sizeof at; at.type = PERF_TYPE_SOFTWARE; at.config = PERF_COUNT_SW_TASK_CLOCK;
-        at.freq = 1; at.sample_freq = freq; at.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID;
+        at.freq = 1; at.sample_freq = freq; at.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
         at.exclude_kernel = 1; at.exclude_hv = 1; at.disabled = 1; at.wakeup_events = 64;
         int fd = (int)syscall(SYS_perf_event_open, &at, tid, -1, -1, 0);
         if (fd < 0) { perror("perf_event_open"); continue; }
@@ -129,7 +130,7 @@ int main(int argc, char** argv)
      * executable's load base) for offline analysis (tools/kzprof_ips.py) */
     { const char* rawp = getenv("KZPROF_RAW"); FILE* rf = rawp ? fopen(rawp, "w") : 0;
       if (rf) { fprintf(rf, "# exe %s\n", exe);
-                for (size_t i = 0; i < s_n; i++) fprintf(rf, "%u %lx\n", s_samp[i].tid, (unsigned long)(s_samp[i].ip - base));
+                for (size_t i = 0; i < s_n; i++) fprintf(rf, "%u %lx %lu\n", s_samp[i].tid, (unsigned long)(s_samp[i].ip - base), (unsigned long)s_samp[i].t);
                 fclose(rf); } }
     char cmd[700]; snprintf(cmd, sizeof cmd, "nm --defined-only '%s' 2>/dev/null", exe);
     FILE* p = popen(cmd, "r");

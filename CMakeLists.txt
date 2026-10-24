@@ -32,6 +32,7 @@ set(KZ2_SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu_recompiled" CACHE PATH
 # The lifted SPU jobs are the in-level bottleneck (Killzone 2's post-processing
 # runs on one SPU); -O3 lets the vector helpers vectorize and inline.
 set(KZ2_SPU_OPT "-O3" CACHE STRING "optimisation level for the lifted SPU images")
+option(KZ2_SPU_LS_DIAG "LS probes and watches (SPU_LS_WATCH, ...) in the lifted SPU code" OFF)
 set(KZ2_RECOMP_COMPILE_OPTIONS "-O1" CACHE STRING
     "extra compile options for the lifted PPU chunks")
 
@@ -148,7 +149,9 @@ endif()
 if(KZ2_SPU_SOURCES)
     set_source_files_properties(${KZ2_SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
-        COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT
+        # SPU_LS_DIAG=0: no LS probes/watches in the lifted code's local-store
+        # accesses (the runtime keeps them); KZ2_SPU_LS_DIAG=ON to debug.
+        COMPILE_DEFINITIONS "SPU_USE_DISPATCH_MT;SPU_LS_DIAG=$<IF:$<BOOL:${KZ2_SPU_LS_DIAG}>,1,0>"
         COMPILE_OPTIONS "-w;${KZ2_SPU_OPT}")
 endif()
 

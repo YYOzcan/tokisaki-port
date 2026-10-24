@@ -1,0 +1,379 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index b4b25e0..55a77b2 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -19,6 +19,7 @@
+ #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
+ #include <string.h>
+ #include <stdint.h>
++#include <time.h>     /* nanosleep: SPURS_KERNEL_POLL_US */
+ 
+ /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
+  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
+@@ -1744,9 +1745,24 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+ {
+     struct SpursInst* si = (struct SpursInst*)p;
+     int disabled = getenv("PS3_NO_SPURS_PM") != NULL;
++    /* SPURS_KERNEL_POLL_US: how often the workloads are looked at when
++     * nothing wakes this thread (default 1000). A real SPU kernel polls them
++     * all the time; below a millisecond the wait is a plain sleep, and a
++     * worker's wake-up then waits for it. SPURS_IDLE_BACKOFF=0: a workload
++     * that found nothing last time is still looked at every pass (else every
++     * 2nd..16th). */
++    static long poll_us = -1; static int backoff = -1;
++    if (poll_us < 0) { const char* e = getenv("SPURS_KERNEL_POLL_US"); poll_us = e ? strtol(e, 0, 0) : 1000; }
++    if (backoff < 0) { const char* e = getenv("SPURS_IDLE_BACKOFF"); backoff = !(e && e[0] == '0'); }
+     AcquireSRWLockExclusive(&si->lock);
+     while (!si->stopping) {
+-        SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
++        if (poll_us >= 1000) SleepConditionVariableSRW(&si->wake, &si->lock, (DWORD)(poll_us / 1000), 0);
++        else {
++            ReleaseSRWLockExclusive(&si->lock);
++            struct timespec ts = { 0, poll_us * 1000L };
++            nanosleep(&ts, NULL);
++            AcquireSRWLockExclusive(&si->lock);
++        }
+         if (si->stopping) break;
+         if (disabled) continue;
+         u32 ea = si->ea;
+@@ -1782,7 +1798,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                 u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+                 int kicked = ready || (signal & (0x8000u >> wid));
+                 if (kicked) si->idle[wid] = 0;
+-                if (!kicked && (si->pass_no & ((1u << si->idle[wid]) - 1)))
++                if (!kicked && backoff && (si->pass_no & ((1u << si->idle[wid]) - 1)))
+                     continue;
+                 spu_lockline_lock();
+                 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index b66ae7d..62a4c41 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -582,6 +582,7 @@ static struct {
+     u32          dsets;
+     u32          async_ops;       /* PS3RECOMP_VK_ASYNC_OPS */
+     u32          cur;             /* current slot */
++    u32          cmd_serial;      /* bumped when a command buffer begins */
+     u32          nslots;          /* 1 when the extra slots could not be made */
+     vk_slot      sl[VK_SLOTS];
+     vk_buffer    rb;              /* cached readback staging, reused */
+@@ -841,6 +842,7 @@ static int vk_begin(void)
+ {
+     vk_rp_close();
+     if (!s_b.open) {
++        s_b.cmd_serial++;          /* bound state (vk_eng_draw_k) starts over */
+         VK_CHECK(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer");
+         VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+@@ -2377,7 +2379,8 @@ static void vk_cb_present(void* ud, u32 buffer_id)
+      * GPU wait on every present for nothing. */
+     static int rb = -1;   /* PS3RECOMP_VK_PRESENT_READBACK: 1 headless, 0 in a window */
+     if (rb < 0) { const char* e = getenv("PS3RECOMP_VK_PRESENT_READBACK"); rb = e ? (e[0] == '1') : !s_vk.windowed; }
+-    if (!rb && !s_vk.dump_path) {
++    const int dump_now = s_vk.dump_path && ((s_vk.presented + 1u) % s_vk.dump_every) == 0;
++    if (!rb && !dump_now) {
+         s_vk.presented++;
+         s_g.last_draws = s_g.draws;
+         s_g.draws = 0;
+@@ -4036,7 +4039,18 @@ static void vk_eng_draw_k(rsx_topology topology, u64 vkey, const void* vertices,
+         s_b.ops++;
+     }
+     s_b.rp_draws++;
+-    pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
++    /* What this command buffer has bound: set only what changed (the driver
++     * calls were ~14% of the FIFO thread with everything set per draw). */
++    static struct {
++        u32 serial; VkPipeline pipe; VkViewport vp; VkRect2D sc; u32 sref; float db[2];
++        VkDescriptorSet set; VkPipelineLayout layout; VkBuffer vb; VkDeviceSize voff; int ib;
++    } bs;
++    if (bs.serial != s_b.cmd_serial) {        /* nothing bound yet: all-ones differs from any state (NaN bounds too) */
++        memset(&bs, 0xFF, sizeof bs);
++        bs.serial = s_b.cmd_serial; bs.pipe = VK_NULL_HANDLE; bs.set = VK_NULL_HANDLE;
++        bs.layout = VK_NULL_HANDLE; bs.vb = VK_NULL_HANDLE; bs.ib = 0;
++    }
++    if (bs.pipe != pipe) { pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); bs.pipe = pipe; }
+     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
+         vp.x = s_e2.vp[0]; vp.y = s_e2.vp[1]; vp.width = s_e2.vp[2]; vp.height = s_e2.vp[3];
+@@ -4050,18 +4064,27 @@ static void vk_eng_draw_k(rsx_topology topology, u64 vkey, const void* vertices,
+         sc.offset.x = (int32_t)x0; sc.offset.y = (int32_t)y0;
+         sc.extent.width = x1 > x0 ? x1 - x0 : 0; sc.extent.height = y1 > y0 ? y1 - y0 : 0;
+     }
+-    pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
+-    pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
+-    pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
+-    if (s_vk.depth_bounds_ok)
++    if (memcmp(&bs.vp, &vp, sizeof vp)) { pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp); bs.vp = vp; }
++    if (memcmp(&bs.sc, &sc, sizeof sc)) { pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc); bs.sc = sc; }
++    if (bs.sref != (s_e2.stencil_ref & 0xFFu)) {
++        pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
++        bs.sref = s_e2.stencil_ref & 0xFFu;
++    }
++    if (s_vk.depth_bounds_ok && (bs.db[0] != s_e2.depth_bounds[0] || bs.db[1] != s_e2.depth_bounds[1])) {
+         pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
+-    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+-                             P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout,
+-                             0, 1, &set, 0, NULL);
+-    pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, in_vc ? &s_vc.buf.buf : &s_b.ring.buf, &voff);
++        bs.db[0] = s_e2.depth_bounds[0]; bs.db[1] = s_e2.depth_bounds[1];
++    }
++    const VkPipelineLayout lay = P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout;
++    if (bs.set != set || bs.layout != lay) {
++        pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, 1, &set, 0, NULL);
++        bs.set = set; bs.layout = lay;
++    }
++    const VkBuffer vb = in_vc ? s_vc.buf.buf : s_b.ring.buf;
++    if (bs.vb != vb || bs.voff != voff) { pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vb, &voff); bs.vb = vb; bs.voff = voff; }
+     if (ibytes) {
+-        pvkCmdBindIndexBuffer(s_vk.cmd, s_b.ring.buf, ioff, VK_INDEX_TYPE_UINT32);
+-        pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
++        /* the ring is bound once, at 0; each draw starts at its own indices */
++        if (!bs.ib) { pvkCmdBindIndexBuffer(s_vk.cmd, s_b.ring.buf, 0, VK_INDEX_TYPE_UINT32); bs.ib = 1; }
++        pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, (u32)(ioff / 4u), 0, 0);
+     } else {
+         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
+     }
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 27659d1..8864858 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -536,18 +536,28 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
+     }
+ }
+ 
++/* SPU_LS_DIAG=0 (a build option for lifted code): no LS probes or watches
++ * on its local-store accesses -- two loads and branches each, ~10% of a
++ * gather loop's instructions. The runtime keeps them. */
++#ifndef SPU_LS_DIAG
++#define SPU_LS_DIAG 1
++#endif
+ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+ {
+     u128 v;
++#if SPU_LS_DIAG
+     /* One load and a branch: the probes (SPU_LS_LOWREAD, and the WWS
+      * policy-module logging that used to run on every image-2 read) are
+      * opt-in, and this is the hottest primitive of lifted code. */
+     if (__builtin_expect(g_spu_ls_probe != 0, 0))
+         spu_ls_read_probe(ctx, lsa);
++#endif
+     lsa &= SPU_LS_MASK & ~0xFu;
+     const uint8_t* p = &ctx->ls[lsa];
++#if SPU_LS_DIAG
+     spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
++#endif
+ #if SPU_LS_FAST
+     uint32_t w0, w1, w2, w3;
+     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
+@@ -628,8 +638,10 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+      * why it resolves to an empty buffer: the resolved address, the whole
+      * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
+      * command (commandNum==5) names the code buffer set. */
++#if SPU_LS_DIAG
+     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
+         spu_ls_write_probe_pre(ctx, lsa, val);
++#endif
+ #if SPU_LS_FAST
+     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
+     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
+@@ -644,10 +656,12 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+         p[i*4 + 3] = (uint8_t)w;
+     }
+ #endif
++#if SPU_LS_DIAG
+     spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+     if (__builtin_expect(g_spu_smc_watch != 0, 0))
+         spu_ls_write_probe_smc(ctx, lsa, p);
++#endif
+ }
+ 
+ /* ---------------------------------------------------------------------------
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 6b4004b..730afc6 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -935,7 +935,10 @@ static __attribute__((noinline, cold, unused)) void spu__xv_why(int op, uint32_t
+         fprintf(stderr, "\n");
+     }
+ }
+-static inline __attribute__((noinline, cold)) u128 spu__xv_fix2(__m128i r, __m128i ok, u128 a, u128 b,
++/* The out-of-line paths return __m128i, not u128: a u128 comes back in a
++ * general-register pair, and merging that with the inline result moved every
++ * fast-path result through rax:rdx (vmovq/vpextrq, two stores) too. */
++static inline __attribute__((noinline, cold)) __m128i spu__xv_fix2(__m128i r, __m128i ok, u128 a, u128 b,
+                                                                  uint32_t negb, int mul) {
+     u128 out = spu__xv_st(r), m = spu__xv_st(ok);
+     for (int i = 0; i < 4; i++)
+@@ -944,9 +947,9 @@ static inline __attribute__((noinline, cold)) u128 spu__xv_fix2(__m128i r, __m12
+                               : spu__fa_any(a._u32[i], b._u32[i] ^ negb);
+             spu__xv_why(mul ? 1 : 0, a._u32[i], b._u32[i] ^ negb, 0, out._u32[i]);
+         }
+-    return out;
++    return spu__xv_ld(out);
+ }
+-static inline __attribute__((noinline, cold)) u128 spu__xv_fix3(__m128i r, __m128i ok, u128 a, u128 b, u128 c,
++static inline __attribute__((noinline, cold)) __m128i spu__xv_fix3(__m128i r, __m128i ok, u128 a, u128 b, u128 c,
+                                                                  uint32_t negp, uint32_t negc) {
+     u128 out = spu__xv_st(r), m = spu__xv_st(ok);
+     for (int i = 0; i < 4; i++)
+@@ -954,7 +957,7 @@ static inline __attribute__((noinline, cold)) u128 spu__xv_fix3(__m128i r, __m12
+             out._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], negp, negc);
+             spu__xv_why(2, a._u32[i], b._u32[i], c._u32[i], out._u32[i]);
+         }
+-    return out;
++    return spu__xv_ld(out);
+ }
+ /* SPU singles on the way in: a denormal operand is a (signed) zero, and
+  * biased exponent 255 is an ordinary, larger number (no Inf/NaN) -- both
+@@ -975,7 +978,7 @@ SPU__XV_INLINE __m256d spu__xv_wide(__m128i x) {          /* x flushed */
+                                         _mm256_slli_epi64(_mm256_and_si256(v, _mm256_set1_epi64x(0x7FFFFF)), 29));
+     return _mm256_castsi256_pd(_mm256_or_si256(sign, _mm256_and_si256(nz, mag)));
+ }
+-static inline __attribute__((noinline)) u128 spu__xv_fa_w(u128 a, u128 b, uint32_t negb) {
++static inline __attribute__((noinline)) __m128i spu__xv_fa_w(u128 a, u128 b, uint32_t negb) {
+     const __m128i x = spu__xv_flush(spu__xv_ld(a));
+     const __m128i y = spu__xv_flush(_mm_xor_si128(spu__xv_ld(b), _mm_set1_epi32((int)negb)));
+     const __m128i gap = _mm_abs_epi32(_mm_sub_epi32(spu__xv_bexp(x), spu__xv_bexp(y)));
+@@ -986,18 +989,18 @@ static inline __attribute__((noinline)) u128 spu__xv_fa_w(u128 a, u128 b, uint32
+     __m128i ok;
+     const __m128i r = spu__xv_trunc(d, &ok, NULL);
+     ok = _mm_and_si128(ok, pre);
+-    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return spu__xv_st(r);
++    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return r;
+     return spu__xv_fix2(r, ok, a, b, negb, 0);
+ }
+-static inline __attribute__((noinline)) u128 spu__xv_fm_w(u128 a, u128 b) {
++static inline __attribute__((noinline)) __m128i spu__xv_fm_w(u128 a, u128 b) {
+     const __m128i x = spu__xv_flush(spu__xv_ld(a)), y = spu__xv_flush(spu__xv_ld(b));
+     const __m256d d = _mm256_mul_pd(spu__xv_wide(x), spu__xv_wide(y));     /* exact */
+     __m128i ok;
+     const __m128i r = spu__xv_trunc(d, &ok, NULL);
+-    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return spu__xv_st(r);
++    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return r;
+     return spu__xv_fix2(r, ok, a, b, 0, 1);
+ }
+-static inline __attribute__((noinline)) u128 spu__xv_fma_w(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
++static inline __attribute__((noinline)) __m128i spu__xv_fma_w(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+     const __m128i x = spu__xv_flush(_mm_xor_si128(spu__xv_ld(a), _mm_set1_epi32((int)negp)));
+     const __m128i y = spu__xv_flush(spu__xv_ld(b));
+     const __m128i z = spu__xv_flush(_mm_xor_si128(spu__xv_ld(c), _mm_set1_epi32((int)negc)));
+@@ -1008,7 +1011,7 @@ static inline __attribute__((noinline)) u128 spu__xv_fma_w(u128 a, u128 b, u128
+     const __m256d err = _mm256_add_pd(_mm256_sub_pd(p, _mm256_sub_pd(d, bb)), _mm256_sub_pd(zz, bb));
+     __m128i ok;
+     const __m128i r = spu__xv_trunc(d, &ok, &err);
+-    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return spu__xv_st(r);
++    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return r;
+     return spu__xv_fix3(r, ok, a, b, c, negp, negc);
+ }
+ /* MXCSR mode for lifted SPU code. While a thread runs it (spu_run_with_halt,
+@@ -1073,55 +1076,59 @@ SPU__XV_INLINE int spu__xv_onbnd(__m256d d, __m256d err) {
+     return _mm256_movemask_pd(_mm256_and_pd(_mm256_castsi256_pd(bnd), _mm256_cmp_pd(err, _mm256_setzero_pd(), _CMP_NEQ_UQ)));
+ }
+ SPU__XV_INLINE u128 spu__xv_fa(u128 a, u128 b, uint32_t negb) {
++    __m128i res;
+     if (__builtin_expect(g_spu_fp_rz, 1)) {
+         const __m128i A = spu__xv_ld(a), B = _mm_xor_si128(spu__xv_ld(b), _mm_set1_epi32((int)negb));
+         const __m128i r = _mm_castps_si128(_mm_add_ps(_mm_castsi128_ps(A), _mm_castsi128_ps(B)));
+         const __m128i bad = spu__rz_bad(A, B, r);
+-        if (__builtin_expect(_mm_testz_si128(bad, bad), 1)) return spu__xv_st(spu__rz_pos0(r));
+-        return spu__xv_fa_w(a, b, negb);
++        res = __builtin_expect(_mm_testz_si128(bad, bad), 1) ? spu__rz_pos0(r) : spu__xv_fa_w(a, b, negb);
++    } else {
++        const __m256d x = spu__xv_cvt(spu__xv_flush0(spu__xv_ld(a)));
++        const __m256d y = spu__xv_cvt(spu__xv_flush0(_mm_xor_si128(spu__xv_ld(b), _mm_set1_epi32((int)negb))));
++        const __m256d d = _mm256_add_pd(x, y), bb = _mm256_sub_pd(d, x);
++        const __m256d err = _mm256_add_pd(_mm256_sub_pd(x, _mm256_sub_pd(d, bb)), _mm256_sub_pd(y, bb));
++        __m128i redo;
++        const __m128i r = spu__xv_trunc1(d, &redo);
++        res = __builtin_expect(_mm_testz_si128(redo, redo) && !spu__xv_onbnd(d, err), 1) ? r : spu__xv_fa_w(a, b, negb);
+     }
+-    const __m256d x = spu__xv_cvt(spu__xv_flush0(spu__xv_ld(a)));
+-    const __m256d y = spu__xv_cvt(spu__xv_flush0(_mm_xor_si128(spu__xv_ld(b), _mm_set1_epi32((int)negb))));
+-    const __m256d d = _mm256_add_pd(x, y), bb = _mm256_sub_pd(d, x);
+-    const __m256d err = _mm256_add_pd(_mm256_sub_pd(x, _mm256_sub_pd(d, bb)), _mm256_sub_pd(y, bb));
+-    __m128i redo;
+-    const __m128i r = spu__xv_trunc1(d, &redo);
+-    if (__builtin_expect(_mm_testz_si128(redo, redo) && !spu__xv_onbnd(d, err), 1)) return spu__xv_st(r);
+-    return spu__xv_fa_w(a, b, negb);
++    return spu__xv_st(res);
+ }
+ SPU__XV_INLINE u128 spu__xv_fm(u128 a, u128 b) {
++    __m128i res;
+     if (__builtin_expect(g_spu_fp_rz, 1)) {
+         const __m128i A = spu__xv_ld(a), B = spu__xv_ld(b);
+         const __m128i r = _mm_castps_si128(_mm_mul_ps(_mm_castsi128_ps(A), _mm_castsi128_ps(B)));
+         const __m128i bad = spu__rz_bad(A, B, r);
+-        if (__builtin_expect(_mm_testz_si128(bad, bad), 1)) return spu__xv_st(spu__rz_pos0(r));
+-        return spu__xv_fm_w(a, b);
++        res = __builtin_expect(_mm_testz_si128(bad, bad), 1) ? spu__rz_pos0(r) : spu__xv_fm_w(a, b);
++    } else {
++        const __m256d d = _mm256_mul_pd(spu__xv_cvt(spu__xv_flush0(spu__xv_ld(a))),
++                                        spu__xv_cvt(spu__xv_flush0(spu__xv_ld(b))));      /* exact */
++        __m128i redo;
++        const __m128i r = spu__xv_trunc1(d, &redo);
++        res = __builtin_expect(_mm_testz_si128(redo, redo), 1) ? r : spu__xv_fm_w(a, b);
+     }
+-    const __m256d d = _mm256_mul_pd(spu__xv_cvt(spu__xv_flush0(spu__xv_ld(a))),
+-                                    spu__xv_cvt(spu__xv_flush0(spu__xv_ld(b))));      /* exact */
+-    __m128i redo;
+-    const __m128i r = spu__xv_trunc1(d, &redo);
+-    if (__builtin_expect(_mm_testz_si128(redo, redo), 1)) return spu__xv_st(r);
+-    return spu__xv_fm_w(a, b);
++    return spu__xv_st(res);
+ }
+ SPU__XV_INLINE u128 spu__xv_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
++    __m128i res;
+     if (__builtin_expect(g_spu_fp_rz, 1)) {
+         const __m128i A = _mm_xor_si128(spu__xv_ld(a), _mm_set1_epi32((int)negp)), B = spu__xv_ld(b);
+         const __m128i C = _mm_xor_si128(spu__xv_ld(c), _mm_set1_epi32((int)negc));
+         const __m128i r = _mm_castps_si128(_mm_fmadd_ps(_mm_castsi128_ps(A), _mm_castsi128_ps(B), _mm_castsi128_ps(C)));
+         const __m128i bad = _mm_or_si128(spu__rz_bad(A, B, r), spu__rz_bad(C, C, C));
+-        if (__builtin_expect(_mm_testz_si128(bad, bad), 1)) return spu__xv_st(spu__rz_pos0(r));
+-        return spu__xv_fma_w(a, b, c, negp, negc);
++        res = __builtin_expect(_mm_testz_si128(bad, bad), 1) ? spu__rz_pos0(r) : spu__xv_fma_w(a, b, c, negp, negc);
++    } else {
++        const __m256d p = _mm256_mul_pd(spu__xv_cvt(spu__xv_flush0(_mm_xor_si128(spu__xv_ld(a), _mm_set1_epi32((int)negp)))),
++                                        spu__xv_cvt(spu__xv_flush0(spu__xv_ld(b))));      /* exact */
++        const __m256d zz = spu__xv_cvt(spu__xv_flush0(_mm_xor_si128(spu__xv_ld(c), _mm_set1_epi32((int)negc))));
++        const __m256d d = _mm256_add_pd(p, zz), bb = _mm256_sub_pd(d, p);
++        const __m256d err = _mm256_add_pd(_mm256_sub_pd(p, _mm256_sub_pd(d, bb)), _mm256_sub_pd(zz, bb));
++        __m128i redo;
++        const __m128i r = spu__xv_trunc1(d, &redo);
++        res = __builtin_expect(_mm_testz_si128(redo, redo) && !spu__xv_onbnd(d, err), 1) ? r
++            : spu__xv_fma_w(a, b, c, negp, negc);
+     }
+-    const __m256d p = _mm256_mul_pd(spu__xv_cvt(spu__xv_flush0(_mm_xor_si128(spu__xv_ld(a), _mm_set1_epi32((int)negp)))),
+-                                    spu__xv_cvt(spu__xv_flush0(spu__xv_ld(b))));      /* exact */
+-    const __m256d zz = spu__xv_cvt(spu__xv_flush0(_mm_xor_si128(spu__xv_ld(c), _mm_set1_epi32((int)negc))));
+-    const __m256d d = _mm256_add_pd(p, zz), bb = _mm256_sub_pd(d, p);
+-    const __m256d err = _mm256_add_pd(_mm256_sub_pd(p, _mm256_sub_pd(d, bb)), _mm256_sub_pd(zz, bb));
+-    __m128i redo;
+-    const __m128i r = spu__xv_trunc1(d, &redo);
+-    if (__builtin_expect(_mm_testz_si128(redo, redo) && !spu__xv_onbnd(d, err), 1)) return spu__xv_st(r);
+-    return spu__xv_fma_w(a, b, c, negp, negc);
++    return spu__xv_st(res);
+ }
+ SPU__XV_INLINE u128 spu_fa(u128 a, u128 b) { return spu__xv_fa(a, b, 0); }
+ SPU__XV_INLINE u128 spu_fs(u128 a, u128 b) { return spu__xv_fa(a, b, 0x80000000u); }
+@@ -1217,13 +1224,17 @@ static inline u128 spu_cfltu(u128 a, int i8) {
+  * scale; clearing the 29 low bits truncates, and the narrowing is exact for a
+  * normal single. Results that land outside the normal range (exponent 255,
+  * or exactly 2^-126 after narrowing) take the per-lane path. */
++static inline __attribute__((noinline, cold)) __m128i spu__cxflt_ref_v(u128 a, int i8, int is_unsigned) {
++    const u128 r = is_unsigned ? spu_cuflt_ref(a, i8) : spu_csflt_ref(a, i8);
++    __m128i v; memcpy(&v, &r, 16); return v;
++}
+ static inline __attribute__((always_inline)) u128 spu__cxflt_v(__m256d d, u128 a, int i8, int is_unsigned) {
+     uint64_t sb = (uint64_t)(1023 + (i8 & 0xFF) - 155) << 52; double sc; memcpy(&sc, &sb, 8);
+     d = _mm256_mul_pd(d, _mm256_set1_pd(sc));
+     __m128i redo;
+     const __m128i r = spu__xv_trunc1(d, &redo);
+-    if (__builtin_expect(_mm_testz_si128(redo, redo), 1)) { u128 o; memcpy(&o, &r, 16); return o; }
+-    return is_unsigned ? spu_cuflt_ref(a, i8) : spu_csflt_ref(a, i8);
++    const __m128i res = __builtin_expect(_mm_testz_si128(redo, redo), 1) ? r : spu__cxflt_ref_v(a, i8, is_unsigned);
++    u128 o; memcpy(&o, &res, 16); return o;
+ }
+ static inline u128 spu_csflt(u128 a, int i8) {
+     __m128i x; memcpy(&x, &a, 16);

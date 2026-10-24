@@ -1305,3 +1305,36 @@ Patch 0025:
 
 Gameplay: 10.8 -> ~12.3 frames/s; FIFO thread drain 70% (GPU wait 6%), parked
 30% -- waiting for the SPU post-processing again.
+
+## 57. Lifted SPU code: results stay in vector registers, no LS diagnostics
+
+A per-thread timeline from timestamped samples (`tools/kzprof_timeline.py
+logs/NAME [start_ms] [span_ms] [bucket_ms]`: one character per bucket per
+thread, the job module or runtime area it ran most) showed the frame plainly:
+the FIFO thread stops ~30 ms a frame while the post-processing filter
+`a27e818cca34` runs on four SPUs at once, ~20 ms per burst.
+
+Its loop (`0x5908`, gather and sum) compiled to ~27 x86 instructions per SPU
+instruction. Two things in it, patch 0026:
+- **results through rax:rdx**: the float helpers' slow paths were
+  out-of-line functions returning `u128`, which the SysV ABI returns in a
+  general-register pair; merging that with the inline result made every
+  fast-path result go `vmovq`/`vpextrq` and two 64-bit stores too. The slow
+  paths now return `__m128i` and the helpers return once.
+- **`SPU_LS_DIAG=0`** for the lifted SPU sources (CMake option
+  `KZ2_SPU_LS_DIAG`, off): every local-store access checked two diagnostic
+  gates (`SPU_LS_LOWREAD` probe, `SPU_LS_WATCH`); the runtime keeps them.
+  With the cold calls gone the compiler also keeps more in registers.
+  `a27e818cca34` 67 -> 53 ms of CPU per frame; gameplay 12.7 -> ~14 frames/s.
+
+Also in 0026: the Vulkan draw sets only the state that changed since the
+last draw in the same command buffer (pipeline, viewport, scissor, stencil
+reference, depth bounds, descriptor set, vertex buffer; the ring is bound
+once as index buffer and draws start at `firstIndex`) -- no measurable change;
+a frame dump reads back only the frames it writes; the SPURS kernel's
+workload pass interval and idle backoff are tunable
+(`SPURS_KERNEL_POLL_US`, default 1000; `SPURS_IDLE_BACKOFF=0`).
+
+Measured and not kept: jm_post on six SPUs (12.3 vs 12.4); FIFO drain every
+250 us (12.4, same); SPURS pass every 250 us (11.6) or without the idle
+backoff (9.7 -- idle workloads' policy modules then take SPU slots).
