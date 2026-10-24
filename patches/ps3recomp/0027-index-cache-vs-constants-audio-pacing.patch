@@ -1,0 +1,320 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index b51fb7c..c8cef73 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -609,16 +609,28 @@ static void* audio_mix_thread_func(void* arg)
+     printf("[cellAudio] Mixing thread started\n");
+ 
+     while (s_mix_thread_running) {
++        /* Mix only when the device has room for a block. SDL's queue has no
++         * bound, and mixing on a fixed sleep ran ~4% ahead of the device
++         * clock: the queue -- the sound's delay behind the picture -- grew
++         * by ~2.5 s a minute for as long as the game ran (Killzone 2: 11 s
++         * after four minutes). Without a device, mix in real time. */
++        const int room = audio_backend_room();
++        if (room == 0) { usleep(1000); continue; }
+         audio_mix_one_block();
+         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+         audio_notify_event_queues();
++        if (room < 0) { usleep(1000000u * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE); continue; }
+ 
+         u32 queued = audio_backend_queued_samples();
+-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
+-            usleep(5000);
+-        } else {
+-            usleep(2000);
+-        }
++        /* AUDIO_RATE=1: every 5 s, blocks mixed per second (real time 187.5)
++         * and how much the device queue holds. */
++        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
++          if (on) { static struct timespec t0; static unsigned n; struct timespec t;
++              clock_gettime(CLOCK_MONOTONIC, &t); if (!t0.tv_sec) t0 = t; n++;
++              const double dt = (t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) * 1e-9;
++              if (dt >= 5.0) { fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), device queue %u samples\n",
++                                       n / dt, queued); n = 0; t0 = t; } } }
++        (void)queued;
+     }
+ 
+     printf("[cellAudio] Mixing thread stopped\n");
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+index 62e9052..3050520 100644
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -250,6 +250,7 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words,
+     if (count > max_words)
+         count = max_words;
+     memcpy(rsx->constants, words, count * sizeof(u32));
++    rsx->const_gen++;
+ }
+ 
+ /* Every NV4097_SET_VERTEX_DATA* variant writes the same constant ("current")
+@@ -353,8 +354,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
+     if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
+         const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
+         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
+-        if (slot < RSX_DSP_NUM_CONSTANTS)
++        if (slot < RSX_DSP_NUM_CONSTANTS) {
+             rsx->constants[slot][word & 3] = arg;
++            rsx->const_gen++;
++        }
+         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
+          * slot range (first 400) -- what a shader's constants really were. */
+         { static int lo = -2, hi = 0, n = 0;
+diff --git a/libs/video/rsx_dispatch.h b/libs/video/rsx_dispatch.h
+index b58a830..060e03a 100644
+--- a/libs/video/rsx_dispatch.h
++++ b/libs/video/rsx_dispatch.h
+@@ -117,6 +117,7 @@ struct rsx_dispatch {
+     u32 regs[RSX_DSP_NUM_REGS];       /* register file: regs[method >> 2]   */
+     u32 vp[RSX_DSP_VP_WORDS];         /* transform (vertex) program words   */
+     u32 constants[RSX_DSP_NUM_CONSTANTS][4]; /* vec4 f32 bit patterns       */
++    u32 const_gen;                    /* bumped by every constants[] write  */
+ 
+     rsx_dispatch_sink sink;
+ 
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 2b4aa90..8f0a363 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -205,6 +205,8 @@ static struct {
+     u64 verts_cap;
+     u32 n_verts;
+     const u8* vptr;     /* the vertices the draw uploads: verts, or a cached copy */
++    const u32* occ;     /* the occurrence map: ref_remap's, or an index-cache entry's */
++    u64 refs_hash;      /* vc_hash of refs[0..n_refs) when an index-cache entry knows it, else 0 */
+     u64 vkey;           /* their vertex-cache key when they are a cached copy, else 0 */
+ 
+     /* Canonical ATTR0..15 float4 snapshots for register-based vertices.
+@@ -1721,6 +1723,8 @@ static void dc_reset(void)
+     dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_cuts = 0;
+     dc.vptr = NULL;
+     dc.vkey = 0;
++    dc.occ = NULL;
++    dc.refs_hash = 0;
+     dc.refs_remapped = 0;
+     dc.fetch_ok = 1;
+     dc.inl = NULL;
+@@ -1819,8 +1823,14 @@ static eng_vc_entry s_vc[ENG_VC_SLOTS];
+ static u64 s_vc_bytes, s_vc_hits, s_vc_miss, s_vc_skip;
+ static int s_vc_on = -1;
+ 
+-/* 0: not cacheable (an attribute reads outside one contiguous span). */
+-static u64 eng_vc_key(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 n)
++static u64 eng_refs_hash(const rsx_vertex_ref* refs, u32 n)
++{
++    return vc_hash(refs, (size_t)n * sizeof *refs, 0x5EEDull);
++}
++
++/* 0: not cacheable (an attribute reads outside one contiguous span).
++ * refs_hash: eng_refs_hash(refs, n) when known, else 0. */
++static u64 eng_vc_key(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 n, u64 refs_hash)
+ {
+     struct { u32 type, size, stride, offset, location, freq, mod; float def[4]; } d;
+     struct { const u8* lo; const u8* hi; } span[RSX_DSP_NUM_VERTEX_ATTR];
+@@ -1848,7 +1858,8 @@ static u64 eng_vc_key(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* r
+             }
+         if (k == nspan) { span[nspan].lo = lo; span[nspan].hi = hi; nspan++; }
+     }
+-    h = vc_hash(refs, (size_t)n * sizeof *refs, h);
++    const u64 rh = refs_hash ? refs_hash : eng_refs_hash(refs, n);
++    h = vc_hash(&rh, sizeof rh, h);
+     for (u32 k = 0; k < nspan; k++)
+         h = vc_hash(span[k].lo, (size_t)(span[k].hi - span[k].lo), h);
+     return h ? h : 1;
+@@ -1896,6 +1907,55 @@ static void eng_vc_age(void)
+     }
+ }
+ 
++/* ---- index cache -----------------------------------------------------------
++ * The references a draw's index batches turn into -- the unique list, the
++ * restart cuts and the occurrence map the topology is rebuilt from -- keyed by
++ * the index bytes and everything else that shapes them. A key seen twice keeps
++ * them; a hit skips decoding and de-duplicating the indices (~15% of the FIFO
++ * thread). RSX_IDX_CACHE=0 turns it off. */
++#define ENG_IC_SLOTS 8192u
++typedef struct {
++    u64 key; u32 last_frame, seen;
++    rsx_vertex_ref* refs; u32 n_refs, n_source_refs; int remapped;
++    u64 refs_hash;
++    u32* cuts; u32 n_cuts;
++    u32* occ;
++} eng_ic_entry;
++static eng_ic_entry s_ic[ENG_IC_SLOTS];
++static int s_ic_on = -1;
++
++static void eng_ic_free(eng_ic_entry* e)
++{
++    free(e->refs); free(e->cuts); free(e->occ);
++    memset(e, 0, sizeof *e);
++}
++
++static eng_ic_entry* eng_ic_find(u64 key)
++{
++    eng_ic_entry* victim = NULL;
++    for (u32 i = 0; i < ENG_VC_PROBE; i++) {
++        eng_ic_entry* e = &s_ic[(key + i) & (ENG_IC_SLOTS - 1u)];
++        if (e->key == key) return e;
++        if (!e->key) { if (!victim || victim->key) victim = e; continue; }
++        if (!victim || (victim->key && (u32)(g.frames - e->last_frame) >
++                                       (u32)(g.frames - victim->last_frame)))
++            victim = e;
++    }
++    eng_ic_free(victim);
++    victim->key = key;
++    victim->last_frame = g.frames;
++    return victim;
++}
++
++static void eng_ic_age(void)
++{
++    static u32 last;
++    if (g.frames - last < 32u) return;
++    last = g.frames;
++    for (u32 i = 0; i < ENG_IC_SLOTS; i++)
++        if (s_ic[i].key && (u32)(g.frames - s_ic[i].last_frame) > ENG_VC_AGE) eng_ic_free(&s_ic[i]);
++}
++
+ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+ {
+     if (dc.n_immediate) {
+@@ -1912,6 +1972,52 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+         dc.vptr = dc.verts;
+         return;
+     }
++    eng_ic_entry* ie = NULL;
++    if (s_ic_on < 0) { const char* e = getenv("RSX_IDX_CACHE"); s_ic_on = !(e && e[0] == '0'); }
++    if (s_ic_on && dc.n_idx && !dc.n_arr && !dc.n_refs && !dc.n_cuts) {
++        rsx_dsp_index_array ia;
++        rsx_dsp_get_index_array(&g.rsx, &ia);
++        struct { u32 off, loc, is32, base, ren, rval, remap, n; } k = {
++            ia.offset, ia.location, ia.is_u32, rsx_dsp_vertex_data_base_index(&g.rsx),
++            (u32)rsx_dsp_restart_index_enabled(&g.rsx, ia.is_u32), rsx_dsp_restart_index(&g.rsx),
++            (u32)allow_remap, dc.n_idx };
++        u64 h = vc_hash(&k, sizeof k, 0x1D3Cull);
++        h = vc_hash(dc.idx, (size_t)dc.n_idx * sizeof dc.idx[0], h);
++        const u32 esz = ia.is_u32 ? 4u : 2u;
++        const u32 ia_loc = ia.location ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
++        for (u32 b = 0; b < dc.n_idx && h; b++) {
++            const u64 start = (u64)ia.offset + (u64)dc.idx[b].first * esz;
++            const u64 bytes = (u64)dc.idx[b].count * esz;
++            const u8* run = (dc.idx[b].count && start + bytes <= 0x100000000ull)
++                ? eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes) : NULL;
++            h = run ? vc_hash(run, (size_t)bytes, h) : 0;
++        }
++        if (h) {
++            eng_ic_age();
++            ie = eng_ic_find(h);
++            ie->last_frame = g.frames;
++            static int verify = -1;
++            if (verify < 0) verify = getenv("RSX_IDX_CACHE_VERIFY") ? 1 : 0;
++            if (ie->refs && !verify) {
++                int ok = dc_reserve_refs(ie->n_refs);
++                if (ok && ie->n_cuts > dc.cap_cuts) {
++                    u32* c = (u32*)realloc(dc.cuts, (size_t)ie->n_cuts * 4u);
++                    if (c) { dc.cuts = c; dc.cap_cuts = ie->n_cuts; } else ok = 0;
++                }
++                if (ok) {
++                    memcpy(dc.refs, ie->refs, (size_t)ie->n_refs * sizeof *dc.refs);
++                    if (ie->n_cuts) memcpy(dc.cuts, ie->cuts, (size_t)ie->n_cuts * 4u);
++                    dc.occ = ie->remapped ? ie->occ : NULL;   /* read in place: no entry is dropped before this draw ends */
++                    dc.n_refs = ie->n_refs; dc.n_source_refs = ie->n_source_refs;
++                    dc.refs_remapped = ie->remapped; dc.n_cuts = ie->n_cuts;
++                    dc.refs_hash = ie->refs_hash;
++                    goto have_refs;
++                }
++            }
++            if (!ie->seen++) ie = NULL;          /* first sighting: the key only */
++        }
++    }
++
+     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
+         for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
+             if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
+@@ -1991,7 +2097,36 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+             dc.n_refs = unique;
+         }
+     }
++    if (ie && ie->refs) {           /* RSX_IDX_CACHE_VERIFY=1: an entry against a fresh decode */
++        static unsigned checked, bad;
++        const int same = ie->n_refs == dc.n_refs && ie->n_source_refs == dc.n_source_refs &&
++                         ie->remapped == dc.refs_remapped && ie->n_cuts == dc.n_cuts &&
++                         !memcmp(ie->refs, dc.refs, (size_t)dc.n_refs * sizeof *dc.refs) &&
++                         (!dc.n_cuts || !memcmp(ie->cuts, dc.cuts, (size_t)dc.n_cuts * 4u)) &&
++                         (!dc.refs_remapped || !memcmp(ie->occ, dc.ref_remap.occurrence_to_unique,
++                                                       (size_t)dc.n_source_refs * 4u));
++        checked++; if (!same) bad++;
++        if ((checked & 0xFFFF) == 0 || (!same && bad <= 4))
++            fprintf(stderr, "[idx-cache] verify: %u checked, %u differ\n", checked, bad);
++    }
++    if (ie && !ie->refs) {
++        ie->refs = (rsx_vertex_ref*)malloc((size_t)dc.n_refs * sizeof *dc.refs + 1);
++        ie->cuts = dc.n_cuts ? (u32*)malloc((size_t)dc.n_cuts * 4u) : NULL;
++        ie->occ = dc.refs_remapped ? (u32*)malloc((size_t)dc.n_source_refs * 4u) : NULL;
++        if (!ie->refs || (dc.n_cuts && !ie->cuts) || (dc.refs_remapped && !ie->occ)) {
++            const u64 key = ie->key; const u32 lf = ie->last_frame, seen = ie->seen;
++            eng_ic_free(ie); ie->key = key; ie->last_frame = lf; ie->seen = seen;
++        } else {
++            memcpy(ie->refs, dc.refs, (size_t)dc.n_refs * sizeof *dc.refs);
++            if (dc.n_cuts) memcpy(ie->cuts, dc.cuts, (size_t)dc.n_cuts * 4u);
++            if (dc.refs_remapped) memcpy(ie->occ, dc.ref_remap.occurrence_to_unique, (size_t)dc.n_source_refs * 4u);
++            ie->n_refs = dc.n_refs; ie->n_source_refs = dc.n_source_refs;
++            ie->remapped = dc.refs_remapped; ie->n_cuts = dc.n_cuts;
++            ie->refs_hash = dc.refs_hash = eng_refs_hash(dc.refs, dc.n_refs);
++        }
++    }
+ 
++have_refs:
+     dc.layout = *layout;
+     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
+@@ -2001,7 +2136,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+     eng_vc_entry* ce = NULL;
+     if (s_vc_on && layout->stride && dc.n_refs >= ENG_VC_MIN && !dc.inl) {
+         eng_vc_age();
+-        const u64 key = eng_vc_key(&dc.fetch_plan, dc.refs, dc.n_refs);
++        const u64 key = eng_vc_key(&dc.fetch_plan, dc.refs, dc.n_refs, dc.refs_hash);
+         if (!key) s_vc_skip++;
+         else {
+             ce = eng_vc_find(key);
+@@ -2908,7 +3043,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+         if (!dc_reserve_indices(n_draw)) return;
+         rsx_draw_engine_write_topology_indices(
+             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
+-            dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
++            dc.refs_remapped ? (dc.occ ? dc.occ : dc.ref_remap.occurrence_to_unique) : NULL,
+             g.indices);
+     }
+ 
+@@ -2930,8 +3065,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
+         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
+         xf[6] = vp.translate[2];
+     }
+-    memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
+-    memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
++    /* The 7.5 KB constant block only when a constant or the viewport
++     * transform changed since the last draw (const_gen); the backend keeps
++     * what it was given last. It was copied and compared per draw. */
++    static u32 s_vp_gen = ~0u;
++    static float s_vp_xf[8];
++    const int vp_same = s_vp_gen == g.rsx.const_gen && !memcmp(s_vp_xf, xf, sizeof xf) &&
++                        s_vp_gen != ~0u;
++    if (!vp_same) {
++        memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
++        memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
++    }
+ 
+     /* The buffered fragment constants, then fp_alpha: the layout
+      * rsx_fp_decompile_buffered_ex compiled the shader against. */
+@@ -2984,7 +3128,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
+     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
+     g.be->bind_pipeline(g.be->user, pipeline);
+-    g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
++    if (!vp_same) {                 /* recorded only once the backend has them */
++        g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
++        s_vp_gen = g.rsx.const_gen;
++        memcpy(s_vp_xf, xf, sizeof xf);
++    }
+     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
+     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
+     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);

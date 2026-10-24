@@ -1338,3 +1338,31 @@ workload pass interval and idle backoff are tunable
 Measured and not kept: jm_post on six SPUs (12.3 vs 12.4); FIFO drain every
 250 us (12.4, same); SPURS pass every 250 us (11.6) or without the idle
 backoff (9.7 -- idle workloads' policy modules then take SPU slots).
+
+## 58. Sound no longer drifts behind the picture; an index cache
+
+**Audio drift (fixed).** The Linux cellAudio mixer mixed a 5.3 ms block,
+then slept 5 ms (2 ms with less than four blocks queued) -- ~196 blocks a
+second against the device's 187.5. SDL's queue has no bound, so the delay of
+the sound behind the picture grew by ~2.5 s a minute: `AUDIO_RATE=1` (now on
+Linux too) showed 538,112 samples queued -- 11 s -- four minutes into the
+level. The loop now mixes only when the device has room for a block
+(`audio_backend_room`, four blocks ahead) and paces on the clock without a
+device: 187.5 blocks/s, the queue steady at 1024 samples (21 ms).
+
+**Index cache** (draw engine): the references a draw's index batches turn
+into -- the unique list, restart cuts and the occurrence map the topology is
+rebuilt from -- keyed by the index bytes and everything else that shapes
+them, kept on a key's second sighting (`RSX_IDX_CACHE=0` off;
+`RSX_IDX_CACHE_VERIFY=1` decodes anyway and compares: 3 million draws, 0
+differences). A hit reads the occurrence map in place and hands the vertex
+cache the references' hash it already knows.
+
+**VS constants**: the 7.5 KB block was copied by the engine and compared by
+the backend on every draw; `rsx_dispatch.const_gen` counts constant writes
+and the block is copied and bound only when it or the viewport transform
+changed.
+
+With these the FIFO thread's own code fell further, but gameplay stays at
+~13.5-14 frames/s: the FIFO thread now waits for the SPU post-processing a
+third of the time (`[rsx-times] parked 31-33%`).
