@@ -1,0 +1,49 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index c944519..b54836a 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -358,8 +358,10 @@ static void pad_poll_sdl2(void)
+         s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+     }
+ 
+-    /* Keyboard fallback / overlay for port 0 */
+-    SDL_PumpEvents();
++    /* Keyboard fallback / overlay for port 0. No SDL_PumpEvents here: this
++     * runs on a guest thread, and SDL's events belong to the thread that made
++     * the window -- the renderer pumps them about every millisecond. Pumping
++     * from two threads lost key releases (keys "stuck" in the menus). */
+     const Uint8* keys = SDL_GetKeyboardState(NULL);
+     if (keys) {
+         u16 kbtns = 0;
+@@ -446,16 +448,21 @@ static void pad_poll_sdl2(void)
+         if (kbtns & CELL_PAD_CTRL_L2) s_host_state[0].trigger_l2 = 255;
+         if (kbtns & CELL_PAD_CTRL_R2) s_host_state[0].trigger_r2 = 255;
+ 
+-        if (kbtns & CELL_PAD_CTRL_UP)       s_host_state[0].press_up = 255;
+-        if (kbtns & CELL_PAD_CTRL_DOWN)     s_host_state[0].press_down = 255;
+-        if (kbtns & CELL_PAD_CTRL_LEFT)     s_host_state[0].press_left = 255;
+-        if (kbtns & CELL_PAD_CTRL_RIGHT)    s_host_state[0].press_right = 255;
+-        if (kbtns & CELL_PAD_CTRL_CROSS)    s_host_state[0].press_cross = 255;
+-        if (kbtns & CELL_PAD_CTRL_CIRCLE)   s_host_state[0].press_circle = 255;
+-        if (kbtns & CELL_PAD_CTRL_SQUARE)   s_host_state[0].press_square = 255;
+-        if (kbtns & CELL_PAD_CTRL_TRIANGLE) s_host_state[0].press_triangle = 255;
+-        if (kbtns & CELL_PAD_CTRL_L1)       s_host_state[0].press_l1 = 255;
+-        if (kbtns & CELL_PAD_CTRL_R1)       s_host_state[0].press_r1 = 255;
++        /* Pressure follows the keys both ways. Only ever set, a key's
++         * pressure stayed at 255 after it was released whenever no game
++         * controller rewrote it -- a title reading pressure (Killzone 2's
++         * menus) saw the d-pad and buttons held for good. A controller on
++         * port 0 keeps its own values for keys that are up. */
++        {   const int pad0 = s_sdl_controllers[0] != NULL;
++#define KBP(bit, field) do { if (kbtns & (bit)) s_host_state[0].field = 255; \
++                             else if (!pad0) s_host_state[0].field = 0; } while (0)
++            KBP(CELL_PAD_CTRL_UP, press_up);       KBP(CELL_PAD_CTRL_DOWN, press_down);
++            KBP(CELL_PAD_CTRL_LEFT, press_left);   KBP(CELL_PAD_CTRL_RIGHT, press_right);
++            KBP(CELL_PAD_CTRL_CROSS, press_cross); KBP(CELL_PAD_CTRL_CIRCLE, press_circle);
++            KBP(CELL_PAD_CTRL_SQUARE, press_square); KBP(CELL_PAD_CTRL_TRIANGLE, press_triangle);
++            KBP(CELL_PAD_CTRL_L1, press_l1);       KBP(CELL_PAD_CTRL_R1, press_r1);
++#undef KBP
++        }
+     }
+ }
+ 
