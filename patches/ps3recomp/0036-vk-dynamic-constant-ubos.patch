@@ -1,0 +1,144 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 01d3d81..a0af18e 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -841,14 +841,15 @@ static void vk_batch_init(void)
+         s_b.sl[0].fence = s_vk.fence;
+         return;
+     }
+-    VkDescriptorPoolSize ps[4] = {
++    VkDescriptorPoolSize ps[5] = {
++        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2u * VK_BATCH_SETS },   /* constants: offsets at bind */
+         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2u * VK_BATCH_SETS },
+         { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES * VK_BATCH_SETS },
+         { VK_DESCRIPTOR_TYPE_SAMPLER, RSX_MAX_TEXTURES * VK_BATCH_SETS },
+         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2u * VK_BATCH_SETS },   /* vk_eng_reinterpret */
+     };
+     VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+-                                       .maxSets = VK_BATCH_SETS, .poolSizeCount = 4, .pPoolSizes = ps };
++                                       .maxSets = VK_BATCH_SETS, .poolSizeCount = 5, .pPoolSizes = ps };
+     { const char* e = getenv("PS3RECOMP_VK_ASYNC_OPS"); s_b.async_ops = e ? (u32)strtoul(e, 0, 0) : 192u; }
+     s_b.nslots = 1;
+     s_b.sl[0].cmd = s_vk.cmd;
+@@ -1897,8 +1898,8 @@ static int vk_guest_init(void)
+ 
+     const VkShaderStageFlags both = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+     VkDescriptorSetLayoutBinding b[4] = {
+-        { RSX_SPIRV_VPCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL },
+-        { RSX_SPIRV_PSCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL },
++        { RSX_SPIRV_VPCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, both, NULL },
++        { RSX_SPIRV_PSCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, both, NULL },
+         { RSX_SPIRV_TEXTURE_BINDING, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES,
+           VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+         { RSX_SPIRV_SAMPLER_BINDING, VK_DESCRIPTOR_TYPE_SAMPLER, RSX_MAX_TEXTURES,
+@@ -1910,7 +1911,7 @@ static int vk_guest_init(void)
+     VK_CHECK(pvkCreateDescriptorSetLayout(s_vk.device, &lci, NULL, &s_g.set_layout),
+              "vkCreateDescriptorSetLayout(guest)");
+     VkDescriptorPoolSize ps[3] = {
+-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 },
++        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 },
+         { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES },
+         { VK_DESCRIPTOR_TYPE_SAMPLER, RSX_MAX_TEXTURES },
+     };
+@@ -2043,10 +2044,10 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
+     VkWriteDescriptorSet w[4] = {
+         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
+           .dstBinding = RSX_SPIRV_VPCONST_BINDING, .descriptorCount = 1,
+-          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[0] },
++          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .pBufferInfo = &bi[0] },
+         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
+           .dstBinding = RSX_SPIRV_PSCONST_BINDING, .descriptorCount = 1,
+-          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[1] },
++          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .pBufferInfo = &bi[1] },
+         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
+           .dstBinding = RSX_SPIRV_TEXTURE_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+           .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = ii },
+@@ -2068,8 +2069,9 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
+     VkRect2D sc = { { 0, 0 }, { s_vk.width, s_vk.height } };
+     pvkCmdSetViewport(s_vk.cmd, 0, 1, &vpt);
+     pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
+-    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_g.pipe_layout,
+-                             0, 1, &s_g.set, 0, NULL);
++    { static const u32 zero_off[2] = { 0, 0 };
++      pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_g.pipe_layout,
++                               0, 1, &s_g.set, 2, zero_off); }
+     VkDeviceSize off = 0;
+     pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &s_g.vertices.buf, &off);
+     pvkCmdDraw(s_vk.cmd, (u32)s_g.cpu_count, 1, 0, 0);
+@@ -3525,8 +3527,8 @@ static VkPipelineLayout vk_eng_split_layout(void)
+     if (s_e2.split_pipe_layout) return s_e2.split_pipe_layout;
+     const VkShaderStageFlags both = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+     VkDescriptorSetLayoutBinding b[3 + RSX_MAX_TEXTURES];
+-    b[0] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_VPCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL };
+-    b[1] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_PSCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL };
++    b[0] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_VPCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, both, NULL };
++    b[1] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_PSCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, both, NULL };
+     b[2] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_SAMPLER_BINDING, VK_DESCRIPTOR_TYPE_SAMPLER,
+                                            RSX_MAX_TEXTURES, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++)
+@@ -3536,7 +3538,7 @@ static VkPipelineLayout vk_eng_split_layout(void)
+     VkDescriptorSetLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                             .bindingCount = 3 + RSX_MAX_TEXTURES, .pBindings = b };
+     VkDescriptorPoolSize ps[3] = {
+-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 },
++        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 },
+         { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES },
+         { VK_DESCRIPTOR_TYPE_SAMPLER, RSX_MAX_TEXTURES },
+     };
+@@ -3944,7 +3946,11 @@ static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P, VkImageVie
+         key.v[u] = ii[u].imageView;
+         key.s[u] = smp;
+     }
+-    key.vs_off = vs_off; key.ps_off = ps_off; key.vsb = vsb; key.psb = psb; key.split = (u32)split;
++    /* The constants are dynamic uniform buffers: their ring offsets are given
++     * when the set is bound, so one set serves every draw with these textures
++     * (it was allocated and written per draw -- the constants move each draw). */
++    (void)vs_off; (void)ps_off;
++    key.vs_off = 0; key.ps_off = 0; key.vsb = vsb; key.psb = psb; key.split = (u32)split;
+     if (s_e2.dset && s_e2.dset_gen == s_b.gen + 1u && !memcmp(&key, &s_e2.dkey, sizeof key))
+         return s_e2.dset;
+ 
+@@ -3955,17 +3961,17 @@ static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P, VkImageVie
+     if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
+     s_b.dsets++;
+     VkDescriptorBufferInfo bi[2] = {
+-        { s_b.ring.buf, vs_off, vsb },
+-        { s_b.ring.buf, ps_off, psb },
++        { s_b.ring.buf, 0, vsb },
++        { s_b.ring.buf, 0, psb },
+     };
+     VkWriteDescriptorSet w[3 + RSX_MAX_TEXTURES];
+     u32 n = 0;
+     w[n++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+           .dstBinding = RSX_SPIRV_VPCONST_BINDING, .descriptorCount = 1,
+-          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[0] };
++          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .pBufferInfo = &bi[0] };
+     w[n++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+           .dstBinding = RSX_SPIRV_PSCONST_BINDING, .descriptorCount = 1,
+-          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[1] };
++          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .pBufferInfo = &bi[1] };
+     w[n++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+           .dstBinding = RSX_SPIRV_SAMPLER_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+           .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = si };
+@@ -4164,6 +4170,7 @@ static void vk_eng_draw_k(rsx_topology topology, u64 vkey, const void* vertices,
+     static struct {
+         u32 serial; VkPipeline pipe; VkViewport vp; VkRect2D sc; u32 sref; float db[2];
+         VkDescriptorSet set; VkPipelineLayout layout; VkBuffer vb; VkDeviceSize voff; int ib;
++        u32 doff[2];
+     } bs;
+     if (bs.serial != s_b.cmd_serial) {        /* nothing bound yet: all-ones differs from any state (NaN bounds too) */
+         memset(&bs, 0xFF, sizeof bs);
+@@ -4195,9 +4202,10 @@ static void vk_eng_draw_k(rsx_topology topology, u64 vkey, const void* vertices,
+         bs.db[0] = s_e2.depth_bounds[0]; bs.db[1] = s_e2.depth_bounds[1];
+     }
+     const VkPipelineLayout lay = P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout;
+-    if (bs.set != set || bs.layout != lay) {
+-        pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, 1, &set, 0, NULL);
+-        bs.set = set; bs.layout = lay;
++    const u32 doff[2] = { (u32)s_e2.vs_off, (u32)s_e2.ps_off };
++    if (bs.set != set || bs.layout != lay || bs.doff[0] != doff[0] || bs.doff[1] != doff[1]) {
++        pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, 1, &set, 2, doff);
++        bs.set = set; bs.layout = lay; bs.doff[0] = doff[0]; bs.doff[1] = doff[1];
+     }
+     const VkBuffer vb = in_vc ? s_vc.buf.buf : s_b.ring.buf;
+     if (bs.vb != vb || bs.voff != voff) { pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vb, &voff); bs.vb = vb; bs.voff = voff; }
