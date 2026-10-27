@@ -64,6 +64,18 @@ in the preferred doubleword, word 0 = high half) is the same fix as
 preferred doubleword"), re-applied here by hand because of the pinned
 submodule. It is what lets Killzone 2's WWS job lists complete.
 
+## SPU register caching — inFAMOUS PC port
+
+`tools/spu_regcache.py` is taken from **[whompay/inFAMOUSreborn](https://github.com/whompay/inFAMOUSreborn)**
+(the inFAMOUS PC port by **whompay**), `ps3recomp/tools/spu_regcache.py`, which
+ships in that repository's copy of ps3recomp under ps3recomp's MIT license.
+It rewrites the lifted SPU code so each function keeps the SPU registers in
+locals instead of the context in memory. Our changes are marked `kz2:` in the
+file: the output replaces `spu_recomp.c` under the same names (CMake
+`KZ2_SPU_REGCACHE`), without their run-time twin selection and their
+`spu_helpers_vec.h`. Nothing else from that repository is used; its
+title-specific code carries no license and is not copied.
+
 ## Other software
 
 - **zlib** — host-side inflate for Edge Zlib requests.

@@ -1,0 +1,351 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index e893d5d..041d846 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -13,6 +13,7 @@
+  * Context-aware HLE: guest pointers (path, buffers, out params) are read/written
+  * through vm_base in big-endian.
+  */
++#define PPU_NO_INLINE_STORES  /* declares the out-of-line vm_write* below */
+ #include "ppu_recomp.h"      /* ppu_context */
+ #include "../../libs/filesystem/edat.h"
+ #include "ps3emu/nid.h"      /* ps3_compute_nid */
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index d9ce0c3..52362ff 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -16,6 +16,7 @@
+  *
+  * Compiled as C++ (matches the lifted output). Game-agnostic.
+  */
++#define PPU_NO_INLINE_STORES  /* (and stores) */
+ #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
+ #include "ppu_recomp.h"   /* ppu_context */
+ #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 55e7525..c03063c 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -32,6 +32,7 @@
+ #endif
+ 
+ #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
++#define PPU_NO_INLINE_STORES  /* (and stores) */
+ #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
+ #include "ppu_recomp.h"
+ #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
+@@ -1577,6 +1578,9 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
+ /* ppu_recomp.h's inline loads (vm_read*_inl) skip the out-of-line accessors'
+  * probes, so they run only while no read diagnostic is armed. */
+ extern "C" int vm_inline_ok = 0;
++/* ppu_recomp.h's inline stores take the out-of-line path while a store watch
++ * is armed (barrier_watch_hit reads these). */
++extern "C" int g_vm_store_slow = (getenv("PPU_WVAL") || getenv("PPU_WWATCH")) ? 1 : 0;
+ static struct VmInlineInit {
+     VmInlineInit() {
+         static const char* const vars[] = {
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index f502d5f..cfeeedb 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -10,6 +10,7 @@
+  * NIDs are computed from the names (ps3_compute_nid), so this stays correct
+  * without hand-written NID literals.
+  */
++#define PPU_NO_INLINE_STORES  /* (and stores) */
+ #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
+ #include "ppu_recomp.h"     /* ppu_context */
+ #include "ps3emu/nid.h"     /* ps3_compute_nid */
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 925a7e3..9fa2725 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -529,6 +529,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+                     cmd, ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
+         if (cmd == MFC_GETLLAR_CMD) {
+             memset(ls, 0, MFC_ATOMIC_LINE);
++            if (ctx->resv_valid) spu_resv_note_clear(ctx->resv_ea);
+             ctx->resv_ea = ea; ctx->resv_valid = 0; ctx->atomic_stat = 4;
+         } else {
+             ctx->atomic_stat = 1;   /* PUTLLC failure (line "moved") */
+@@ -634,6 +635,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+         /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
+          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
+          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
++        if (ctx->resv_valid) spu_resv_note_clear(ctx->resv_ea);
++        spu_resv_note_set(ea);          /* counted before it is visible as valid */
+         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
+         ctx->dbg_getllar++;
+         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
+@@ -730,6 +733,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+              * raise a self-LR: hardware CONSUMES the reservation on a
+              * successful PUTLLC, it does not report it lost. Already under the
+              * lock-line lock, which is what spu_coh_notify_write expects. */
++            if (ctx->resv_valid) spu_resv_note_clear(ctx->resv_ea);
+             ctx->resv_valid = 0;
+             { static int s_w = -1;
+               if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
+@@ -801,6 +805,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+               fprintf(stderr, "[atom-ea] PUTLLC %s lr=0x%05X ea=0x%08X\n",
+                       ctx->atomic_stat ? "FAIL" : "OK",
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
++        if (ctx->resv_valid) spu_resv_note_clear(ctx->resv_ea);
+         ctx->resv_valid = 0;                           /* reservation consumed */
+         spu_lockline_unlock();
+         if (ctx->atomic_stat == 0) {
+@@ -821,6 +826,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+          * reservation here would commit a PUTLLC against a snapshot this store
+          * has already overwritten. */
+         spu_coh_notify_write(ea);
++        if (ctx->resv_valid) spu_resv_note_clear(ctx->resv_ea);
+         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+         spu_lockline_unlock();
+         spu_taskset_line_committed(ea & ~127u);
+@@ -995,6 +1001,7 @@ static void spu_resv_lost_poll(spu_context* ctx)
+     if (!(ctx->event_mask & 0x400u) || !ctx->resv_valid) return;
+     if (!vm_base || ctx->resv_ea == 0) return;
+     if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
++        spu_resv_note_clear(ctx->resv_ea);
+         ctx->resv_valid = 0;
+         ctx->event_status |= 0x400u;
+     }
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 6ea4cc2..e6d591d 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -51,9 +51,31 @@ void spu_lockline_lock(void)
+ void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
+ #else
+ #include <stdatomic.h>
+-static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
+-void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
+-void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
++#include <sched.h>
++#include <string.h>
++#if defined(__x86_64__) || defined(__i386__)
++#include <immintrin.h>
++#define SPU_LL_PAUSE() _mm_pause()
++#else
++#define SPU_LL_PAUSE() ((void)0)
++#endif
++/* Test-and-test-and-set, as on Windows: the bare exchange loop had seven
++ * threads (six SPUs and the PPU) bouncing the line between cores while one of
++ * them held it -- 5 ms of CPU per Killzone 2 frame in this function alone. */
++static _Atomic int g_lockline = 0;
++void spu_lockline_lock(void)
++{
++    if (__builtin_expect(!atomic_exchange_explicit(&g_lockline, 1, memory_order_acquire), 1)) return;
++    unsigned spins = 0;
++    for (;;) {
++        while (atomic_load_explicit(&g_lockline, memory_order_relaxed)) {
++            SPU_LL_PAUSE();
++            if (++spins >= 4096) { spins = 0; sched_yield(); }
++        }
++        if (!atomic_exchange_explicit(&g_lockline, 1, memory_order_acquire)) return;
++    }
++}
++void spu_lockline_unlock(void) { atomic_store_explicit(&g_lockline, 0, memory_order_release); }
+ #endif
+ 
+ /* ===========================================================================
+@@ -72,14 +94,43 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
+ #define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
+ #define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
+ 
+-static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
++/* Exported for the lifted PPU code's inline stores (ppu_recomp.h, vm_st_ok). */
++unsigned char g_spu_coh_bitmap[SPU_COH_BITMAP_SZ];
++#define s_coh_bitmap g_spu_coh_bitmap
+ 
+ /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
+  * bitmap entirely for a title that runs no SPU code, and keeps every existing
+  * test that stores through vm_write* paying one compare against a hot global.
+  * Written once, under the lock; read unlocked, where a stale zero costs at most
+  * one missed event on the very first reservation of the run. */
+-static int s_coh_armed;
++int g_spu_coh_armed;
++#define s_coh_armed g_spu_coh_armed
++
++/* Live reservations per hashed line. The bitmap above is sticky -- a line once
++ * reserved stays marked for the rest of the run -- so every later store to it
++ * walked every registered context (Killzone 2: ~20k times a frame, 48 contexts
++ * each, 4% of them finding a live reservation). A context counts its
++ * reservation in here from GETLLAR until it is consumed or lost
++ * (spu_resv_note_set / _clear); the notify, which runs under the lock-line
++ * lock like every count change, skips the walk when the line's bucket is
++ * zero. A count left high (a context freed while holding one) only costs the
++ * walk. */
++uint32_t g_spu_resv_cnt[SPU_RESV_BUCKETS];
++static inline uint32_t spu_resv_bucket(uint32_t ea)
++{
++    const uint32_t l = ea >> SPU_COH_LINE_SHIFT;
++    return (l ^ (l >> 15)) & (SPU_RESV_BUCKETS - 1u);
++}
++void spu_resv_note_set(uint32_t ea)
++{
++    __atomic_fetch_add(&g_spu_resv_cnt[spu_resv_bucket(ea)], 1u, __ATOMIC_SEQ_CST);
++}
++void spu_resv_note_clear(uint32_t ea)
++{
++    uint32_t* p = &g_spu_resv_cnt[spu_resv_bucket(ea)];
++    uint32_t v = __atomic_load_n(p, __ATOMIC_RELAXED);
++    while (v && !__atomic_compare_exchange_n(p, &v, v - 1u, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {}
++}
+ 
+ /* Every live virtual context may retain a reservation between scheduling
+  * quanta; physical SPU count is not a bound on this set. All access is under
+@@ -175,6 +226,11 @@ int spu_coh_is_reserved(uint32_t addr)
+ {
+     if (!s_coh_armed) return 0;
+     uint32_t line = addr >> SPU_COH_LINE_SHIFT;
++    /* Sticky on purpose: the caller takes the lock-line lock on a hit, and
++     * only under that lock may the live count decide anything (a GETLLAR
++     * counts its line under the same lock). Checked here, unlocked, a store
++     * could slip between a peer's snapshot and its count and the SPURS
++     * kernel slept through the change it was waiting for. */
+     return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+ }
+ 
+@@ -191,11 +247,13 @@ int spu_coh_is_reserved(uint32_t addr)
+ void spu_coh_notify_write_except(uint32_t ea, const void* self)
+ {
+     uint32_t line = ea & ~127u;
++    if (!__atomic_load_n(&g_spu_resv_cnt[spu_resv_bucket(ea)], __ATOMIC_SEQ_CST)) return;
+     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
+         spu_context* c = entry->ctx;
+         if (!c || (const void*)c == self) continue;
+         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
+             c->event_status |= SPU_EVENT_LR;
++            spu_resv_note_clear(c->resv_ea);
+             c->resv_valid = 0;
+             g_spu_lr_raise++;
+             spu_ch_wake(c);
+@@ -206,11 +264,32 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
+ void spu_coh_notify_write(uint32_t ea)
+ {
+     uint32_t line = ea & ~127u;
++    if (!__atomic_load_n(&g_spu_resv_cnt[spu_resv_bucket(ea)], __ATOMIC_SEQ_CST)) return;
++    /* SPU_COH_STATS=1: calls, contexts walked, lines actually reserved. */
++    { static int st = -1; if (st < 0) st = getenv("SPU_COH_STATS") ? 1 : 0;
++      if (st) { static unsigned long long calls, walked, hits, t0; static uint32_t top[8], topn[8];
++          extern unsigned long long ps3_qpc_us(void);
++          calls++; int hit = 0;
++          for (spu_coh_entry* e2 = s_coh_ctxs; e2; e2 = e2->next) { walked++;
++              if (e2->ctx && e2->ctx->resv_valid && (e2->ctx->resv_ea & ~127u) == line) hit = 1; }
++          hits += hit;
++          { int k; for (k = 0; k < 8 && top[k] != line && topn[k]; k++) {}
++            if (k < 8) { top[k] = line; topn[k]++; } }
++          unsigned long long now = ps3_qpc_us();
++          if (!t0) t0 = now;
++          if (now - t0 >= 5000000ull) {
++              fprintf(stderr, "[coh] notify %llu calls, %.1f ctxs walked each, %llu live hits; lines:",
++                      calls, calls ? (double)walked / calls : 0.0, hits);
++              for (int k = 0; k < 8 && topn[k]; k++) fprintf(stderr, " %08X x%u", top[k], topn[k]);
++              fprintf(stderr, "\n");
++              calls = walked = hits = 0; t0 = now; memset(top, 0, sizeof top); memset(topn, 0, sizeof topn);
++          } } }
+     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
+         spu_context* c = entry->ctx;
+         if (!c) continue;
+         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
+             c->event_status |= SPU_EVENT_LR;
++            spu_resv_note_clear(c->resv_ea);
+             c->resv_valid = 0;          /* reservation lost, PUTLLC must fail */
+             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
+              * always fails for "no reservation" is useless without knowing who
+diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
+index 74f7b77..a15caae 100644
+--- a/runtime/spu/spu_coherency.h
++++ b/runtime/spu/spu_coherency.h
+@@ -54,6 +54,12 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
+ /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
+  * lookup guarded by a global that is zero until the first GETLLAR. */
+ int spu_coh_is_reserved(uint32_t addr);
++/* Live-reservation accounting (spu_coherency.c): GETLLAR notes its line, every
++ * path that drops a valid reservation clears it. */
++#define SPU_RESV_BUCKETS 65536u
++extern uint32_t g_spu_resv_cnt[];
++void spu_resv_note_set(uint32_t ea);
++void spu_resv_note_clear(uint32_t ea);
+ int spu_coh_armed(void);
+ 
+ /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index c442efd..f2b5c97 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -215,6 +215,74 @@ static inline uint64_t vm_read64_inl(uint64_t a)
+ #define vm_read64(a) vm_read64_inl(a)
+ #endif
+ 
++/* Inline stores, the same idea as the loads above: the out-of-line vm_write*
++ * run a watch hook, the null/out-of-range checks and the SPU reservation test
++ * as three calls per guest store. The fast path stores directly whenever none
++ * of them can apply: no store watch armed (g_vm_store_slow, PPU_WVAL /
++ * PPU_WWATCH), no sync watch, no null sweep, and no SPU reservation on the
++ * line (it must then lock, store and break the reservation). */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern int      g_vm_store_slow;
++extern uint32_t g_barrier_sync_watch, g_null_sweep_hi;
++extern int      g_spu_coh_armed;
++extern unsigned char g_spu_coh_bitmap[];
++#ifdef __cplusplus
++}
++#endif
++static inline int vm_st_ok(uint32_t ea, uint32_t n)
++{
++    if (!vm_inl_ok(ea, n) || (g_vm_store_slow | g_barrier_sync_watch | g_null_sweep_hi)) return 0;
++    if (__builtin_expect(g_spu_coh_armed, 1)) {
++        const uint32_t l0 = ea >> 7, l1 = (ea + n - 1) >> 7;
++        if (((g_spu_coh_bitmap[l0 >> 3] >> (l0 & 7)) | (g_spu_coh_bitmap[l1 >> 3] >> (l1 & 7))) & 1u) return 0;
++    }
++    return 1;
++}
++static inline void vm_write8_inl(uint64_t a, uint8_t v)
++{
++    const uint32_t ea = (uint32_t)a;
++    if (vm_st_ok(ea, 1)) { __atomic_store_n(vm_base + ea, v, __ATOMIC_RELAXED); return; }
++    vm_write8(a, v);
++}
++static inline void vm_write16_inl(uint64_t a, uint16_t v)
++{
++    const uint32_t ea = (uint32_t)a;
++    if (vm_st_ok(ea, 2)) {
++        const uint16_t s = __builtin_bswap16(v);
++        if (!(ea & 1u)) __atomic_store_n((uint16_t*)(vm_base + ea), s, __ATOMIC_RELAXED);
++        else memcpy(vm_base + ea, &s, 2);
++        return; }
++    vm_write16(a, v);
++}
++static inline void vm_write32_inl(uint64_t a, uint32_t v)
++{
++    const uint32_t ea = (uint32_t)a;
++    if (vm_st_ok(ea, 4)) {
++        const uint32_t s = __builtin_bswap32(v);
++        if (!(ea & 3u)) __atomic_store_n((uint32_t*)(vm_base + ea), s, __ATOMIC_RELAXED);
++        else memcpy(vm_base + ea, &s, 4);
++        return; }
++    vm_write32(a, v);
++}
++static inline void vm_write64_inl(uint64_t a, uint64_t v)
++{
++    const uint32_t ea = (uint32_t)a;
++    if (vm_st_ok(ea, 8)) {
++        const uint64_t s = __builtin_bswap64(v);
++        if (!(ea & 7u)) __atomic_store_n((uint64_t*)(vm_base + ea), s, __ATOMIC_RELAXED);
++        else memcpy(vm_base + ea, &s, 8);
++        return; }
++    vm_write64(a, v);
++}
++#ifndef PPU_NO_INLINE_STORES
++#define vm_write8(a, v)  vm_write8_inl(a, v)
++#define vm_write16(a, v) vm_write16_inl(a, v)
++#define vm_write32(a, v) vm_write32_inl(a, v)
++#define vm_write64(a, v) vm_write64_inl(a, v)
++#endif
++
+ /* Syscall handler */
+ #ifdef __cplusplus
+ extern "C"

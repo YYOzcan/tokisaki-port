@@ -80,6 +80,23 @@ add_custom_command(
 
 set(KZ2_SPU_SOURCES "")
 file(GLOB KZ2_SPU_LIFTED CONFIGURE_DEPENDS "${KZ2_SPU_DIR}/*/spu_recomp.c")
+# tools/spu_regcache.py writes spu_recomp_rc.c next to each image: the same
+# functions with the SPU registers in locals instead of the context in memory.
+# Off: here it is slower (PROGRESS 62) -- clang already keeps ctx->gpr in
+# registers, and the locals of an 80-register loop spill to the stack.
+option(KZ2_SPU_REGCACHE "Build the register-cached SPU sources (spu_recomp_rc.c) where present" OFF)
+if(KZ2_SPU_REGCACHE)
+    set(_kz2_spu "")
+    foreach(src IN LISTS KZ2_SPU_LIFTED)
+        get_filename_component(dir "${src}" DIRECTORY)
+        if(EXISTS "${dir}/spu_recomp_rc.c")
+            list(APPEND _kz2_spu "${dir}/spu_recomp_rc.c")
+        else()
+            list(APPEND _kz2_spu "${src}")
+        endif()
+    endforeach()
+    set(KZ2_SPU_LIFTED ${_kz2_spu})
+endif()
 if(KZ2_SPU_LIFTED)
     list(APPEND KZ2_SPU_SOURCES ${KZ2_SPU_LIFTED}
          "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")

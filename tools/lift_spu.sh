@@ -41,3 +41,10 @@ PYEOF
 export JOBMOD_EXTRA_FUNCS="${JOBMOD_EXTRA_FUNCS:-9de83b69cfa0:0x4600,0x5300,0x8808}"
 "${PY}" -I "${T}/lift_jobmods.py" --jobmods "${OUT}/jobmods" --out "${SPU}" \
     --register "${SPU}/jobmods_register.c" --symbol-prefix kz2
+
+# Register-cached copies (spu_recomp_rc.c, built instead of spu_recomp.c with
+# CMake's KZ2_SPU_REGCACHE=ON): KZ2_SPU_REGCACHE=1 tools/lift_spu.sh. Slower
+# on this title so far (PROGRESS 62).
+if [ "${KZ2_SPU_REGCACHE:-0}" = 1 ]; then
+    "${PY}" -I "${ROOT}/tools/spu_regcache.py" "${SPU}" | tail -1
+fi

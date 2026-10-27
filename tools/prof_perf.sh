@@ -22,7 +22,7 @@ KZPROF_RAW="${OUT%.txt}.raw" "${ROOT}/build/kzprof" "${GPID}" "${SECS}" 1000 80 
 wait "${GBPID}"
 kill -9 "${GPID}" "${PID}" 2>/dev/null
 # the symbols of this binary, so the raw samples can be read after a rebuild
-nm --defined-only "${ROOT}/build/killzone2" | grep ' [tTwW] ' | gzip -1 > "${OUT%.txt}.nm.gz"
+nm --defined-only "${KZ2_BUILD_DIR:-${ROOT}/build}/killzone2" | grep ' [tTwW] ' | gzip -1 > "${OUT%.txt}.nm.gz"
 wait 2>/dev/null
 grep -a '\[fps\]' "${OUT%.txt}.log" | tail -4
 cat "${OUT%.txt}.gpu"

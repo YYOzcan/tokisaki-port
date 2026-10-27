@@ -126,6 +126,12 @@ tools/lift.sh               # PPU: EBOOT.ELF -> recompiled/   (~1 min)
 tools/lift_spu.sh           # SPU: images, policy module, job modules -> spu_recompiled/
 BUILD_JOBS=8 tools/build.sh # ~0.6 GB RAM per job
 ```
+For this machine only, at full strength (16 GB RAM or more): `KZ2_MAX=1 BUILD_JOBS=8 tools/build.sh`
+-- `-march=native`, the lifted PPU code at `-O2`, the SPU code with `pgo/spu.profdata` when present
+(~7 min on a Ryzen 5 5600; ~7% more frames per second than the default build, docs/PROGRESS.md §62).
+Without system packages for Ninja or the Vulkan headers: `pip install ninja` into `.venv`, and
+`CMAKE_ARGS=-DPS3RECOMP_VULKAN_INCLUDE_DIR=<Vulkan-Headers>/include` on the first build.
+The firmware fonts can come from the disc's own update: `rpcs3 --installfw game_dump/PS3_UPDATE/PS3UPDAT.PUP`.
 
 ### Running
 ```bash
@@ -186,6 +192,9 @@ tools/lift.sh               # PPU çevirimi -> recompiled/
 tools/lift_spu.sh           # SPU çevirimi -> spu_recompiled/
 BUILD_JOBS=8 tools/build.sh
 ```
+Yalnızca bu makine için, tam güçte (16 GB RAM ve üstü): `KZ2_MAX=1 BUILD_JOBS=8 tools/build.sh`
+-- `-march=native`, PPU kodu `-O2`, SPU kodu `pgo/spu.profdata` ile (Ryzen 5 5600'de ~7 dk;
+varsayılandan ~%7 daha fazla kare/s, docs/PROGRESS.md §62).
 
 ### Çalıştırma
 ```bash

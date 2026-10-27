@@ -35,6 +35,10 @@ for base in sys.argv[1:]:
         i = bisect.bisect_right(addrs, off) - 1
         c[group(names[i]) if i >= 0 and off < addrs[-1] + 0x100000 else 'libs'] += 1
     secs = 20.0
+    try:   # the sampling time, from the report's first line ("N samples over S s")
+        secs = float(re.search(r'samples over ([\d.]+) s', open(base + '.txt').read()).group(1))
+    except (OSError, AttributeError):
+        pass
     cols.append((base, fps, {k: v / (secs * fps) for k, v in c.items()}))   # ms per frame (1000 Hz)
 keys = sorted(set(k for _, _, d in cols for k in d), key=lambda k: -max(d.get(k, 0) for _, _, d in cols))
 print('%-28s' % 'ms CPU per frame' + ''.join('%14s' % b.split('/')[-1] for b, _, _ in cols))

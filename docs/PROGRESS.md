@@ -1448,3 +1448,54 @@ the default again since section 54), which stalled the level start half the
 time in section 45 until the task-id fix of section 53. Not yet confirmed:
 reach a transition with `7:1` (the launcher's stable mode) and with
 `KZ2_RSX_TIMES=1`.
+
+## 62. On a desktop: Ryzen 5 5600, RTX 3060; a full-strength build; register caching measured
+
+The tree moved from the laptop (Ryzen 7 170, Radeon 680M + RTX 4050 Laptop)
+to a desktop: Ryzen 5 5600 (Zen 3, 6 cores / 12 threads), 32 GB DDR4,
+GeForce RTX 3060 (NVIDIA 615.78), CachyOS.
+- The copy kept no symbolic links and no execute bits: modes restored from
+  the git index, the venv rebuilt (Python 3.14), `run/vfs` is now a full copy
+  of the dump instead of a link (it works either way).
+- No Ninja or Vulkan headers on the system and no root: Ninja from pip in
+  `.venv`, Vulkan-Headers v1.4.328 passed as `PS3RECOMP_VULKAN_INCLUDE_DIR`
+  (`CMAKE_ARGS` in `tools/build.sh`).
+- Firmware fonts: RPCS3 v0.0.43 installs the disc's own update
+  (`PS3_UPDATE/PS3UPDAT.PUP`, firmware 2.52) with `--installfw`; it asks
+  twice ("Install firmware?", "Old firmware detected") in message boxes, so
+  an unattended install needs the answers given (a two-line `LD_PRELOAD` that
+  returns Yes from `QMessageBox::question` did it). 2.52 has every
+  `SCE-PS3-*` font Killzone 2 opens.
+- The laptop's last, uncommitted experiment (2026-10-26: inline PPU stores
+  with the reserved-line bitmap test, live reservation counts per line, a
+  test-and-test-and-set lock-line lock) stopped the game in its last profile
+  -- 71% of all samples in `spu_lockline_lock`, four SPU threads at 100%. It
+  is kept as `patches/wip/inline-stores-resv-count.patch` (not applied) and
+  the submodule is back on the series; upstream has since done the same
+  inline bitmap test (`29154bc6`, v0.18.0).
+
+**Full strength** (`KZ2_MAX=1 tools/build.sh`): `-march=native`, the lifted
+PPU chunks at `-O2` (32 GB allow ~3 GB per job), the SPU code with
+`pgo/spu.profdata`. ~7 min at `-j8` vs ~4.5 min for the default. Gameplay
+with the test script, 90-180 s, headless: default build 11.2-13.0 frames/s,
+full strength 12.4-13.4.
+
+**Register caching from the inFAMOUS port** (`tools/spu_regcache.py`, from
+whompay/inFAMOUSreborn's ps3recomp, MIT): keeps each lifted SPU function's
+registers in locals instead of `ctx->gpr`. It applies cleanly here -- every
+statement of our SPU lifter's output is one line, no `else`/loops, every
+`goto` has a register-only condition; 24,165 functions -- but it is slower:
+11.4-11.6 frames/s, `a27e818cca34` 39 -> 51 ms of CPU per frame. Its hot loop
+(`0x5908`) uses ~80 SPU registers; as locals they no longer fit the 16 x86
+vector registers and spill to the stack (970 stack accesses, 3,394
+instructions vs 2,624 with 291 `ctx` accesses -- clang already keeps
+`ctx->gpr` in registers between accesses). Kept opt-in
+(`KZ2_SPU_REGCACHE=1 tools/lift_spu.sh`, CMake `KZ2_SPU_REGCACHE=ON`).
+
+**Where the frame goes on six cores** (`tools/prof_perf.sh`, 120 s
+warm-up): 5.1 cores busy on average, so the CPU itself is nearly full; one
+SPU worker at 99% runs `jobmod_73d064721abc` (62 ms of CPU per frame; absent
+from the laptop's profiles at 210 s), the SPU runtime (drain, lock line,
+coherency) 72 ms, `a27e818cca34` 39 ms. One run in six stopped at the level
+start (frames end ~60 s in; one thread spins in `spu_coh_reserve` under
+`jobmod_0f8584c7c87a`): the occasional stop of section 61 is still there.
