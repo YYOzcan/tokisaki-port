@@ -204,6 +204,32 @@ static void frame_clock_loop(void)
         if (cellGcm_take_flip_pending_synced()) {
             be.present();
             g_frames_presented.fetch_add(1);
+            /* KZ2_FRAME_HIST=1: every 5 s, the time between presents in 1/60 s
+             * steps -- a frame rate held at whole vblank counts shows as a few
+             * full bins, one limited by work as a spread. */
+            {   static const bool hist = getenv("KZ2_FRAME_HIST") != nullptr;
+                if (hist) {
+                    static uint64_t last = 0, t0 = 0; static unsigned bins[12], ms2[64];
+                    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                    const uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+                    if (last) {
+                        unsigned b = (unsigned)((now_us - last) * 60ull / 1000000ull);   /* whole vblanks */
+                        bins[b < 11 ? b : 11]++;
+                        const unsigned m = (unsigned)((now_us - last) / 2000ull);   /* 2 ms bins */
+                        ms2[m < 63 ? m : 63]++;
+                    }
+                    last = now_us;
+                    if (!t0) t0 = now_us;
+                    if (now_us - t0 >= 5000000ull) {
+                        fprintf(stderr, "[frame-hist] vblanks/frame:");
+                        for (unsigned k = 0; k < 12; k++) if (bins[k]) fprintf(stderr, " %u%s:%u", k, k == 11 ? "+" : "", bins[k]);
+                        fprintf(stderr, " | ms:");
+                        for (unsigned k = 0; k < 64; k++) if (ms2[k]) fprintf(stderr, " %u:%u", k * 2, ms2[k]);
+                        fprintf(stderr, "\n");
+                        memset(bins, 0, sizeof bins); memset(ms2, 0, sizeof ms2); t0 = now_us;
+                    }
+                }
+            }
             /* KZ2_FLIP_IMMEDIATE=1: the flip completes once presented, not
              * on the next 60 Hz beat (vsync off for the guest). */
             static const bool flip_now = [] {
@@ -259,7 +285,14 @@ static void frame_clock_loop(void)
         while ((int64_t)(now - next_tick) >= 0 && fired < 240) {
             cellGcm_request_tick();
             drain();
-            next_tick += 16;
+            /* KZ2_VBLANK_MS: the vblank period (default 16 ms, ~60 Hz) --
+             * a diagnostic: the title paces on vblank events. */
+            static const unsigned vbl_ms = [] {
+                const char* e = getenv("KZ2_VBLANK_MS");
+                const unsigned v = e ? (unsigned)strtoul(e, 0, 0) : 16u;
+                return v ? v : 16u;
+            }();
+            next_tick += vbl_ms;
             fired++;
         }
         if (fired >= 240) next_tick = now;

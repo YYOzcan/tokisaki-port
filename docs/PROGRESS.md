@@ -1701,3 +1701,30 @@ neutral; only more parallelism moved it (section 64). Left, largest first:
    patches is the way to get it.
 4. Killzone 2 was made for 30 frames/s; above that its own timing has not
    been tested.
+
+## 67. Inline PPU stores; the frame is CPU-bound after all
+
+**PPU stores inline** (patch 0044, the first part of the laptop's WIP of
+section 62, without its live-reservation counts and its lock-line lock):
+the lifted code stores directly when no store watch, sync watch or null
+sweep is armed and the line was never reserved by an SPU, else it calls the
+out-of-line `vm_write*` as before -- the same checks, inline (raw SPU
+problem state, at 0xE0000000, stays out of line; `g_spu_coh_bitmap` /
+`g_spu_coh_armed` are exported for it). The main thread's
+`barrier_watch_hit` (8.5% of its samples), `vm_write64/32` (7.6%) and
+`spu_coh_is_reserved` (2.8%) are gone; 14.58 / 14.89 frames/s, two runs,
+no stop.
+
+**Diagnostics**: `KZ2_FRAME_HIST=1` prints the time between presents every
+5 s (whole vblanks and 2 ms bins): one broad peak at 62-74 ms, small bumps
+near 48 and 78 ms -- not vblank-locked. `KZ2_VBLANK_MS=8` (twice the vblank
+rate, diagnostic only): 14.63, the title does not pace on vblanks.
+
+**Cores** (`taskset -c` on `tools/longrun.sh`): four physical cores 10.80
+frames/s, all six 15.06. With 1.5 times the cores the frame rate is 1.39
+times higher: the frame *is* bound by CPU capacity as a whole, though no
+single thread is saturated and no one change of a few percent shows above
+the ±0.5 noise of one run -- they add up (13.5 this morning with the
+title's SPURS limits, 15.1 now). A CPU with more cores runs it faster
+(the laptop's eight did 17.9 at The New Sun). 30 frames/s on six cores
+needs the ~390 ms of CPU a frame halved; the SPU job code is ~200 ms of it.

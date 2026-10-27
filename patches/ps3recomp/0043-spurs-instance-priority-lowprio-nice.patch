@@ -1,0 +1,92 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index cd55e757..31c31e78 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -39,6 +39,9 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
+ #else
+ #include <pthread.h>
+ #include <time.h>
++#include <sys/resource.h>  /* setpriority: SPURS_LOWPRIO_NICE */
++#include <sys/syscall.h>
++#include <unistd.h>
+ #endif
+ 
+ /* ---------------------------------------------------------------------------
+@@ -447,6 +450,7 @@ struct SpursPmSlot {
+ };
+ static struct SpursInst {
+     u32 ea, nspus;
++    s32 spu_prio;            /* the SPU thread group priority it was created with */
+     char prefix[16];
+     int kernel_live, stopping, starting;
+     SRWLOCK lock;
+@@ -513,7 +517,7 @@ static void spurs_api_unlock(struct SpursInst* si)
+ volatile uint32_t g_spurs_last_task_arg[4];
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+ 
+-static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
++static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix, s32 spu_prio)
+ {
+     if (!nspus || nspus > 6) return CELL_SPURS_CORE_ERROR_INVAL;
+     AcquireSRWLockExclusive(&s_inst_directory_lock);
+@@ -536,6 +540,8 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+     ReleaseSRWLockExclusive(&si->lock);
+     ReleaseSRWLockExclusive(&s_inst_directory_lock);
+     si->nspus = (nspus > 0 && nspus <= CELL_SPURS_MAX_SPU) ? nspus : 1;
++    si->spu_prio = spu_prio;
++    printf("[cellSpurs] instance 0x%08X spu priority %d\n", spurs_ea, spu_prio);
+     memset(si->prefix, 0, sizeof(si->prefix));
+     if (prefix) memcpy(si->prefix, prefix, 15);
+ 
+@@ -560,10 +566,10 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
+                         s32 ppuPriority, u8 exitIfNoWork)
+ {
+-    (void)spuPriority; (void)ppuPriority; (void)exitIfNoWork;
++    (void)ppuPriority; (void)exitIfNoWork;
+     if (!spurs)
+         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+-    return spurs_initialize_common((u32)(uintptr_t)spurs, (u32)nSpus, NULL);
++    return spurs_initialize_common((u32)(uintptr_t)spurs, (u32)nSpus, NULL, spuPriority);
+ }
+ 
+ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
+@@ -573,7 +579,7 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
+         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+     u32 spurs_ea = (u32)(uintptr_t)spurs;
+     attr = GUEST_PTR(attr, const CellSpursAttribute*);
+-    return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix);
++    return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix, attr->spuPriority[0]);
+ }
+ 
+ static void spurs_cancel_attached_queues(u32 spurs_ea);  /* defined with the queue table */
+@@ -1715,6 +1721,29 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+         while (!slot->busy && !si->stopping)
+             SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
+         if (si->stopping && !slot->busy) break;
++#ifndef _WIN32
++        /* SPURS_LOWPRIO_NICE=<n>: the workers of an instance created with a
++         * lower SPU thread group priority than another live instance run at
++         * nice n. On the console the higher group preempts it on the SPUs;
++         * here both share the host's cores with the PPU and RSX threads. */
++        { static __thread int applied = 0;
++          if (!applied) {
++              applied = 1;
++              static int nice_v = -1;
++              if (nice_v < 0) { const char* e = getenv("SPURS_LOWPRIO_NICE"); nice_v = e ? atoi(e) : 0; }
++              if (nice_v > 0) {
++                  s32 minp = si->spu_prio;
++                  for (int i = 0; i < MAX_SPURS_INST; i++)
++                      if (__atomic_load_n(&s_inst[i].ea, __ATOMIC_ACQUIRE) && s_inst[i].spu_prio < minp)
++                          minp = s_inst[i].spu_prio;
++                  if (si->spu_prio > minp) {
++                      setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), nice_v);
++                      printf("[cellSpurs] instance 0x%08X (priority %d) worker %u at nice %d\n",
++                             si->ea, si->spu_prio, slot->spu_num, nice_v);
++                  }
++              }
++          } }
++#endif
+         ReleaseSRWLockExclusive(&si->lock);
+         extern unsigned long long ps3_ms_now(void);
+         const unsigned long long t_run = ps3_ms_now();
