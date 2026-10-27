@@ -1,0 +1,172 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 400484e2..dd6a3c07 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1589,13 +1589,22 @@ void cellGcm_rsx_process_fifo(void)
+     gcm_rsx_process_fifo_unlocked();
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+ }
++/* GCM_DRAINDBG, read once (the drain checked it twice per pass). */
++static int gcm_draindbg(void)
++{
++    static int on = -1;
++    if (on < 0) on = getenv("GCM_DRAINDBG") ? 1 : 0;
++    return on;
++}
+ 
+ static void gcm_rsx_process_fifo_unlocked(void)
+ {
+     { static unsigned _n = 0; static unsigned long long _t0 = 0;
+       extern unsigned long long ps3_ms_now(void);
++      static int rate = -1;   /* GCM_* switches below: read once, not per drain pass */
+       _n++;
+-      if (getenv("GCM_RATE")) {
++      if (rate < 0) rate = getenv("GCM_RATE") ? 1 : 0;
++      if (rate) {
+           unsigned long long now = ps3_ms_now();
+           if (_t0 == 0) _t0 = now;
+           if (now - _t0 >= 2000) {
+@@ -1636,7 +1645,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
+      * its own, every field below moves with it and the FIFO the runtime walks
+      * stops being the one the title fills. Reported on change, not per tick. */
+-    if (getenv("GCM_CTXDBG") && s_gcm_ctx_out_ea) {
++    static int s_ctxdbg = -1;
++    if (s_ctxdbg < 0) s_ctxdbg = getenv("GCM_CTXDBG") ? 1 : 0;
++    if (s_ctxdbg && s_gcm_ctx_out_ea) {
+         static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
+         u32 ptr = vm_read32(s_gcm_ctx_out_ea);
+         u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
+@@ -1652,7 +1663,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+     }
+ 
+     u32 start_off = s_fifo_getoff;
+-    if (getenv("GCM_DRAINDBG")) {
++    if (gcm_draindbg()) {
+         static int n = 0;
+         if (n++ % 60 == 0)
+             printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
+@@ -1664,8 +1675,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * present in 0..put. "The title waits for a fence we never published" has
+      * two very different causes -- we missed the command, or it was never
+      * submitted -- and only a direct scan of the ring separates them. */
+-    { static int scanned = 0;
+-      if (!scanned && getenv("GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
++    { static int scanned = 0, scanref = -1;
++      if (scanref < 0) scanref = getenv("GCM_SCANREF") ? 1 : 0;
++      if (!scanned && scanref && put >= 0x19F0) { scanned = 1;
+         unsigned found = 0;
+         for (u32 io = 0; io + 8 <= put; io += 4) {
+             u32 ea = gcm_io2ea(io); if (!ea) continue;
+@@ -1905,7 +1917,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                     u32 m = (type == 0) ? method + i * 4 : method;
+                     u32 v = vm_read32(dea);
+                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
+-                    { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
++                    { static int sn = 0, recdbg = -1; if (recdbg < 0) recdbg = getenv("GCM_RECDBG") ? 1 : 0;
++                      if (recdbg && sn++ < 12)
+                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
+                     { static long lw = -2; if (lw == -2) { const char* e = getenv("RSX_LABEL_WATCH"); lw = e ? (long)strtoul(e, 0, 16) : -1; }
+                       if (lw >= 0 && ((m == 0x64u && v == (u32)lw) || (m != 0x64u && s_sema_offset == (u32)lw))) {
+@@ -2160,7 +2173,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
+      * value stays observable to equality-waiters. The wrap recycle path polls
+      * the drained EA. */
+-    if (getenv("GCM_DRAINDBG")) {
++    if (gcm_draindbg()) {
+         static int n2 = 0;
+         if (n2++ % 60 == 0)
+             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 37e82c63..b7a55478 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -288,8 +288,9 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+          * halts (stop -> longjmp) or the trampoline empties. Nested brsl/bisl
+          * calls drain inside their own call brackets (see the lifter). */
+         entry(ctx);
+-        { static int _e = 0;
+-          if (getenv("SPU_ARGWATCH") && _e < 8) { _e++;
++        { static int _e = 0, _on = -1;   /* read once: this runs on every SPU start */
++          if (_on < 0) _on = getenv("SPU_ARGWATCH") ? 1 : 0;
++          if (_on && _e < 8) { _e++;
+               fprintf(stderr, "[argwatch] after entry(): img=%d pc=0x%05X "
+                       "r2=0x%08X r3=0x%08X r4=0x%08X\n", ctx->image_id,
+                       (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[2]._u32[0],
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 730afc6e..95a45b13 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -1031,10 +1031,15 @@ __declspec(selectany) __declspec(thread) unsigned g_spu_fp_saved;
+ __attribute__((weak)) __thread int g_spu_fp_rz;
+ __attribute__((weak)) __thread unsigned g_spu_fp_saved;   /* the thread's own MXCSR */
+ #endif
++/* The result alone says whether a lane needs the slow path: an exponent-255
++ * operand (the SPU's extended range, Inf or NaN to x86) always gives an
++ * exponent-255 result in IEEE add, multiply and fma -- x + Inf = Inf,
++ * Inf * 0 = NaN, Inf - Inf = NaN, NaN anything = NaN -- and an overflow lands
++ * on FLT_MAX under round-toward-zero. The operands' own tests were four of
++ * the ~12 instructions an fa took (and seven more in fma). */
+ SPU__XV_INLINE __m128i spu__rz_bad(__m128i a, __m128i b, __m128i r) {
+-    const __m128i m = _mm_set1_epi32(0x7FFFFFFF);
+-    const __m128i mx = _mm_max_epu32(_mm_max_epu32(_mm_and_si128(a, m), _mm_and_si128(b, m)), _mm_and_si128(r, m));
+-    return _mm_cmpgt_epi32(mx, _mm_set1_epi32(0x7F7FFFFE));
++    (void)a; (void)b;
++    return _mm_cmpgt_epi32(_mm_and_si128(r, _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(0x7F7FFFFE));
+ }
+ SPU__XV_INLINE __m128i spu__rz_pos0(__m128i r) {
+     const __m128i sb = _mm_set1_epi32((int)0x80000000u);
+@@ -1115,7 +1120,7 @@ SPU__XV_INLINE u128 spu__xv_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t
+         const __m128i A = _mm_xor_si128(spu__xv_ld(a), _mm_set1_epi32((int)negp)), B = spu__xv_ld(b);
+         const __m128i C = _mm_xor_si128(spu__xv_ld(c), _mm_set1_epi32((int)negc));
+         const __m128i r = _mm_castps_si128(_mm_fmadd_ps(_mm_castsi128_ps(A), _mm_castsi128_ps(B), _mm_castsi128_ps(C)));
+-        const __m128i bad = _mm_or_si128(spu__rz_bad(A, B, r), spu__rz_bad(C, C, C));
++        const __m128i bad = spu__rz_bad(A, B, r);   /* covers C too (see spu__rz_bad) */
+         res = __builtin_expect(_mm_testz_si128(bad, bad), 1) ? spu__rz_pos0(r) : spu__xv_fma_w(a, b, c, negp, negc);
+     } else {
+         const __m256d p = _mm256_mul_pd(spu__xv_cvt(spu__xv_flush0(_mm_xor_si128(spu__xv_ld(a), _mm_set1_epi32((int)negp)))),
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 9c6a1fe7..9cfea8ce 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -647,7 +647,8 @@ static void spu_async_run(spu_async_job* j)
+              * timing bug, fix = defer/re-dispatch on signal); if it still loops on
+              * a null base, the buffer is never filled (=> an audio HLE gap). */
+             if (j->image_id != 22) {
+-                const char* d = getenv("LBP_TASK_DELAY");
++                static const char* d; static int d_read;   /* read once: per task start */
++                if (!d_read) { d = getenv("LBP_TASK_DELAY"); d_read = 1; }
+                 if (d && *d) {
+ #ifdef _WIN32
+                     Sleep((unsigned)(atoi(d) * 1000));
+@@ -656,7 +657,8 @@ static void spu_async_run(spu_async_job* j)
+                 /* SPURS_TASK_DELAY_MS=<ms>: start a task this long after its
+                  * CreateTask, the way a real kernel picks it up on a later
+                  * scheduling pass rather than inside the PPU call. */
+-                const char* dm = getenv("SPURS_TASK_DELAY_MS");
++                static const char* dm; static int dm_read;
++                if (!dm_read) { dm = getenv("SPURS_TASK_DELAY_MS"); dm_read = 1; }
+                 if (dm && *dm) {
+ #ifdef _WIN32
+                     Sleep((unsigned)atoi(dm));
+@@ -675,7 +677,9 @@ static void spu_async_run(spu_async_job* j)
+              * Planting it makes the mixer read the real FMOD control block
+              * (0x0094F5xx) and the EventFlag handshake completes. Default ON;
+              * LBP_NO_TASKSET restores the old direct-dispatch for comparison. */
+-            if (j->image_id != 22 && !getenv("LBP_NO_TASKSET")) {
++            static int s_no_ts = -1;
++            if (s_no_ts < 0) s_no_ts = getenv("LBP_NO_TASKSET") ? 1 : 0;
++            if (j->image_id != 22 && !s_no_ts) {
+                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                 /* Use the taskset+taskid captured for THIS job at dispatch (not the
+                  * globals, which the next CreateTask clobbers -- the race that made
+@@ -816,7 +820,8 @@ static void spu_async_run(spu_async_job* j)
+              * ends. A reference dump from real hardware is a full local store,
+              * so the only way to ask "what ELSE is different" -- rather than
+              * checking one guessed word at a time -- is to diff all 256 KB. */
+-            { const char* pfx = getenv("SPU_LS_DUMP");
++            { static const char* pfx; static int pfx_read;
++              if (!pfx_read) { pfx = getenv("SPU_LS_DUMP"); pfx_read = 1; }
+               if (pfx) { char path[512];
+                   snprintf(path, sizeof path, "%s_img%d.bin", pfx, j->image_id);
+                   FILE* f = fopen(path, "wb");

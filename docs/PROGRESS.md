@@ -1499,3 +1499,58 @@ from the laptop's profiles at 210 s), the SPU runtime (drain, lock line,
 coherency) 72 ms, `a27e818cca34` 39 ms. One run in six stopped at the level
 start (frames end ~60 s in; one thread spins in `spu_coh_reserve` under
 `jobmod_0f8584c7c87a`): the occasional stop of section 61 is still there.
+
+## 63. The test runs play Corinth River; two upstream fixes; a cheaper SPU float check
+
+**What the test script plays now.** Frame dumps (`PS3RECOMP_VK_DUMP`,
+`PS3RECOMP_VK_DUMP_EVERY=400`) show that `run_test/` holds a campaign in
+progress -- the launcher's quick start uses that directory, and the hand
+sessions of section 61 saved there -- so the script's Cross on the main menu
+picks *Continue* and the game loads the Corinth River checkpoint, the
+battle after the prologue ("Rico: Sev, this way!"). Every desktop number of
+section 62 is from there, not from The New Sun, which is why they do not
+compare with the laptop's. It also means the third stop of section 61 --
+continuing from that checkpoint -- no longer happens: a dozen runs loaded it
+and played on. `run_bench_tpl/` keeps a copy of those saves and
+`KZ2_RUN_TEMPLATE=<dir>` (longrun, prof_perf) starts each run from a fresh
+copy, since the game saves as it goes.
+
+In that scene one SPU worker is sometimes 99% busy with `73d064721abc`
+(a windowed sum of squares at `0x4898`, 85 ms of CPU a frame) and sometimes
+does not run it at all, at the same frame rate: it is not on the frame's
+path. The frame is: the FIFO thread drains for ~half of it and is parked
+the other half (`KZ2_RSX_TIMES=1`: drain 50%, parked 50%) waiting for the
+post-processing jobs to patch the command buffer (section 23); no thread is
+saturated.
+
+**Two upstream commits that apply to the series as they are** (patch 0037;
+most of v0.18.0's performance work does not apply without the refactors
+before it): `13a7676b` copies only the reserved lines of a PUT under the
+lock-line lock, `06a37689` stops the EA->IO lookup behind every SPU PUT at
+the highest slot ever used instead of walking all 512 (`gcm_note_spu_put`
+left the profile). Their tests pass (`test_spu_lockline_peer` 56/56,
+`test_gcm_ea2io_range`). Also in 0037: `[spu-spin]` prints the whole
+128-byte line and r3-r6.
+
+**The SPU float fast path tests the result only** (patch 0038). In the
+round-toward-zero MXCSR mode an `fa`/`fm`/`fma` lane needs the exact slow
+path when an operand has exponent 255 (the SPU's extended range) or the
+result overflowed. IEEE arithmetic already turns any exponent-255 operand
+into an exponent-255 result (x + Inf = Inf, Inf * 0 = NaN, Inf - Inf = NaN),
+and an overflow lands on FLT_MAX under round toward zero, so the result's
+magnitude alone decides -- four of an `fa`'s ~12 instructions and seven more
+of an `fma`'s. `tests/test_spu_fma.c` (8 M random vectors, extended and
+denormal operands, both MXCSR modes): 0 mismatches; with the threshold
+moved off by one it reports 1.37 M, so it does test this. CPU per frame:
+`9935c8f700db` 18.7 -> 12.6 ms, `78f2ef397e8f` 14.2 -> 12.7,
+`a27e818cca34` 36.8 -> 34.6. Frame dumps unchanged.
+
+**`getenv` on hot paths** (patch 0038): an `LD_PRELOAD` counter found ~9,000
+calls a second in the level, from `spu_run_with_halt` (every SPU start,
+`SPU_ARGWATCH`), the task dispatch (four switches) and the FIFO walker
+(upstream `3b27abdb`'s list, done by hand); each is now read once. ~140 a
+second remain, none per packet.
+
+Measured and not kept: the lifted SPU code with `-fstrict-aliasing` (code
+size and thread-local reloads unchanged), and MangoHud off (it is enabled
+system-wide here; no change in frame rate).

@@ -1,0 +1,595 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 95fcab25..400484e2 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -169,6 +169,13 @@ typedef struct IoMapping {
+ 
+ static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
+ static int s_io_mapping_count = 0;
++/* One past the highest slot ever handed out since the table was last cleared:
++ * every active slot is below it. Slots are taken first-free, so it stays at
++ * the peak number of simultaneous mappings. Lets gcm_ea2io_range(), which runs
++ * on every SPU PUT, skip the never-used tail of the table. It only grows
++ * between resets, so a reader racing a map or unmap elsewhere in the table
++ * still reaches every mapping that stays active. */
++static int s_io_mapping_hw = 0;
+ 
+ /* Callback handlers — these are GUEST OPD addresses passed by the
+  * recompiled game, not host function pointers. Stored as uint32_t and
+@@ -404,8 +411,13 @@ static IoMapping* find_mapping_by_io(u32 io)
+ static IoMapping* find_free_mapping(void)
+ {
+     for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+-        if (!s_io_mappings[i].active)
++        if (!s_io_mappings[i].active) {
++            /* Raised before the caller activates the slot; a caller that then
++             * fails leaves it one slot high, which only costs a visit. */
++            if (i >= __atomic_load_n(&s_io_mapping_hw, __ATOMIC_RELAXED))
++                __atomic_store_n(&s_io_mapping_hw, i + 1, __ATOMIC_RELAXED);
+             return &s_io_mappings[i];
++        }
+     }
+     return NULL;
+ }
+@@ -440,6 +452,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+     memset(&s_config, 0, sizeof(s_config));
+     memset(&s_control, 0, sizeof(s_control));
+     memset(s_io_mappings, 0, sizeof(s_io_mappings));
++    __atomic_store_n(&s_io_mapping_hw, 0, __ATOMIC_RELAXED);
+     memset(s_tiles, 0, sizeof(s_tiles));
+     memset(s_zcull, 0, sizeof(s_zcull));
+     memset(s_report_data, 0, sizeof(s_report_data));
+@@ -492,6 +505,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+         s_io_mappings[0].ea     = ioAddress;
+         s_io_mappings[0].io     = 0;
+         s_io_mappings[0].size   = ioSize;
++        __atomic_store_n(&s_io_mapping_hw, 1, __ATOMIC_RELAXED);
+         s_io_mappings[0].active = 1;
+         s_io_mapping_count = 1;
+     }
+@@ -1314,7 +1328,11 @@ static int s_spu_blk_w = 0;
+ /* EA -> IO through the mapping list (range lookup; the by-ea helper is exact). */
+ static u32 gcm_ea2io_range(u32 ea, u32* room)
+ {
+-    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
++    /* Called for every SPU PUT. The table has CELL_GCM_MAX_IO_MAPPINGS slots
++     * and a title uses a handful, all below the high-water mark; the first
++     * match in slot order is the one a full scan returns. */
++    const int n = __atomic_load_n(&s_io_mapping_hw, __ATOMIC_RELAXED);
++    for (int i = 0; i < n; i++) {
+         IoMapping* m = &s_io_mappings[i];
+         if (!m->active || !m->size) continue;
+         if (ea >= m->ea && ea < m->ea + m->size) {
+@@ -3338,6 +3356,7 @@ void cellGcmTerminate(void)
+     memset(&s_config, 0, sizeof(s_config));
+     memset(&s_control, 0, sizeof(s_control));
+     memset(s_io_mappings, 0, sizeof(s_io_mappings));
++    __atomic_store_n(&s_io_mapping_hw, 0, __ATOMIC_RELAXED);
+     memset(s_tiles, 0, sizeof(s_tiles));
+     memset(s_zcull, 0, sizeof(s_zcull));
+     memset(s_report_data, 0, sizeof(s_report_data));
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 925a7e30..37e82c63 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -21,9 +21,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <setjmp.h>
+-#ifndef _WIN32
+-#include <sched.h>   /* sched_yield */
+-#endif
++#ifndef _WIN32
++#include <sched.h>   /* sched_yield */
++#endif
+ #include <time.h>
+ #include "../platform/win32_compat.h"
+ 
+@@ -65,48 +65,48 @@ static uint64_t spu_host_ns(void)
+ #else
+ #  define SPU_TLS __thread
+ #endif
+-/* Called after an SPU atomic commits a 128-byte line, with the lock-line lock
+- * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
+- * when a task sets the flag, instead of on its next 2 ms poll. */
+-void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+-/* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
+-void spu_taskset_line_committed(uint32_t line);
+-/* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
+- * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
+-#define SPU_WATCH_MAX 4
+-int g_spu_ls_watch_n = -1;
+-static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
+-unsigned* spu_ls_watch_list(int* out_n)
+-{
+-    if (g_spu_ls_watch_n < 0) {
+-        int n = 0; const char* e = getenv("SPU_LS_WATCH");
+-        while (e && *e && n < SPU_WATCH_MAX) {
+-            s_spu_ls_watch[n++] = (unsigned)strtoul(e, (char**)&e, 0) & ~0xFu;
+-            while (*e == ',' || *e == ' ') e++;
+-        }
+-        g_spu_ls_watch_n = n;
+-    }
+-    *out_n = g_spu_ls_watch_n;
+-    return s_spu_ls_watch;
+-}
+-void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
+-{
+-    int n; spu_ls_watch_list(&n);
+-    if (!n) return;
+-    uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
+-    for (int i = 0; i < g_spu_ls_watch_n; i++) {
+-        if (s_spu_ls_watch[i] == a) {
+-            fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
+-                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+-                is_write ? "WR" : "rd", a, pc, lr,
+-                p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+-                p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
+-            fflush(stderr);
+-            break;
+-        }
+-    }
+-}
+-
++/* Called after an SPU atomic commits a 128-byte line, with the lock-line lock
++ * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
++ * when a task sets the flag, instead of on its next 2 ms poll. */
++void (*g_spu_line_commit_hook)(uint32_t line) = 0;
++/* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
++void spu_taskset_line_committed(uint32_t line);
++/* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
++ * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
++#define SPU_WATCH_MAX 4
++int g_spu_ls_watch_n = -1;
++static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
++unsigned* spu_ls_watch_list(int* out_n)
++{
++    if (g_spu_ls_watch_n < 0) {
++        int n = 0; const char* e = getenv("SPU_LS_WATCH");
++        while (e && *e && n < SPU_WATCH_MAX) {
++            s_spu_ls_watch[n++] = (unsigned)strtoul(e, (char**)&e, 0) & ~0xFu;
++            while (*e == ',' || *e == ' ') e++;
++        }
++        g_spu_ls_watch_n = n;
++    }
++    *out_n = g_spu_ls_watch_n;
++    return s_spu_ls_watch;
++}
++void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
++{
++    int n; spu_ls_watch_list(&n);
++    if (!n) return;
++    uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
++    for (int i = 0; i < g_spu_ls_watch_n; i++) {
++        if (s_spu_ls_watch[i] == a) {
++            fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
++                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
++                is_write ? "WR" : "rd", a, pc, lr,
++                p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
++                p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
++            fflush(stderr);
++            break;
++        }
++    }
++}
++
+ static SPU_TLS jmp_buf s_spu_halt_env;
+ static SPU_TLS int     s_spu_halt_armed = 0;
+ 
+@@ -252,7 +252,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+      * recursion guard halted the SPU at 2000 after a few minutes of idling. */
+     ctx->host_depth = 0;
+     ctx->irq_frame = 0;
+-    ctx->drain_ret_pc = 0;
++    ctx->drain_ret_pc = 0;
+     /* Nest-safe: a job run synchronously from inside another SPU's execution
+      * re-enters here on the same host thread. The halt target is per-thread,
+      * so save the outer one and put it back on the way out -- otherwise the
+@@ -644,10 +644,15 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+           if (ea != t_ea) { t_ea = ea; t_n = 0; }
+           else if (++t_n == 4000000) {
+               const uint8_t* m = vm_base + ea;
+-              fprintf(stderr, "[spu-spin] img=%d pc=0x%05X lr=0x%05X GETLLAR ea=0x%08X x4M; line:"
+-                              " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
++              /* The whole line, and r3-r6: the polled word is anywhere in it,
++               * and a read helper usually holds its EA in one of those. */
++              char hex[128 * 2 + 8 + 1]; int o = 0;
++              for (int k = 0; k < 128; k++)
++                  o += snprintf(hex + o, sizeof hex - (size_t)o, (k & 15) == 15 && k != 127 ? "%02X|" : "%02X", m[k]);
++              fprintf(stderr, "[spu-spin] img=%d pc=0x%05X lr=0x%05X GETLLAR ea=0x%08X x4M; "
++                              "r3=%08X r4=%08X r5=%08X r6=%08X line: %s\n",
+                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
+-                      m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
++                      ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0], hex);
+           } }
+         spu_lockline_unlock();
+         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
+@@ -803,10 +808,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
+         ctx->resv_valid = 0;                           /* reservation consumed */
+         spu_lockline_unlock();
+-        if (ctx->atomic_stat == 0) {
+-            spu_taskset_line_committed(ea & ~127u);
+-            if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+-        }
++        if (ctx->atomic_stat == 0) {
++            spu_taskset_line_committed(ea & ~127u);
++            if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
++        }
+         return 1;
+ 
+     case MFC_PUTLLUC_CMD:
+@@ -824,7 +829,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+         spu_lockline_unlock();
+         spu_taskset_line_committed(ea & ~127u);
+-        if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
++        if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+         return 1;
+ 
+     default:
+@@ -2023,7 +2028,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+ static int spu_smc_microstep(spu_context* ctx)
+ {
+     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+-    const uint32_t entry_pc = pc;
++    const uint32_t entry_pc = pc;
+     for (int steps = 0; steps < 4096; steps++) {
+         uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
+                      ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
+@@ -2176,29 +2181,29 @@ static int spu_smc_microstep(spu_context* ctx)
+               for (int k = 0; k < 16; k++) fprintf(stderr, " %02X", ctx->ls[0x4000 + k]);
+               fprintf(stderr, "\n");
+           } }
+-        /* SPU_INTERP_ENTRY_LOG=1: every distinct (image, overlay, entry pc)
+-         * that falls back to the interpreter, once -- the entries the lifter
+-         * did not find, to feed back as --extra-funcs. */
+-        { static int en = -1;
+-          if (en < 0) en = getenv("SPU_INTERP_ENTRY_LOG") ? 1 : 0;
+-          if (en) {
+-              enum { N = 1024 };
+-              static uint64_t seen[N]; static int nseen;
+-              const uint64_t key = ((uint64_t)(uint32_t)ctx->image_id << 40) |
+-                                   ((uint64_t)(uint32_t)ctx->resident_ovl << 20) | entry_pc;
+-              int found = 0;
+-              spu_lockline_lock();
+-              for (int k = 0; k < nseen; k++) if (seen[k] == key) { found = 1; break; }
+-              if (!found && nseen < N) seen[nseen++] = key;
+-              spu_lockline_unlock();
+-              if (!found)
+-                  fprintf(stderr, "[spu-interp-entry] img=%d ovl=%d pc=0x%05X\n",
+-                          ctx->image_id, ctx->resident_ovl, entry_pc);
+-          } }
++        /* SPU_INTERP_ENTRY_LOG=1: every distinct (image, overlay, entry pc)
++         * that falls back to the interpreter, once -- the entries the lifter
++         * did not find, to feed back as --extra-funcs. */
++        { static int en = -1;
++          if (en < 0) en = getenv("SPU_INTERP_ENTRY_LOG") ? 1 : 0;
++          if (en) {
++              enum { N = 1024 };
++              static uint64_t seen[N]; static int nseen;
++              const uint64_t key = ((uint64_t)(uint32_t)ctx->image_id << 40) |
++                                   ((uint64_t)(uint32_t)ctx->resident_ovl << 20) | entry_pc;
++              int found = 0;
++              spu_lockline_lock();
++              for (int k = 0; k < nseen; k++) if (seen[k] == key) { found = 1; break; }
++              if (!found && nseen < N) seen[nseen++] = key;
++              spu_lockline_unlock();
++              if (!found)
++                  fprintf(stderr, "[spu-interp-entry] img=%d ovl=%d pc=0x%05X\n",
++                          ctx->image_id, ctx->resident_ovl, entry_pc);
++          } }
+         ctx->pc = pc;
+-        /* Stop at the drain's return point too: it sits mid-function, so it is
+-         * no lifted entry, and a job's return would otherwise run on through
+-         * the caller's code (GH3's song-freeze; see drain_ret_pc). */
++        /* Stop at the drain's return point too: it sits mid-function, so it is
++         * no lifted entry, and a job's return would otherwise run on through
++         * the caller's code (GH3's song-freeze; see drain_ret_pc). */
+         const uint32_t return_pc = ctx->drain_ret_pc;
+         uint32_t result = spu_interp_run_until(ctx, pc, return_pc);
+         /* A live interpreter rejoin is a transfer, not a host return. Nested
+@@ -2267,18 +2272,18 @@ void spu_indirect_branch(spu_context* ctx)
+             if ((n <= 4 || (n % 4096) == 0) && s_poll_logs++ < 16)
+                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
+                         n, ctx->gpr[3]._u32[0]);
+-            /* SPURS_PM_SELECT_CURRENT=1: answer the workload that is running
+-             * (SpursKernelContext.wklCurrentId, be32 at LS 0x1DC). A policy
+-             * module that compares the answer with its own id -- the WWS job
+-             * managers do -- treats 0 as "switch away" and exits after every
+-             * job when it is not workload 0 (Killzone 3 fix list, R6). */
+-            static int s_cur = -1;
+-            if (s_cur < 0) s_cur = getenv("SPURS_PM_SELECT_CURRENT") ? 1 : 0;
+-            uint32_t ans = 0;
+-            if (s_cur)
+-                ans = ((uint32_t)ctx->ls[0x1DC] << 24) | ((uint32_t)ctx->ls[0x1DD] << 16) |
+-                      ((uint32_t)ctx->ls[0x1DE] << 8)  |  (uint32_t)ctx->ls[0x1DF];
+-            ctx->gpr[3] = spu_make_preferred_u32(ans);
++            /* SPURS_PM_SELECT_CURRENT=1: answer the workload that is running
++             * (SpursKernelContext.wklCurrentId, be32 at LS 0x1DC). A policy
++             * module that compares the answer with its own id -- the WWS job
++             * managers do -- treats 0 as "switch away" and exits after every
++             * job when it is not workload 0 (Killzone 3 fix list, R6). */
++            static int s_cur = -1;
++            if (s_cur < 0) s_cur = getenv("SPURS_PM_SELECT_CURRENT") ? 1 : 0;
++            uint32_t ans = 0;
++            if (s_cur)
++                ans = ((uint32_t)ctx->ls[0x1DC] << 24) | ((uint32_t)ctx->ls[0x1DD] << 16) |
++                      ((uint32_t)ctx->ls[0x1DE] << 8)  |  (uint32_t)ctx->ls[0x1DF];
++            ctx->gpr[3] = spu_make_preferred_u32(ans);
+             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+             return;
+         }
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 66e4f193..4f04e8c6 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -664,10 +664,18 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+          * snapshot against a line this copy has already replaced and commits
+          * over it, and a peer parked on RdEventStat sleeps through the write.
+          *
+-         * So when the span touches a reserved line the copy and the notify run
+-         * as ONE critical section under the lock-line lock -- the same contract
+-         * the PPU store path and the PUTLLC commit keep, and the only way the
+-         * copy cannot land inside a peer's compare-and-commit window. Spans
++         * So a reserved line's copy and its notify run as ONE critical section
++         * under the lock-line lock -- the same contract the PPU store path and
++         * the PUTLLC commit keep, and the only way the copy cannot land inside
++         * a peer's compare-and-commit window. Only the reserved lines need it:
++         * in a multi-line span the others are copied first, without the lock,
++         * exactly as an unreserved span is, and the locked pass then copies the
++         * lines it skipped and notifies every reserved one. A line reserved
++         * after its unlocked copy is notified there but NOT copied again: a
++         * peer may already have reserved and committed it on top of our bytes,
++         * and a second copy would write that commit back over. A wide PUT that
++         * touches one queue line no longer holds every other SPU's atomics off
++         * for the whole copy. Spans
+          * that touch no reserved line keep the lock-free copy: bulk asset PUTs
+          * are large and hot, and the scan is a bitmap bit per 128 bytes against
+          * a global that stays zero until an SPU reserves its first line.
+@@ -691,7 +699,34 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                 if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+                 if (a == a1) break;
+             }
+-            if (span_reserved) {
++            /* Lines the unlocked pass left for the locked one: a 16 KiB
++             * transfer spans at most 129 lines. */
++            uint64_t locked_lines[3] = {0, 0, 0};
++            if (span_reserved && a0 != a1 && ((a1 - a0) >> 7) < 64u * 3u) {
++                const uint32_t ea32 = (uint32_t)ea;
++                uint32_t i = 0;
++                for (uint32_t a = a0; ; a += 128u, i++) {
++                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
++                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
++                    if (spu_coh_is_reserved(a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
++                    else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
++                    if (a == a1) break;
++                }
++                spu_lockline_lock();
++                i = 0;
++                for (uint32_t a = a0; ; a += 128u, i++) {
++                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
++                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
++                    if ((locked_lines[i >> 6] >> (i & 63u)) & 1u) {
++                        memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
++                        spu_coh_notify_write_except(a, spu);
++                    } else if (spu_coh_is_reserved(a)) {
++                        spu_coh_notify_write_except(a, spu);   /* reserved after its copy */
++                    }
++                    if (a == a1) break;
++                }
++                spu_lockline_unlock();
++            } else if (span_reserved) {
+                 spu_lockline_lock();
+                 memcpy(ea_ptr, ls_ptr, size);
+                 for (uint32_t a = a0; ; a += 128u) {
+diff --git a/runtime/spu/tests/test_spu_lockline_peer.c b/runtime/spu/tests/test_spu_lockline_peer.c
+index 4bf08693..f945ab0b 100644
+--- a/runtime/spu/tests/test_spu_lockline_peer.c
++++ b/runtime/spu/tests/test_spu_lockline_peer.c
+@@ -347,6 +347,34 @@ static void test_wide_put_finds_the_reserved_line(void)
+     CHECK(mem_is(LINE_D, 0xB0, 0x200));
+ }
+ 
++/* The reserved line is copied under the lock and the rest of the span outside
++ * it, so the partial first and last lines are their own pieces: each has to
++ * land exactly, and nothing either side of the span may move. */
++static void test_unaligned_wide_put_around_a_reserved_line(void)
++{
++    reset_pair();
++    memset(g_guest_mem + LINE_D, 0xEE, 0x200);
++    unsigned long raised = g_spu_lr_raise;
++
++    spu_atomic(&g_a, LSA_A, LINE_D + 0x80, MFC_GETLLAR_CMD);    /* the middle line */
++
++    TEST("an unaligned PUT over a reserved line raises once");
++    stage(&g_b, LSA_B, 0xC0, 0x100);
++    spu_put(&g_b, LSA_B, LINE_D + 0x40, 0x100);
++    CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
++    CHECK(g_a.resv_valid == 0);
++    CHECK(g_spu_lr_raise == raised + 1);
++
++    TEST("...the span landed, partial lines included");
++    CHECK(mem_is(LINE_D + 0x40, 0xC0, 0x100));
++
++    TEST("...and the bytes either side of it did not move");
++    int untouched = 1;
++    for (uint32_t i = 0; i < 0x40; i++)    untouched &= g_guest_mem[LINE_D + i] == 0xEE;
++    for (uint32_t i = 0x140; i < 0x200; i++) untouched &= g_guest_mem[LINE_D + i] == 0xEE;
++    CHECK(untouched);
++}
++
+ /* ===========================================================================
+  * The event acknowledge against a concurrent raise
+  *
+@@ -426,6 +454,7 @@ int main(void)
+     test_plain_put_breaks_peer();
+     test_plain_put_elsewhere_is_quiet();
+     test_wide_put_finds_the_reserved_line();
++    test_unaligned_wide_put_around_a_reserved_line();
+     test_ack_keeps_a_concurrent_raise();
+ 
+     printf("\nSPU-to-SPU lock-line coherence tests: %d passed, %d failed\n",
+diff --git a/tests/test_gcm_ea2io_range.c b/tests/test_gcm_ea2io_range.c
+new file mode 100644
+index 00000000..151e8568
+--- /dev/null
++++ b/tests/test_gcm_ea2io_range.c
+@@ -0,0 +1,120 @@
++/* gcm_ea2io_range(), the EA -> IO lookup behind every SPU PUT, stops at the
++ * mapping table's high-water mark instead of walking all of it. Checks that
++ * it still returns what a walk of the whole table returns -- the first active
++ * mapping in slot order and its remaining room -- across maps, unmaps, holes
++ * and overlapping ranges, and that every active slot is below the mark.
++ * Includes the real implementation, as test_gcm_map_flags.c does. */
++#include "../libs/video/cellGcmSys.c"
++#include <assert.h>
++
++uint8_t* vm_base;
++uint32_t g_ww_lo, g_ww_hi;
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
++int g_resv_store_active;
++void ppu_resv_break_store(uint64_t addr) { (void)addr; abort(); }
++int spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
++void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
++void spu_lockline_lock(void) { abort(); }
++void spu_lockline_unlock(void) { abort(); }
++
++/* The lookup over every slot: what gcm_ea2io_range returned before the bound. */
++static u32 full_scan(u32 ea, u32* room)
++{
++    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
++        const IoMapping* m = &s_io_mappings[i];
++        if (!m->active || !m->size) continue;
++        if (ea >= m->ea && ea < m->ea + m->size) {
++            if (room) *room = m->ea + m->size - ea;
++            return m->io + (ea - m->ea);
++        }
++    }
++    return 0xFFFFFFFFu;
++}
++
++static int g_checks;
++static void agree(u32 ea)
++{
++    u32 room_a = 0xA5A5A5A5u, room_b = 0xA5A5A5A5u;
++    const u32 a = gcm_ea2io_range(ea, &room_a);
++    const u32 b = full_scan(ea, &room_b);
++    if (a != b || room_a != room_b) {
++        fprintf(stderr, "FAIL ea 0x%08X: bounded io 0x%08X room 0x%X, full io 0x%08X room 0x%X\n",
++                ea, a, room_a, b, room_b);
++        abort();
++    }
++    g_checks++;
++}
++
++static void below_mark(void)
++{
++    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++)
++        if (s_io_mappings[i].active) assert(i < s_io_mapping_hw);
++}
++
++static u32 g_rng = 0x2545F491u;
++static u32 rnd(u32 n) { g_rng = g_rng * 1664525u + 1013904223u; return (g_rng >> 8) % n; }
++
++#define EA0 0x40000000u
++static void probe_all(void)
++{
++    /* Every 64 KB through the window the mappings live in, plus the edges. */
++    for (u32 ea = EA0 - 0x100000u; ea < EA0 + 0x1000000u; ea += 0x10000u) {
++        agree(ea); agree(ea + 0xFFFFu);
++    }
++    agree(0); agree(0xFFFFFFFFu);
++    below_mark();
++}
++
++int main(void)
++{
++    vm_base = calloc(1, 0x10000); assert(vm_base);
++    /* stdout carries the mapping log lines; the verdict goes to stderr. */
++    if (!freopen("/dev/null", "w", stdout)) return 1;
++
++    /* An empty table: nothing maps and nothing is visited. */
++    assert(s_io_mapping_hw == 0);
++    assert(gcm_ea2io_range(EA0, NULL) == 0xFFFFFFFFu);
++
++    /* First match in slot order: two overlapping ranges, the earlier slot
++     * wins; unmapping it hands the address to the later one; a new mapping
++     * that lands in the hole wins again. */
++    cellGcm_syscall_iomap(EA0, 0x00100000u, 0x200000u);            /* slot 0 */
++    cellGcm_syscall_iomap(EA0 + 0x100000u, 0x00800000u, 0x200000u); /* slot 1 */
++    assert(gcm_ea2io_range(EA0 + 0x180000u, NULL) == 0x00280000u);
++    assert(cellGcmUnmapEaIoAddress(EA0) == CELL_OK);
++    assert(gcm_ea2io_range(EA0 + 0x180000u, NULL) == 0x00880000u);
++    cellGcm_syscall_iomap(EA0 + 0x100000u, 0x00C00000u, 0x100000u); /* slot 0 again */
++    assert(s_io_mappings[0].active && s_io_mappings[0].io == 0x00C00000u);
++    assert(gcm_ea2io_range(EA0 + 0x180000u, NULL) == 0x00C80000u);
++    assert(s_io_mapping_hw == 2);
++    probe_all();
++
++    /* Random maps and unmaps over a small window, so ranges overlap and the
++     * table keeps gaining and losing holes. */
++    for (int step = 0; step < 4000; step++) {
++        if (s_io_mapping_count && rnd(3) == 0) {
++            int k = (int)rnd((u32)s_io_mapping_count);
++            for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++)
++                if (s_io_mappings[i].active && k-- == 0) {
++                    assert(cellGcmUnmapIoAddress(s_io_mappings[i].io) == CELL_OK);
++                    break;
++                }
++        } else if (s_io_mapping_count < 48) {
++            cellGcm_syscall_iomap(EA0 + rnd(16) * 0x100000u, rnd(200) * 0x100000u,
++                                  (1u + rnd(3)) * 0x100000u);
++        }
++        if (step % 50 == 0) probe_all();
++    }
++    probe_all();
++    assert(s_io_mapping_hw <= 48 + 1);
++
++    /* Terminating clears the mark with the table. */
++    assert(s_io_mapping_hw > 2);
++    cellGcmTerminate();
++    assert(s_io_mapping_hw == 0 && s_io_mapping_count == 0);
++    probe_all();
++
++    fprintf(stderr, "PASS: bounded EA->IO lookup matched the full-table walk in %d probes\n",
++            g_checks);
++    return 0;
++}
+diff --git a/tools/test_gcm_ea2io_range.py b/tools/test_gcm_ea2io_range.py
+new file mode 100644
+index 00000000..acfe0ea0
+--- /dev/null
++++ b/tools/test_gcm_ea2io_range.py
+@@ -0,0 +1,19 @@
++#!/usr/bin/env python3
++"""The bounded EA->IO lookup behind the SPU PUT hook agrees with a full-table walk."""
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++root=Path(__file__).resolve().parents[1]
++if os.name=='nt':
++    print('SKIP: fixture currently uses POSIX linking')
++    raise SystemExit(0)
++with tempfile.TemporaryDirectory(prefix='gcm-ea2io-range-') as tmp:
++    binary=Path(tmp)/'test'
++    linker=['-Wl,-dead_strip'] if sys.platform=='darwin' else ['-Wl,--gc-sections','-pthread','-lm']
++    subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-D_GNU_SOURCE','-O1','-UNDEBUG','-w',
++        '-ffunction-sections','-fdata-sections','-I'+str(root/'include'),
++        str(root/'tests/test_gcm_ea2io_range.c'),*linker,'-o',str(binary)],check=True)
++    subprocess.run([str(binary)],check=True,timeout=60,
++        env={k:v for k,v in os.environ.items() if not k.startswith('A2O_')})
+diff --git a/tools/test_gcm_io_mappings.py b/tools/test_gcm_io_mappings.py
+index fb2a31f0..4f2b1b68 100644
+--- a/tools/test_gcm_io_mappings.py
++++ b/tools/test_gcm_io_mappings.py
+@@ -62,6 +62,7 @@ static CellGcmConfig s_config = { 0x100000u, 0x200000u };
+ typedef struct IoMapping { u32 ea; u32 io; u32 size; int active; } IoMapping;
+ static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
+ static int s_io_mapping_count = 0;
++static int s_io_mapping_hw = 0;
+ static unsigned char mem[0x1000];
+ static void vm_write32(u32 a, u32 v) { for (int i = 0; i < 4; i++) mem[a + i] = (unsigned char)(v >> (24 - 8 * i)); }
+ static u32 rd32(u32 a) { return (u32)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }

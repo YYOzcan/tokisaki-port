@@ -7,6 +7,11 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SECS="${1:-900}"; LOG="${2:-${ROOT}/logs/longrun.log}"
 export KZ2_RUN_DIR="${KZ2_RUN_DIR:-${ROOT}/run_test}" PS3RECOMP_VK_WINDOW="${PS3RECOMP_VK_WINDOW:-0}" KZ2_FPS=1
+# KZ2_RUN_TEMPLATE=<dir>: start from a fresh copy of <dir>/gamedata (the game
+# saves as it goes, so without it each run starts where the last one left).
+if [ -n "${KZ2_RUN_TEMPLATE:-}" ]; then
+    rm -rf "${KZ2_RUN_DIR}"; mkdir -p "${KZ2_RUN_DIR}"; cp -a "${KZ2_RUN_TEMPLATE}/gamedata" "${KZ2_RUN_DIR}/"
+fi
 export PS3RECOMP_VK_PRESENT_READBACK="${PS3RECOMP_VK_PRESENT_READBACK:-0}"
 export PAD_SCRIPT="${PAD_SCRIPT:-20:0x4000,26:0x4000,32:0x4000,38:0x0008,44:0x4000,50:0x4000,56:0x0008,62:0x4000}"
 "${ROOT}/tools/run.sh" > "${LOG}" 2>&1 &

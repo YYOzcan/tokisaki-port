@@ -8,6 +8,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WARM="${1:-210}"; SECS="${2:-20}"; OUT="${3:-${ROOT}/logs/kzprof.txt}"
 [ "${ROOT}/build/kzprof" -nt "${ROOT}/tools/kzprof.c" ] || cc -O2 -o "${ROOT}/build/kzprof" "${ROOT}/tools/kzprof.c"
 export KZ2_RUN_DIR="${KZ2_RUN_DIR:-${ROOT}/run_test}" PS3RECOMP_VK_WINDOW="${PS3RECOMP_VK_WINDOW:-0}"
+# KZ2_RUN_TEMPLATE=<dir>: start from a fresh copy of <dir>/gamedata (the game
+# saves as it goes, so without it each run starts where the last one left).
+if [ -n "${KZ2_RUN_TEMPLATE:-}" ]; then
+    rm -rf "${KZ2_RUN_DIR}"; mkdir -p "${KZ2_RUN_DIR}"; cp -a "${KZ2_RUN_TEMPLATE}/gamedata" "${KZ2_RUN_DIR}/"
+fi
 export KZ2_FPS="${KZ2_FPS:-1}" KZ2_ALLOW_PTRACE=1
 # as in a window: no full-frame readback per present unless frames are dumped
 export PS3RECOMP_VK_PRESENT_READBACK="${PS3RECOMP_VK_PRESENT_READBACK:-0}"
