@@ -740,6 +740,13 @@ int main(int argc, char** argv)
      * KZ2_POST_BLUR=1 keeps the layer. */
     if (!(getenv("KZ2_POST_BLUR") && getenv("KZ2_POST_BLUR")[0] == '1'))
         setenv("RSX_ZERO_TEXTURE", "1:0x0177D200", 0);
+    /* Z16 depth read as an X16 texture through guest memory, not built on the
+     * GPU: the quarter-resolution scene depth the soft particles fade against
+     * (0x02D30000, an address the shadow maps share) came out wrong on the GPU
+     * path -- smoke as hard black-and-white quads, white blocks over distant
+     * buildings, a dark disc in the sky (PROGRESS 70). Bits: 1 D24S8 as ARGB8,
+     * 2 Z16 as X16, 4 RGBA8 as Y16_X16_FLOAT. */
+    setenv("RSX_GPU_REINTERPRET_MASK", "5", 0);
     /* In the level the frame is gated by jm_post (workload 7), the SPU
      * post-processing job list. Its policy module keeps running while it has
      * jobs instead of returning to the kernel after each one (KZ3 fix list

@@ -1779,3 +1779,27 @@ Y = 512 - 113 cos roll cos pitch, the 399 of rest; Z = 512 + 113 sin pitch)
 and the roll rate on the gyro (G). Released, the pad settles back to rest in
 a few polls. The direct mouse-look hook gets no motion while Ctrl is held.
 Crouch is on C only now (Ctrl was its second key).
+
+## 70. Smoke as hard quads, white blocks, a dark disc: the soft particles' depth
+
+Three glitches of Corinth River -- smoke drawn as hard black-and-white
+blotches, flat white blocks over the distant buildings (what looked like
+missing textures: the G-buffer has those buildings textured), and a dark disc
+in the sky -- all come from the quarter-resolution particle pass (640x360,
+`0x00F30000`). Skipping pipelines (`RSX_ENGINE_SKIP_PIPES`, halving the set
+four times) pins the blocks on pipe 167: soft particles that fade by
+`|particle depth - scene depth| * scale`, the scene depth read from the
+640x360 Z16 target at `0x02D30000` as an X16 texture (an address the shadow
+maps use too). With that read built on the GPU (`RSX_GPU_REINTERPRET_MASK`
+bit 2, the reinterpret compute pass of section 41) the fade saturates and
+the particles' faint edges come out opaque; through guest memory
+(`RSX_GPU_REINTERPRET_MASK=5`) all three are gone
+(`docs/media/soft-particles-gpu-vs-guest.png`: left GPU, right guest
+memory). boot_main now sets 5. The shader's arithmetic is right, so the GPU
+path most likely copies the wrong depth image for that address (the shadow
+map's); finding it gets the cost back: 12.99 / 13.56 frames/s against
+~14.5, a GPU round trip per frame.
+
+Weapon switching (Triangle at 90 s and 110 s, frames every 12): rifle ->
+pistol -> rifle, all textured in the scripted run; the texture loss seen in
+play needs its circumstances.
