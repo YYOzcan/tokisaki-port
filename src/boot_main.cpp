@@ -646,6 +646,14 @@ int main(int argc, char** argv)
      * under yama ptrace_scope=1, so a stalled run can be inspected without
      * starting it under a debugger, which is too slow to reach the stall. */
     if (getenv("KZ2_ALLOW_PTRACE")) prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+    /* KZ2_TIMER_SLACK_NS: the timer slack of this thread and of every thread
+     * created after it (inherited). Linux's default, 50 us, makes each short
+     * sleep last ~55 us -- the title waits on its job counters with
+     * sys_timer_usleep(1) (func_004D3D00), the runtime's waits and backoffs
+     * nanosleep for microseconds. Unset or 0 keeps the system default. */
+    {   const char* e = getenv("KZ2_TIMER_SLACK_NS");
+        const unsigned long ns = e ? strtoul(e, 0, 0) : 0ul;   /* 1000: no gain measured (PROGRESS 64) */
+        if (ns) prctl(PR_SET_TIMERSLACK, ns, 0, 0, 0); }
 #endif
 
     if (argc < 2) {
@@ -698,8 +706,12 @@ int main(int argc, char** argv)
     /* jm_post on four SPUs. Off since section 46 for level-start stalls,
      * which were the task-id race fixed in section 53: with it fixed, nine
      * runs to gameplay did not stall, and the frame rate rises from ~5 to ~9
-     * (docs/PROGRESS.md section 54). SPURS_MAXCONT=7:1 restores one SPU. */
-    setenv("SPURS_MAXCONT", "7:4", 0);
+     * (docs/PROGRESS.md section 54). SPURS_MAXCONT=7:1 restores one SPU.
+     * The other workloads that run in the level (0, 2-5, 8, 9) may take up to
+     * six: their jobs then run side by side instead of one after another on
+     * one SPU -- ~13.5 -> ~14.9 frames/s at Corinth River on six cores
+     * (section 64). SPURS_MAXCONT=7:4 alone restores the title's own limits. */
+    setenv("SPURS_MAXCONT", "0:6,2:6,3:6,4:6,5:6,7:4,8:6,9:6", 0);
     /* A presented flip completes at once, not on the next 60 Hz beat: a
      * frame of 6.1 vblanks no longer waits for the 7th (section 54). */
     setenv("KZ2_FLIP_IMMEDIATE", "1", 0);

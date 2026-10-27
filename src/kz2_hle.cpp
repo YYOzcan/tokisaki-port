@@ -794,6 +794,14 @@ extern "C" int kz2_spu_progress_wait(ppu_context* ctx)
 #if defined(__x86_64__)
         _mm_pause();
 #endif
-        if ((pass & 255) == 0) sched_yield();
+        /* KZ2_SPIN_SLEEP_US=<us>: after ~4096 passes, sleep this long between
+         * passes instead of spinning on -- the core is then free for an SPU
+         * worker on its sibling thread. 0 (default): yield every 256. */
+        static int sleep_us = -1;
+        if (sleep_us < 0) { const char* e = getenv("KZ2_SPIN_SLEEP_US"); sleep_us = e ? atoi(e) : 0; }
+        if (sleep_us > 0 && pass >= 4096) {
+            struct timespec ts = { 0, (long)sleep_us * 1000L };
+            nanosleep(&ts, nullptr);
+        } else if ((pass & 255) == 0) sched_yield();
     }
 }

@@ -1,0 +1,206 @@
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+index 30505207..ee9cb254 100644
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -242,6 +242,7 @@ void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u3
+     if (count > RSX_DSP_VP_WORDS)
+         count = RSX_DSP_VP_WORDS;
+     memcpy(rsx->vp, words, count * sizeof(u32));
++    rsx->vp_gen++;
+ }
+ 
+ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count)
+@@ -341,8 +342,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
+         const u32 lane = ((method - M_VP_UPLOAD_INST) >> 2) & 3;
+         u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+         const u32 pos = *load * 4 + lane;
+-        if (pos < RSX_DSP_VP_WORDS)
++        if (pos < RSX_DSP_VP_WORDS) {
+             rsx->vp[pos] = arg;
++            rsx->vp_gen++;
++        }
+         if (lane == 3)
+             (*load)++;
+         return;
+diff --git a/libs/video/rsx_dispatch.h b/libs/video/rsx_dispatch.h
+index 060e03a6..61e624e6 100644
+--- a/libs/video/rsx_dispatch.h
++++ b/libs/video/rsx_dispatch.h
+@@ -118,6 +118,7 @@ struct rsx_dispatch {
+     u32 vp[RSX_DSP_VP_WORDS];         /* transform (vertex) program words   */
+     u32 constants[RSX_DSP_NUM_CONSTANTS][4]; /* vec4 f32 bit patterns       */
+     u32 const_gen;                    /* bumped by every constants[] write  */
++    u32 vp_gen;                       /* bumped by every vp[] write         */
+ 
+     rsx_dispatch_sink sink;
+ 
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index ad85f8b1..14186410 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -58,6 +58,9 @@ extern u32 ppu_vm_size;
+ #define ENG_MAX_SURFACE_DIM 8192u
+ 
+ #define ENG_VP_CB_BYTES    ((RSX_DSP_NUM_CONSTANTS + 2) * 16u)
++/* While bind_vs_constants runs: how many leading bytes of the block the
++ * program reads (the 32-byte viewport tail always counts); 0 = all. */
++u32 g_rsx_eng_vs_prefix;
+ #define ENG_FP_MAX_BYTES   0x10000u
+ 
+ #define M_ALPHA_TEST_ENABLE   0x0304
+@@ -3110,10 +3113,29 @@ static void sink_end(void* user, const rsx_dispatch* r)
+      * what it was given last. It was copied and compared per draw. */
+     static u32 s_vp_gen = ~0u;
+     static float s_vp_xf[8];
++    /* Of the 512 constants only those the program names are compared and
++     * copied (rsx_vp_analyze_constants; all of them for a relative read):
++     * Killzone 2 changed a constant before ~800 of its ~1,400 draws a frame
++     * and moved the whole 8 KB block four times for each. Rows 0..3 at least,
++     * for the fixed-function VS. s_vp_cn: how many the backend was given
++     * with the current const_gen; a program that reads more refreshes it. */
++    static u32 s_cn_vpgen = ~0u, s_cn_start = ~0u, s_cn = RSX_DSP_NUM_CONSTANTS, s_vp_cn = 0;
++    {   const u32 start = rsx_dsp_vp_start(&g.rsx);
++        if (g.rsx.vp_gen != s_cn_vpgen || start != s_cn_start) {
++            u32 n = RSX_DSP_NUM_CONSTANTS;
++            if (start >= RSX_DSP_VP_INSTR ||
++                !rsx_vp_analyze_constants((const u8*)(g.rsx.vp + start * 4),
++                                          (RSX_DSP_VP_INSTR - start) * 16u, &n))
++                n = RSX_DSP_NUM_CONSTANTS;
++            s_cn = n < 4u ? 4u : n;
++            s_cn_vpgen = g.rsx.vp_gen; s_cn_start = start;
++        }
++    }
++    const u32 cn = s_cn;
+     const int vp_same = s_vp_gen == g.rsx.const_gen && !memcmp(s_vp_xf, xf, sizeof xf) &&
+-                        s_vp_gen != ~0u;
++                        s_vp_gen != ~0u && s_vp_cn >= cn;
+     if (!vp_same) {
+-        memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
++        memcpy(g.vp_cb, g.rsx.constants, cn * 16u);
+         memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+     }
+ 
+@@ -3169,8 +3191,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
+     g.be->bind_pipeline(g.be->user, pipeline);
+     if (!vp_same) {                 /* recorded only once the backend has them */
++        g_rsx_eng_vs_prefix = cn * 16u;
+         g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
++        g_rsx_eng_vs_prefix = 0;
+         s_vp_gen = g.rsx.const_gen;
++        s_vp_cn = cn;
+         memcpy(s_vp_xf, xf, sizeof xf);
+     }
+     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
+diff --git a/libs/video/rsx_vp_decompiler.c b/libs/video/rsx_vp_decompiler.c
+index edd01d68..7ec19131 100644
+--- a/libs/video/rsx_vp_decompiler.c
++++ b/libs/video/rsx_vp_decompiler.c
+@@ -263,6 +263,27 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
+     return instrs;
+ }
+ 
++int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes, u32* count)
++{
++    if (!ucode || !count) return 0;
++    u32 n = 0;
++    for (u32 off = 0; off + 16 <= max_bytes; off += 16) {
++        const u32 d1 = rd_le(ucode + off + 4);
++        const u32 d2 = rd_le(ucode + off + 8);
++        const u32 d3 = rd_le(ucode + off + 12);
++        const u32 src0 = ((d2 >> 23) & 0x1FF) | ((d1 & 0xFF) << 9);
++        const u32 src1 = (d2 >> 6) & 0x1FFFF;
++        const u32 src2 = ((d3 >> 21) & 0x7FF) | ((d2 & 0x3F) << 11);
++        if ((src0 & 3u) == 3u || (src1 & 3u) == 3u || (src2 & 3u) == 3u) {
++            if ((d3 >> 1) & 1u) return 0;               /* vp_c[(c + aN) & 511] */
++            const u32 c = ((d1 >> 12) & 0x3FF) & 511u;  /* as emit_src reads it */
++            if (c + 1u > n) n = c + 1u;
++        }
++        if (d3 & 1u) { *count = n; return 1; }
++    }
++    return 0;
++}
++
+ static int rsx_vp_decompile_impl(
+     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
+     u32 input_mask, char* out, u32 out_size);
+diff --git a/libs/video/rsx_vp_decompiler.h b/libs/video/rsx_vp_decompiler.h
+index ecc53fce..40ec41e1 100644
+--- a/libs/video/rsx_vp_decompiler.h
++++ b/libs/video/rsx_vp_decompiler.h
+@@ -37,6 +37,12 @@ typedef struct rsx_vp_input_analysis {
+ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
+                           rsx_vp_input_analysis* analysis);
+ 
++/* The transform constants the program reads: *count = one past the highest
++ * constant it names (any source field of constant type counts, used or not).
++ * Returns 0 -- read all of them -- when that is not known: a relative
++ * (address-register) constant read, or no end bit within max_bytes. */
++int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes, u32* count);
++
+ /* Decompile an NV40 vertex program into an HLSL vertex shader.
+  *   ucode    : VP bytecode (little-endian words, as in RPCS3's shader cache).
+  *   max_bytes: safety bound.
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index a0af18ec..5c0c0af6 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3365,6 +3365,7 @@ static struct {
+     u32          scratch_w, scratch_h;
+     u32          pipeline;
+     u32          vs_bytes, ps_bytes;
++    u32          vs_pre;      /* leading bytes of vs_data that are current (+ the 32-byte tail) */
+     u32          tex[RSX_BE_MAX_TEXTURES];
+     rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES];
+     u32          tex_mask;
+@@ -3755,9 +3756,18 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
+     if (!s_g.on || !data) { s_e2.vs_bytes = 0; return; }
+     const u32 cap = (u32)sizeof s_e2.vs_data;
+     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
+-    if (bytes == s_e2.vs_bytes && s_e2.vs_gen && !memcmp(s_e2.vs_data, data, bytes)) return;
+-    memcpy(s_e2.vs_data, data, bytes);
++    /* Only the constants the program reads (g_rsx_eng_vs_prefix) and the
++     * viewport tail are compared and kept; the shader reads nothing else. */
++    extern u32 g_rsx_eng_vs_prefix;
++    const u32 tail = bytes >= 32u ? 32u : 0u;
++    const u32 pre = (g_rsx_eng_vs_prefix && g_rsx_eng_vs_prefix < bytes - tail) ? g_rsx_eng_vs_prefix : bytes - tail;
++    const u8* d = (const u8*)data;
++    if (bytes == s_e2.vs_bytes && s_e2.vs_gen && pre <= s_e2.vs_pre && !memcmp(s_e2.vs_data, d, pre) &&
++        !memcmp(s_e2.vs_data + bytes - tail, d + bytes - tail, tail)) return;
++    memcpy(s_e2.vs_data, d, pre);
++    memcpy(s_e2.vs_data + bytes - tail, d + bytes - tail, tail);
+     s_e2.vs_bytes = bytes;
++    s_e2.vs_pre = pre;
+     s_e2.vs_gen = 0;
+ }
+ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
+@@ -4130,9 +4140,13 @@ static void vk_eng_draw_k(rsx_topology topology, u64 vkey, const void* vertices,
+     }
+     if (s_e2.vs_gen != s_b.gen + 1u) {
+         s_e2.vs_off = vk_ring_alloc(vsb);
+-        memcpy((u8*)s_b.ring.ptr + s_e2.vs_off, s_e2.vs_data, vsb);
++        /* the slot is the full block; only its live parts are written */
++        const u32 tail = (s_e2.vs_bytes >= 32u && s_e2.vs_pre && s_e2.vs_pre + 32u <= vsb) ? 32u : 0u;
++        const u32 pre = tail ? s_e2.vs_pre : vsb;
++        memcpy((u8*)s_b.ring.ptr + s_e2.vs_off, s_e2.vs_data, pre);
++        if (tail) memcpy((u8*)s_b.ring.ptr + s_e2.vs_off + vsb - tail, s_e2.vs_data + vsb - tail, tail);
+         s_e2.vs_gen = s_b.gen + 1u;
+-        s_ring_vsc += vsb;
++        s_ring_vsc += pre + tail;
+     }
+     if (s_e2.ps_gen != s_b.gen + 1u) {
+         s_e2.ps_off = vk_ring_alloc(psb);
+diff --git a/tools/lift_jobmods.py b/tools/lift_jobmods.py
+index c5b317c8..9885c0b8 100644
+--- a/tools/lift_jobmods.py
++++ b/tools/lift_jobmods.py
+@@ -195,6 +195,9 @@ def main():
+         inside += [hex(a) for a in switch_table_targets(raw)]
+         if inside:
+             cmd += ["--extra-funcs", ",".join(inside)]
++        # JOBMOD_LIFTER_ARGS: extra spu_lifter.py options for every module
++        # (e.g. --merge-chunks).
++        cmd += os.environ.get("JOBMOD_LIFTER_ARGS", "").split()
+         r = subprocess.run(cmd, capture_output=True, text=True)
+         if r.returncode != 0:
+             print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)

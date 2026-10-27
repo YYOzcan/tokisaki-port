@@ -1554,3 +1554,63 @@ second remain, none per packet.
 Measured and not kept: the lifted SPU code with `-fstrict-aliasing` (code
 size and thread-local reloads unchanged), and MangoHud off (it is enabled
 system-wide here; no change in frame rate).
+
+## 64. The relay, measured; more SPUs for the other workloads; what did not help
+
+Desktop, Corinth River from `run_bench_tpl/`, 160 s runs, the mean of the
+last 14 five-second windows (~±0.5 frames/s between runs).
+
+**The frame.** Per 5 s (`PS3RECOMP_VK_SUBMIT_STATS=1`): ~90,000 draws in
+~19,000 render passes (~1,400 draws and ~300 passes a frame), 6.9 GB through
+the batch ring (vertices 533 MB, indices 316 MB, VS constants 438 MB). The
+FIFO thread is ~31% busy; `KZ2_RSX_TIMES`: drain ~48%, parked ~52%. A 1 ms
+timeline (`kzprof_timeline.py NAME 8000 170 1`) shows the relay of section
+59 plainly: while the FIFO thread draws, most SPU workers are idle; while it
+is parked, the post-processing chain runs -- `e569adaf4ffe`, `a27e818cca34`
+on four SPUs, then `9935c8f700db` and `78f2ef397e8f` **one after the other on
+one SPU** (~25 ms). Gdb samples of the main thread: half in its own code, a
+quarter in `sys_cond_wait` under `func_004EED70` (the Havok step), and in
+`func_004D3D00`, which waits for a job counter with `sys_timer_usleep(1)`.
+
+**More SPUs for the other workloads** (`boot_main.cpp`, default
+`SPURS_MAXCONT=0:6,2:6,3:6,4:6,5:6,7:4,8:6,9:6`): the title limits most of
+its workloads to fewer SPUs than it has; raised, their jobs run side by side.
+`SPURS_PM_STATS=1` per 5 s: w7 (jm_post) ~5.9 s of SPU time, w3 ~3.0 s, w8
+~2.0, w4 ~1.5, w5 ~1.0, w9 ~0.8. Frame rate: 13.53 / 13.45 with `7:4`;
+7:4 + 8:4 13.74; all others at 4: 14.27, 14.73; all at 6 including jm_post:
+14.31; **jm_post at 4, the others at 6: 15.53, 14.56, 14.59**.
+`SPURS_MAXCONT=7:4` restores the old behaviour.
+
+**VS constants by what the program reads** (patch 0039): before ~800 of the
+~1,400 draws a frame a constant changed, and the engine then copied all 514
+vec4 (8 KB) into its block, the backend compared and copied them, and the
+draw copied them into the ring. `rsx_vp_analyze_constants` names the
+highest constant a program reads (any constant-type source field counts;
+a relative `a0` read or a missing end bit means all 512); only that prefix
+and the viewport tail are compared and written, the ring slot stays full
+size so the shader layout does not change, and a program that reads more
+than was last written refreshes it (`vp_gen`, bumped by every transform
+program word, keys the analysis). VS constants through the ring 438 -> 275 MB
+per 5 s (skinned meshes index their bones, so they still take all); frame
+dumps unchanged; no frame-rate change measurable.
+
+**Tried and not kept**, all within noise or worse:
+- FIFO drain every 200 us (`KZ2_DRAIN_US=200`): parked stays ~50% -- the
+  parks wait for SPU work, not for the next poll.
+- SPURS kernel pass every 250 us: 12.4-13.0, worse, as on the laptop.
+- 1 us timer slack for every thread (`KZ2_TIMER_SLACK_NS`, kept as an
+  opt-in): 13.1 vs 13.7.
+- the main thread's progress wait sleeping after 4,096 passes
+  (`KZ2_SPIN_SLEEP_US=20|50`, opt-in): 13.46 / 13.43 vs 13.53.
+- **`--merge-chunks` for the job modules** (`JOBMOD_LIFTER_ARGS`, patch
+  0039): the SPU lifter splits loops at every branch target, so e.g.
+  `73d064721abc`'s bit-unpacking loop (`0x6254` body, `0x6280` test) returns
+  to the drain loop twice per iteration. Lifted with merged chunks (gotos
+  77 -> 928 in that module), the drain then resumed at a lifted entry
+  millions of times (`[spu] drain-resume return_pc=0x032C0 at lifted entry
+  0x06E90`, 31 M lines -- past its own 8-line cap) and the frame rate fell to
+  10. Not understood yet; the default lift is back. Splitting less is still
+  the largest unclaimed SPU saving.
+- PGO from this scene (`KZ2_PGO=10000,10700`, merged 2:1 with the laptop's
+  New Sun profile into `pgo/spu.profdata`): `a27e818cca34` 35.1 -> 33.2 ms;
+  kept.

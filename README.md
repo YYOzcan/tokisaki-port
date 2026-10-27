@@ -6,8 +6,8 @@
 
 > [!WARNING]
 > **Work in progress — playable only in a limited sense.**
-> The campaign starts, the opening cutscene on *The New Sun* plays and you can play the first level with keyboard and mouse or a controller, with sound — at **~13-14 frames/s** (Radeon 680M, laptop in power-saver; the game advances at most 1/15 s per frame, so its clock runs at ~90% of real time and at full speed from 15 frames/s). The level start can still stop during the load now and then. Details below and in docs/PROGRESS.md §40-57.
-> **Devam eden bir çalışma — ancak sınırlı anlamda oynanabilir.** Kampanya başlıyor, *The New Sun* açılış sinematiği oynuyor ve ilk bölüm klavye+fare ya da kontrolcüyle, sesli olarak oynanabiliyor: **~13-14 kare/s** (Radeon 680M, dizüstü güç tasarrufu modunda; oyun kare başına en fazla 1/15 s ilerlediği için saati gerçek zamanın ~%90'ı hızında akıyor, 15 kare/s'den itibaren tam hızda). Bölüm yüklenirken ara sıra hâlâ takılabiliyor.
+> The campaign starts, the opening cutscene on *The New Sun* plays and you can play the first level with keyboard and mouse or a controller, with sound — at **~13-14 frames/s** (Radeon 680M, laptop in power-saver; the game advances at most 1/15 s per frame, so its clock runs at ~90% of real time and at full speed from 15 frames/s). The level start can still stop during the load now and then. On a desktop (Ryzen 5 5600, RTX 3060, `KZ2_MAX=1` build) the Corinth River battle after the prologue runs at **~14-15 frames/s**. Details below and in docs/PROGRESS.md §40-64.
+> **Devam eden bir çalışma — ancak sınırlı anlamda oynanabilir.** Kampanya başlıyor, *The New Sun* açılış sinematiği oynuyor ve ilk bölüm klavye+fare ya da kontrolcüyle, sesli olarak oynanabiliyor: **~13-14 kare/s** (Radeon 680M, dizüstü güç tasarrufu modunda; oyun kare başına en fazla 1/15 s ilerlediği için saati gerçek zamanın ~%90'ı hızında akıyor, 15 kare/s'den itibaren tam hızda). Bölüm yüklenirken ara sıra hâlâ takılabiliyor. Masaüstünde (Ryzen 5 5600, RTX 3060, `KZ2_MAX=1` derlemesi) prolog sonrasındaki Corinth River çatışması **~14-15 kare/s**.
 >
 > Built on [ps3recomp](https://github.com/sp00nznet/ps3recomp); the boot harness is adapted from [Kurtisone/twistedmetal](https://github.com/Kurtisone/twistedmetal). Developed with an AI coding agent. See [CREDITS.md](CREDITS.md).
 
@@ -81,7 +81,9 @@ tools/play.sh
 | Arrow keys / Ok tuşları | D-pad | | Tab | SELECT |
 | F1 | release / recapture the mouse | | | |
 
-An SDL game controller also works. On a hybrid laptop the integrated GPU is
+An SDL game controller also works. `tools/install_desktop_entry.sh` adds
+*Killzone 2* to the application menu (it runs `tools/play.sh`; with Tk
+installed, `KZ2_ENTRY=launcher` makes it open `tools/launcher.py`). On a hybrid laptop the integrated GPU is
 used by default (`KZ2_GPU=dgpu tools/play.sh` for the discrete one);
 `PS3_PAD_MOUSE_SENS` sets the look speed.
 
