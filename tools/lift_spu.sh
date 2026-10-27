@@ -39,6 +39,10 @@ PYEOF
 # runtime's SPU_INTERP_ENTRY_LOG=1 (they ran in the fallback interpreter --
 # the post-processing module 9de83b69cfa0 spent most of its time there).
 export JOBMOD_EXTRA_FUNCS="${JOBMOD_EXTRA_FUNCS:-9de83b69cfa0:0x4600,0x5300,0x8808}"
+# Lifted with merged chunks (one C function per run of chunks, loops as gotos):
+# 73d064721abc's hot loop spans five chunks, and as trampolines it was the
+# costliest job of Corinth River. Merging every module livelocks (PROGRESS 65).
+export JOBMOD_MERGE="${JOBMOD_MERGE-73d064721abc}"
 "${PY}" -I "${T}/lift_jobmods.py" --jobmods "${OUT}/jobmods" --out "${SPU}" \
     --register "${SPU}/jobmods_register.c" --symbol-prefix kz2
 

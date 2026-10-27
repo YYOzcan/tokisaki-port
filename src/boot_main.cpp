@@ -731,6 +731,15 @@ int main(int argc, char** argv)
      * turns every in-level frame black. Until it does, the engine substitutes
      * an identity curve (docs/PROGRESS.md section 28). */
     setenv("RSX_ZERO_LUT_IDENTITY", "1", 0);
+    /* No depth-of-field / motion-blur layer: the SPU post-processing output
+     * the last screen pass lays over the frame (640x360 A8R8G8B8 at main
+     * memory offset 0x0177D200) comes out fully opaque everywhere -- the motion
+     * vectors in the G-buffer are a screen-wide gradient with the camera at
+     * rest -- so the whole picture was that blurred layer. Read as transparent
+     * black, the frame is the sharp scene plus its bloom (PROGRESS 68).
+     * KZ2_POST_BLUR=1 keeps the layer. */
+    if (!(getenv("KZ2_POST_BLUR") && getenv("KZ2_POST_BLUR")[0] == '1'))
+        setenv("RSX_ZERO_TEXTURE", "1:0x0177D200", 0);
     /* In the level the frame is gated by jm_post (workload 7), the SPU
      * post-processing job list. Its policy module keeps running while it has
      * jobs instead of returning to the kernel after each one (KZ3 fix list

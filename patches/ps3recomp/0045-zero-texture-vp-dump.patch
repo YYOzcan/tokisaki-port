@@ -1,0 +1,102 @@
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+index ee9cb254..eee77164 100644
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -366,7 +366,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
+         { static int lo = -2, hi = 0, n = 0;
+           if (lo == -2) { const char* e = getenv("RSX_CONST_LOG"); lo = -1;
+                           if (e) sscanf(e, "%d,%d", &lo, &hi); }
+-          if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && n < 400) { n++;
++          if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && n < 4000000) { n++;
+               fprintf(stderr, "[const-load] c[%u].%c = 0x%08X (method 0x%04X id=%u)\n", slot,
+                       "xyzw"[word & 3], arg, method, rsx->regs[M_VP_UPLOAD_CONST_ID >> 2]); } }
+         return;
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 14186410..cb184006 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -966,6 +966,30 @@ static int eng_staging_reserve(u32 bytes)
+ 
+ /* Decode a guest texture out of guest memory and hand every face and level to
+  * the backend. Returns the backend handle, or 0. */
++/* RSX_ZERO_TEXTURE="<location>:<offset>[,...]": textures read from those
++ * addresses decode as transparent black. Killzone 2's last screen pass lays
++ * the SPU post-processing layer (depth of field and motion blur, premultiplied,
++ * 640x360 in main memory) over the frame with ONE / ONE_MINUS_SRC_ALPHA; with
++ * that layer zero the frame is the sharp scene plus its bloom. */
++static int eng_tex_zeroed(u32 location, u32 offset)
++{
++    static int n = -1; static u32 loc[8], off[8];
++    if (n < 0) {
++        n = 0;
++        const char* e = getenv("RSX_ZERO_TEXTURE");
++        while (e && *e && n < 8) {
++            char* q; const unsigned long l = strtoul(e, &q, 0);
++            if (*q != ':') break;
++            const unsigned long o = strtoul(q + 1, &q, 0);
++            loc[n] = (u32)l; off[n] = (u32)o; n++;
++            e = (*q == ',') ? q + 1 : q;
++            if (!*q) break;
++        }
++    }
++    for (int i = 0; i < n; i++) if (loc[i] == location && off[i] == offset) return 1;
++    return 0;
++}
++
+ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                               u32 levels, u32 pitch, int cube, u32 remap)
+ {
+@@ -994,6 +1018,8 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+             rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
+                                face + lv[m].offset, lv[m].w, lv[m].h, tl,
+                                rsx_texture_argb_is_rgba());
++            if (eng_tex_zeroed(location, offset))
++                memset(g.tex_staging, 0, (size_t)tl->dst_row_bytes * tl->rows);
+             g.be->texture_upload(g.be->user, handle, f, m, lv[m].w, lv[m].h,
+                                  g.tex_staging, tl->dst_row_bytes, tl->rows);
+         }
+@@ -1029,6 +1055,8 @@ static int eng_texture_reupload(u32 handle, u32 location, u32 offset, u32 fmt, u
+             rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
+                                face + lv[m].offset, lv[m].w, lv[m].h, tl,
+                                rsx_texture_argb_is_rgba());
++            if (eng_tex_zeroed(location, offset))
++                memset(g.tex_staging, 0, (size_t)tl->dst_row_bytes * tl->rows);
+             g.be->texture_upload(g.be->user, handle, f, m, lv[m].w, lv[m].h,
+                                  g.tex_staging, tl->dst_row_bytes, tl->rows);
+         }
+@@ -1686,6 +1714,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+             if ((f = fopen(path, "w"))) { fputs(s_vs_hlsl, f); fclose(f); }
+             snprintf(path, sizeof path, "%s/pipe%u.ps.hlsl", dir, handle);
+             if ((f = fopen(path, "w"))) { fputs(s_ps_hlsl, f); fclose(f); }
++            if (!fixed && vp_uc && vp_instrs) {   /* the guest vertex program's ucode */
++                snprintf(path, sizeof path, "%s/pipe%u.vp.bin", dir, handle);
++                if ((f = fopen(path, "wb"))) { fwrite(vp_uc, 16, vp_instrs, f); fclose(f); }
++            }
+             if (!fixed && fp_uc && fp_size) {
+                 u32 fp_loc = 0;
+                 const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
+@@ -3250,7 +3282,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+             for (u32 j = 0; j < nf && j < 24; j++) fprintf(s_pd.draws_log, " %g", fv[k * nf + j]);
+             fprintf(s_pd.draws_log, "\n");
+         }
+-        static const u32 vc[] = { 0, 1, 2, 3, 4, 5, 6, 7, 466, 467 };
++        static const u32 vc[] = { 0, 1, 2, 3, 4, 5, 6, 7, 25, 26, 27, 28, 466, 467 };
+         fprintf(s_pd.draws_log, "    vpc:");
+         for (u32 k = 0; k < sizeof vc / sizeof vc[0]; k++) {
+             const float* c = (const float*)g.rsx.constants[vc[k]];
+diff --git a/tools/lift_jobmods.py b/tools/lift_jobmods.py
+index 9885c0b8..e87ad05d 100644
+--- a/tools/lift_jobmods.py
++++ b/tools/lift_jobmods.py
+@@ -198,6 +198,11 @@ def main():
+         # JOBMOD_LIFTER_ARGS: extra spu_lifter.py options for every module
+         # (e.g. --merge-chunks).
+         cmd += os.environ.get("JOBMOD_LIFTER_ARGS", "").split()
++        # JOBMOD_MERGE="<sha>[,<sha>...]": --merge-chunks for those modules
++        # only (merging every module livelocks one of them; see the port's
++        # docs/PROGRESS.md).
++        if sha in [m.strip() for m in os.environ.get("JOBMOD_MERGE", "").split(",") if m.strip()]:
++            cmd.append("--merge-chunks")
+         r = subprocess.run(cmd, capture_output=True, text=True)
+         if r.returncode != 0:
+             print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)

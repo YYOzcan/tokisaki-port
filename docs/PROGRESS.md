@@ -1728,3 +1728,40 @@ the ±0.5 noise of one run -- they add up (13.5 this morning with the
 title's SPURS limits, 15.1 now). A CPU with more cores runs it faster
 (the laptop's eight did 17.9 at The New Sun). 30 frames/s on six cores
 needs the ~390 ms of CPU a frame halved; the SPU job code is ~200 ms of it.
+
+## 68. The blur: a depth-of-field / motion-blur layer that covered everything
+
+The in-level picture was blurred end to end. Pass dumps of one frame
+(`RSX_ENGINE_PASS_DUMP=<dir> RSX_ENGINE_PASS_DUMP_AFTER=110`,
+`docs/media/corinth-river-blur-passes.png`): the scene is sharp after the
+MSAA resolve (pass 15, `0x00394000`) and after the quarter-resolution smoke
+and fog are laid on it (pass 20); the last screen pass (pipe 163) makes it
+blurred. Its fragment program: `out.rgb = layer.rgb + bloom.rgb * c1 +
+dither`, `out.a = layer.a`, blended ONE / ONE_MINUS_SRC_ALPHA -- `layer` is
+the SPU post-processing output (640x360 A8R8G8B8 in main memory, IO offset
+`0x0177D200`, premultiplied depth of field and motion blur), `bloom` the
+160x90 one. The layer's alpha is 0xFF everywhere (first texels
+`FFC69366 FFC79367`), so the frame was the layer.
+
+Upstream of it, the G-buffer's fourth target (`0x016B0000`, motion
+vectors in R/G as in Guerrilla's 2007 G-buffer) is a screen-wide red-yellow-
+green gradient with the camera at rest. The vertex programs compute the
+previous clip position as `c[25..28] * (v0.xyz - v12.xyz, v0.w - c[467].x)`
+(ucode verified: instruction 7 is `MOV r0.w, c[467].x`) and the fragment
+program `motion = (ndc - prev.xy/prev.w) / 2 + 0.5`. Most G-buffer draws see
+`c[467] = (0, -1, 1, n)`, but one pipeline's 469 draws see `(640, 360, 640,
+360)`, and `c[25..28]` (uploaded in bursts at id 25, a quarter as often as
+`c[0..3]`) differs from the current transform by far more than a camera at
+rest allows. Which of these is wrong -- or whether the SPU job reads the
+vectors in another order -- is open.
+
+**Fix for now** (patch 0045, `boot_main.cpp`): `RSX_ZERO_TEXTURE=<loc>:<off>`
+makes the engine decode a texture at that address as transparent black;
+boot_main sets it for the layer, so the frame is the sharp scene plus its
+bloom (`docs/media/corinth-river-no-blur.png`). `KZ2_POST_BLUR=1` keeps the
+layer. Also in 0045: `RSX_ENGINE_SHADER_DUMP` writes the vertex program's
+ucode (`.vp.bin`), the pass dump's `vpc:` line has `c[25..28]`, and
+`RSX_CONST_LOG` logs up to 4 M uploads.
+
+Still visible: smoke drawn as hard black-and-white blotches, a dark disc in
+the sky, and the colour grading (the LUT of section 28) is still identity.
