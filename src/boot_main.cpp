@@ -88,6 +88,7 @@ int  cellGcm_take_flip_pending_synced(void);
 void cellGcm_complete_flip_now(void);
 /* present only in a -fprofile-generate build (KZ2_SPU_PGO=gen) */
 extern "C" int  __llvm_profile_write_file(void) __attribute__((weak));
+extern "C" int  g_spu_skip_marked;      /* ps3recomp spu_drain.c */
 extern "C" void __llvm_profile_reset_counters(void) __attribute__((weak));
 extern volatile unsigned g_spurs_pm_cur_wid, g_spurs_pm_cur_lane;   /* spurs_policy.c */
 extern volatile unsigned long long g_spurs_pm_cur_since;
@@ -738,15 +739,25 @@ int main(int argc, char** argv)
      * rest -- so the whole picture was that blurred layer. Read as transparent
      * black, the frame is the sharp scene plus its bloom (PROGRESS 68).
      * KZ2_POST_BLUR=1 keeps the layer. */
-    if (!(getenv("KZ2_POST_BLUR") && getenv("KZ2_POST_BLUR")[0] == '1'))
+    if (!(getenv("KZ2_POST_BLUR") && getenv("KZ2_POST_BLUR")[0] == '1')) {
         setenv("RSX_ZERO_TEXTURE", "1:0x0177D200", 0);
-    /* Z16 depth read as an X16 texture through guest memory, not built on the
-     * GPU: the quarter-resolution scene depth the soft particles fade against
-     * (0x02D30000, an address the shadow maps share) came out wrong on the GPU
-     * path -- smoke as hard black-and-white quads, white blocks over distant
-     * buildings, a dark disc in the sky (PROGRESS 70). Bits: 1 D24S8 as ARGB8,
-     * 2 Z16 as X16, 4 RGBA8 as Y16_X16_FLOAT. */
-    setenv("RSX_GPU_REINTERPRET_MASK", "5", 0);
+        /* ...and the two SPU jobs that build it (e569adaf4ffe, then
+         * a27e818cca34 on four SPUs, ~12 ms of every frame) skip their
+         * kernels: the entries tools/lift_spu.sh marks --skippable-funcs
+         * return at once, the jobs still take their buffers and write the
+         * (now unread) layer, so the job manager's bookkeeping is unchanged
+         * (PROGRESS 71). SPU_SKIP_MARKED=0 runs the kernels anyway. */
+        const char* sk = getenv("SPU_SKIP_MARKED");
+        g_spu_skip_marked = !(sk && sk[0] == '0');
+    }
+    /* Targets read in another format are built on the GPU (bits: 1 D24S8 as
+     * ARGB8, 2 Z16 as X16, 4 RGBA8 as Y16_X16_FLOAT). The quarter-resolution
+     * depth the soft particles fade against is sampled while it is the bound
+     * zeta and keeps the guest-memory round trip (PROGRESS 70, 71); the shadow
+     * maps at the same address take the GPU path, two GPU waits a frame
+     * fewer. RSX_GPU_REINTERPRET_MASK=5 sends every Z16 read through guest
+     * memory as before. */
+    setenv("RSX_GPU_REINTERPRET_MASK", "7", 0);
     /* In the level the frame is gated by jm_post (workload 7), the SPU
      * post-processing job list. Its policy module keeps running while it has
      * jobs instead of returning to the kernel after each one (KZ3 fix list

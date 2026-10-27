@@ -32,7 +32,7 @@ assets/
 
 # Game-derived generated code and runtime state (never commit)
 recompiled/
-spu_recompiled/
+spu_recompiled*/
 out/
 run/
 logs/

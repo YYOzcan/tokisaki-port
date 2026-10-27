@@ -1,0 +1,367 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index cb184006..0ccc5ef4 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -120,6 +120,7 @@ typedef struct {
+     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
+     u32 used_w, used_h;    /* the clip that write went through              */
+     int wb_pending;        /* sampled through the GPU path: guest copy owed  */
++    u64 dbg_hash; u32 dbg_w, dbg_h;   /* RSX_Z16_LOG: guest bytes as last stored */
+ } eng_zdepth;
+ 
+ typedef struct {
+@@ -1206,9 +1207,18 @@ void rsx_draw_engine_flush_main_targets(void)
+     static int en = -1;
+     if (en < 0) { const char* e = getenv("RSX_MAIN_TARGET_WB"); en = e ? atoi(e) : 1; }
+     if (!en || !g.ready || !g.be->readback) return;
++    static int wlog = -1;
++    if (wlog < 0) { const char* e = getenv("RSX_MAIN_WB_LOG"); wlog = e ? atoi(e) : 0; }
+     for (u32 i = 0; i < g.n_surfaces; i++) {
+         const eng_surface* s = &g.surfaces[i];
+-        if (s->handle && s->location == 1 && s->guest_dirty) eng_surface_writeback(i);
++        if (s->handle && s->location == 1 && s->guest_dirty) {
++            if (wlog > 0) {
++                wlog--;
++                fprintf(stderr, "[rsx engine] main target writeback 0x%08X fmt %u %ux%u pitch %u\n",
++                        s->offset, (unsigned)s->fmt, s->w, s->h, s->pitch);
++            }
++            eng_surface_writeback(i);
++        }
+     }
+     eng_zdepth_flush_owed();
+ }
+@@ -1237,6 +1247,18 @@ static int eng_surface_to_guest(u32 slot)
+ static float* s_depth_rows;
+ static u32 s_depth_cap;
+ 
++/* RSX_Z16_LOG: FNV-1a of a Z16 target's guest rows. */
++u64 eng_z16_hash(u32 loc, u32 off, u32 pitch, u32 w, u32 h)
++{
++    u64 x = 1469598103934665603ull;
++    for (u32 r = 0; r < h; r++) {
++        const u8* p = (const u8*)eng_guest_ptr(NULL, loc, off + r * pitch, w * 2u);
++        if (!p) return 0;
++        for (u32 c = 0; c < w * 2u; c++) x = (x ^ p[c]) * 1099511628211ull;
++    }
++    return x;
++}
++
+ /* Store a depth target into guest memory as its zeta format lays it out:
+  * Z16 as one big-endian 16-bit value, Z24S8 as a big-endian word with the
+  * depth in the top 24 bits. The stencil byte is written as 0: the host depth
+@@ -1298,6 +1320,9 @@ static int eng_zdepth_to_guest(u32 slot)
+     }
+     z->guest_dirty = 0;
+     eng_textures_touch(z->location, z->offset, z->pitch * h);
++    { extern u64 eng_z16_hash(u32 loc, u32 off, u32 pitch, u32 w, u32 h);
++      static int zl = -1; if (zl < 0) zl = getenv("RSX_Z16_LOG") ? 1 : 0;
++      if (zl && bpp == 2u) { z->dbg_hash = eng_z16_hash(z->location, z->offset, z->pitch, w, h); z->dbg_w = w; z->dbg_h = h; } }
+     if (eng_coherence_log())
+         fprintf(stderr, "[rsx engine] depth 0x%08X (%s, pitch %u) %ux%u stored to guest memory\n",
+                 z->offset, bpp == 2u ? "Z16" : "Z24S8", z->pitch, w, h);
+@@ -2514,6 +2539,16 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+               if (lg > 0) { lg--; const eng_zdepth* z = &g.zdepths[zsrc];
+                 fprintf(stderr, "[rsx engine] depth via guest: unit %u tex fmt %02X %ux%u pitch %u, zeta fmt %u %ux%u at %u:0x%08X\n",
+                         u, base_fmt, t.width, t.height, t.pitch, z->zfmt, z->w, z->h, t.location, t.offset); } }
++            { static int zl = -1; if (zl < 0) { const char* e = getenv("RSX_Z16_LOG"); zl = e ? atoi(e) : 0; }
++              if (zl > 0 && (base_fmt == 0x92u || base_fmt == 0x94u)) { zl--; const eng_zdepth* z = &g.zdepths[zsrc];
++                u32 same = 0; for (u32 i = 0; i < g.n_zdepths; i++) same += g.zdepths[i].location == t.location && g.zdepths[i].offset == t.offset;
++                extern u64 eng_z16_hash(u32 loc, u32 off, u32 pitch, u32 w, u32 h);
++                const int changed = !z->guest_dirty && z->dbg_w &&
++                    eng_z16_hash(t.location, t.offset, z->pitch, z->dbg_w, z->dbg_h) != z->dbg_hash;
++                fprintf(stderr, "[z16] tex %ux%u pitch %u <- slot %d of %u (current zeta %d): zfmt %u %ux%u pitch %u used %ux%u serial %llu dirty %d guest %s\n",
++                        t.width, t.height, t.pitch, zsrc, same, (int)current_zslot, z->zfmt, z->w, z->h, z->pitch, z->used_w, z->used_h,
++                        (unsigned long long)z->depth_serial, z->guest_dirty,
++                        z->guest_dirty ? "-" : changed ? "CHANGED-since-store" : "as-stored"); } }
+             {
+                 const eng_zdepth* z = &g.zdepths[zsrc];
+                 u32 kind = 0, bpp = 0;
+@@ -2521,8 +2556,46 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+                 else if ((base_fmt == 0x92u || base_fmt == 0x94u) && z->zfmt == 1u) {
+                     kind = RSX_BE_XFORM_DEPTH16_R16; bpp = 2;
+                 }
++                /* A Z16 target sampled while it is the bound zeta (Killzone 2's
++                 * soft particles test against and fade by the same quarter-
++                 * resolution depth) keeps the guest-memory round trip: the
++                 * GPU copy matches it value for value (RSX_XFORM_VERIFY), yet
++                 * PROGRESS 70's glitches were reported gone with it. Shadow
++                 * maps, sampled from another pass, take the GPU path and skip
++                 * a GPU wait each. RSX_Z16_GPU_FEEDBACK=1 builds both. */
++                static int zfb = -1;
++                if (zfb < 0) { const char* e = getenv("RSX_Z16_GPU_FEEDBACK"); zfb = e && e[0] == '1'; }
++                if (kind == RSX_BE_XFORM_DEPTH16_R16 && !zfb && current_zslot == (u32)zsrc) kind = 0;
+                 if (kind && eng_xform_fits(&t, z->pitch, bpp, z->w, z->h)) {
++                    { static int xs = -1; if (xs < 0) { const char* e = getenv("RSX_XFORM_SYNC"); xs = e && e[0] == '1'; }
++                      if (xs && kind == RSX_BE_XFORM_DEPTH16_R16) g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE); }
++                    extern const void* g_vk_xform_last_out;
++                    g_vk_xform_last_out = 0;
+                     const u32 xh = eng_xform_get(kind, &t, z->handle, z->depth_serial);
++                    /* RSX_XFORM_VERIFY=N: the first N Z16 reinterprets that ran,
++                     * compared with the guest-memory round trip of the same
++                     * target, value by value. */
++                    { static int vf = -1; if (vf < 0) { const char* e = getenv("RSX_XFORM_VERIFY"); vf = e ? atoi(e) : 0; }
++                      if (vf > 0 && xh && kind == RSX_BE_XFORM_DEPTH16_R16 && g_vk_xform_last_out) {
++                        vf--;
++                        const u16* out = (const u16*)g_vk_xform_last_out;
++                        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++                        g.zdepths[zsrc].guest_dirty = 1;
++                        eng_zdepth_to_guest((u32)zsrc);
++                        u32 bad = 0, maxd = 0, fx = 0, fy = 0, gv0 = 0, xv0 = 0;
++                        for (u32 r = 0; r < t.height; r++) {
++                            const u8* gp = (const u8*)eng_guest_ptr(NULL, t.location, t.offset + r * t.pitch, t.width * 2u);
++                            if (!gp) break;
++                            for (u32 c = 0; c < t.width; c++) {
++                                const u32 gv = ((u32)gp[2 * c] << 8) | gp[2 * c + 1], xv = out[(size_t)r * t.width + c];
++                                const u32 d = gv > xv ? gv - xv : xv - gv;
++                                if (d > 1) { if (!bad) { fx = c; fy = r; gv0 = gv; xv0 = xv; } bad++; }
++                                if (d > maxd) maxd = d;
++                            }
++                        }
++                        fprintf(stderr, "[xform-verify] Z16 %ux%u at 0x%08X (current zeta %d, slot %d): %u of %u differ, max %u; first (%u,%u) guest %04X gpu %04X\n",
++                                t.width, t.height, t.offset, (int)current_zslot, zsrc, bad, t.width * t.height, maxd, fx, fy, gv0, xv0);
++                      } }
+                     if (xh) {
+                         /* The Z16 guest copy is not stored: each store is
+                          * a GPU wait (~8 a frame in Killzone 2's level) and
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 5c0c0af6..8a6e038e 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3324,8 +3324,11 @@ static u32 vk_eng_reinterpret(void* user, u32 kind, u32 src, u32 w, u32 h, u32 d
+                              .imageExtent = { w, h, 1 } };
+     pvkCmdCopyBufferToImage(s_vk.cmd, s_b.ring.buf, to->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+     vk_op_done();
++    { extern const void* g_vk_xform_last_out;     /* RSX_XFORM_VERIFY (rsx_draw_engine.c) */
++      g_vk_xform_last_out = s_b.ring.ptr ? (const u8*)s_b.ring.ptr + out_off : 0; }
+     return dst;
+ }
++const void* g_vk_xform_last_out;
+ 
+ /* ---- E2: pipelines and draws ---------------------------------------------
+  * A pipeline handle carries the two translated modules and the render state
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 493bf759..382c1826 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -940,6 +940,10 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+         }                                                      \
+     } while (0)
+ 
++/* Set by the title: entries the lift marked --skippable-funcs return at once
++ * (spu_drain.c; SPU_SKIP_MARKED=1 sets it at start too). */
++extern int g_spu_skip_marked;
++
+ /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
+  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
+  * resume / restack unwind) so dispatch to the link register instead -- faithful
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 4f04e8c6..a617dcd3 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -169,6 +169,48 @@ static inline int mfc_is_fence(uint32_t cmd)
+ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                    uint32_t size, uint32_t cmd)
+ {
++    /* SPU_DMA_LOG=<overlay id>[,<max lines>]: every transfer while that job
++     * module is resident (what a job reads and writes, and where). */
++    {
++        static int s_ovl[4] = { -2, -1, -1, -1 }; static int s_max = 0, s_n = 0;
++        if (s_ovl[0] == -2) {
++            const char* e = getenv("SPU_DMA_LOG");     /* <id>[+<id>...][,<max>] */
++            s_ovl[0] = -1;
++            for (int k = 0; e && k < 4; k++) {
++                s_ovl[k] = atoi(e);
++                e = strchr(e, '+'); if (e) e++;
++            }
++            const char* c = getenv("SPU_DMA_LOG") ? strchr(getenv("SPU_DMA_LOG"), ',') : 0;
++            s_max = c ? atoi(c + 1) : 4000;
++        }
++        /* SPU_DMA_RANGE=<lo>:<hi> (EA, hex): every transfer touching it,
++         * whichever image or job module issues it. */
++        static uint64_t s_rlo = 1, s_rhi = 0; static int s_rn = 0; static double s_after = 0;
++        extern double g_spu_t0;     /* spu_drain.c: monotonic seconds at process start */
++        if (s_rlo == 1 && s_rhi == 0) {
++            const char* r = getenv("SPU_DMA_RANGE");     /* <lo>:<hi>[@<seconds from start>] */
++            s_rlo = 0;
++            if (r && strchr(r, ':')) { s_rlo = strtoull(r, 0, 16); s_rhi = strtoull(strchr(r, ':') + 1, 0, 16); }
++            if (r && strchr(r, '@')) s_after = atof(strchr(r, '@') + 1);
++        }
++        double now = 0;
++        if (__builtin_expect(s_rhi != 0, 0) && ea < s_rhi && ea + size > s_rlo && s_rn < 200000 &&
++            ({ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
++               now = t.tv_sec + t.tv_nsec * 1e-9 - g_spu_t0; now >= s_after; })) {
++            s_rn++;
++            fprintf(stderr, "[dma-range] t=%.3f img=%d ovl=%d spu=%u cmd=0x%02X ea=0x%08llX size=%u pc=0x%05X\n",
++                    now, spu->image_id, (int)spu->resident_ovl, (unsigned)spu->spu_id, cmd & 0xFFu,
++                    (unsigned long long)ea, size, (unsigned)(spu->pc & SPU_LS_MASK));
++        }
++        const int ro = (int)spu->resident_ovl;
++        if (__builtin_expect(s_ovl[0] >= 0, 0) && ro > 0 &&
++            (ro == s_ovl[0] || ro == s_ovl[1] || ro == s_ovl[2] || ro == s_ovl[3]) && s_n < s_max) {
++            s_n++;
++            fprintf(stderr, "[dma] ovl=%d spu=%u cmd=0x%02X tag=%u lsa=0x%05X ea=0x%08llX size=%u pc=0x%05X\n",
++                    ro, (unsigned)spu->spu_id, cmd & 0xFFu, spu->mfc_tag & 31u, lsa & SPU_LS_MASK,
++                    (unsigned long long)ea, size, (unsigned)(spu->pc & SPU_LS_MASK));
++        }
++    }
+     /* Upper16 command-channel bits carry replacement/transfer class IDs. */
+     if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {
+         /* CBEA 1.02 section 7.7.3: SDCRZ writes zeros in EA space, without an
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 7417ca09..4d0a15c6 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -7,6 +7,9 @@
+  * place -- later milestones only replace the bodies. */
+ #include "spu_context.h"
+ #include <setjmp.h>
++#include <signal.h>
++#include <stdlib.h>
++#include <time.h>
+ 
+ /* See spu_context.h `irq_frame`. */
+ typedef struct spu_irq_frame {
+@@ -18,6 +21,15 @@ typedef struct spu_irq_frame {
+ 
+ /* Pending cross-function transfer target for this host thread's SPU context. */
+ SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
++int g_spu_skip_marked = 0;
++double g_spu_t0;
++__attribute__((constructor)) static void spu_skip_marked_init(void)
++{
++    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
++    g_spu_t0 = t.tv_sec + t.tv_nsec * 1e-9;
++    const char* e = getenv("SPU_SKIP_MARKED");
++    if (e) g_spu_skip_marked = (e[0] == '1');
++}
+ SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
+ SPU_THREAD_LOCAL unsigned g_spu_pch_n;
+ 
+@@ -422,6 +434,8 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+      * loop exits, whichever first. */
+     spu_irq_frame f;
+     f.prev = 0; f.depth = 0; f.image_id = 0;
++    unsigned long long resumes = 0;
++    uint32_t first_pc = 0, first_r0 = 0;
+ #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
+     for (;;) {
+         while (g_spu_trampoline_fn) {
+@@ -478,6 +492,24 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+                     fprintf(stderr, "[spu] drain-resume #%llu return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
+                             k, (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
+                             (int)ctx->resident_ovl); }
++                /* One drain call resuming thousands of times is a livelock
++                 * (a return that lands where it started): report the state
++                 * once per 2^k, and with SPU_LIVELOCK_STOP=1 stop the process
++                 * so a debugger can read the host frames. */
++                if (++resumes >= 4096 && (resumes & (resumes - 1)) == 0) {
++                    fprintf(stderr, "[spu-livelock] %llu resumes in one drain: return_pc=0x%05X pc=0x%05X "
++                            "first pc=0x%05X r0=0x%05X (first 0x%05X) r1=0x%05X r3=0x%05X img=%d ovl=%d depth=%d hops:",
++                            resumes, (unsigned)(return_pc & SPU_LS_MASK), pc, first_pc,
++                            ctx->gpr[0]._u32[0] & SPU_LS_MASK, first_r0, ctx->gpr[1]._u32[0] & SPU_LS_MASK,
++                            ctx->gpr[3]._u32[0], ctx->image_id, (int)ctx->resident_ovl, ctx->host_depth);
++                    for (unsigned q = 0; q < 8; q++)
++                        fprintf(stderr, " %05X", g_spu_pch[(g_spu_pch_n + q) & 7u]);
++                    fprintf(stderr, "\n");
++                    { static int stop = -1;
++                      if (stop < 0) { const char* e = getenv("SPU_LIVELOCK_STOP"); stop = e && e[0] == '1'; }
++                      if (stop) { fflush(stderr); raise(SIGSTOP); } }
++                }
++                if (resumes == 1) { first_pc = pc; first_r0 = ctx->gpr[0]._u32[0] & SPU_LS_MASK; }
+                 g_spu_trampoline_fn = spu_indirect_branch;
+                 continue;
+             }
+diff --git a/tools/lift_jobmods.py b/tools/lift_jobmods.py
+index e87ad05d..0b2be762 100644
+--- a/tools/lift_jobmods.py
++++ b/tools/lift_jobmods.py
+@@ -65,6 +65,14 @@ for _part in os.environ.get("JOBMOD_EXTRA_FUNCS", "").split(";"):
+     if ":" in _part:
+         _sha, _addrs = _part.split(":", 1)
+         MODULE_EXTRA_FUNCS[_sha.strip()] = [x.strip() for x in _addrs.split(",") if x.strip()]
++# JOBMOD_SKIPPABLE="<sha>:0x4A20,0x4CB0;<sha2>:...": spu_lifter.py
++# --skippable-funcs for those modules (entries that return at once while the
++# runtime's g_spu_skip_marked is set).
++MODULE_SKIPPABLE = {}
++for _part in os.environ.get("JOBMOD_SKIPPABLE", "").split(";"):
++    if ":" in _part:
++        _sha, _addrs = _part.split(":", 1)
++        MODULE_SKIPPABLE[_sha.strip()] = [x.strip() for x in _addrs.split(",") if x.strip()]
+ 
+ 
+ def manual_link_targets(raw, base=BASE):
+@@ -195,6 +203,8 @@ def main():
+         inside += [hex(a) for a in switch_table_targets(raw)]
+         if inside:
+             cmd += ["--extra-funcs", ",".join(inside)]
++        if sha in MODULE_SKIPPABLE:
++            cmd += ["--skippable-funcs", ",".join(MODULE_SKIPPABLE[sha])]
+         # JOBMOD_LIFTER_ARGS: extra spu_lifter.py options for every module
+         # (e.g. --merge-chunks).
+         cmd += os.environ.get("JOBMOD_LIFTER_ARGS", "").split()
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index 7cce85a6..87f99994 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -505,6 +505,9 @@ class SPULifter:
+         self.branch_targets: set[int] = set()
+         self.unsupported: dict[str, int] = {}
+         self.trace = trace
++        # --skippable-funcs: entries that return at once while the runtime's
++        # g_spu_skip_marked is set (a title switching off work it discards).
++        self.skippable: set[int] = set()
+         # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
+         # Lets multiple lifted SPU images link into one binary without collisions
+         # (every image otherwise exports spu_func_00000090 etc.). Empty = legacy.
+@@ -544,6 +547,9 @@ class SPULifter:
+             if tgt is not None and start <= tgt < end:
+                 internal.add(tgt)
+ 
++        if start in self.skippable:
++            func.body_lines.append(
++                "    if (g_spu_skip_marked) { SPU_RET(ctx); }   /* --skippable-funcs */")
+         last_insn = None
+         for insn in insns:
+             if insn.addr < start or insn.addr >= end:
+@@ -866,6 +872,14 @@ class SPULifter:
+ 
+         # ---- channel ops ----
+         if mn == "rdch":
++            # SPU_RdMachStat recognises the interrupts-on assertion
++            # (`rdch; andi 1; brz -> stop`) by reading the code at ctx->pc,
++            # which a chunk sets on entry but a --merge-chunks group does not:
++            # there the read answered 0 and the job stopped on its own
++            # assertion (Killzone 2's 15e56deeec92 at LS 0x68D0). Publish the
++            # instruction's own address.
++            if _chan(ops[1]) == "SPU_RdMachStat":
++                return f"ctx->pc = 0x{addr:X}; {g(rt())} = spu_rdch(ctx, SPU_RdMachStat);"
+             return f"{g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
+         if mn == "rchcnt":
+             # CBEA: the count lands in the PREFERRED word, remaining slots ZERO
+@@ -1167,6 +1181,13 @@ def main() -> None:
+                         "garbage `functions` (e.g. the LBP WWS physics jobmods, "
+                         "which append a zlib inflate string table + float tables "
+                         "after the code at 0xAE68 / 0xAE48).")
++    p.add_argument("--skippable-funcs", default="",
++                   help="Comma-separated entries (called with brsl $r0) that "
++                        "return at once while the runtime's g_spu_skip_marked "
++                        "is set: pure computation whose result the title "
++                        "discards (Killzone 2's depth-of-field / motion-blur "
++                        "kernels). The entry must not do channel I/O itself, "
++                        "or the job's DMA and buffer bookkeeping changes.")
+     p.add_argument("--merge-chunks", action="store_true",
+                    help="Emit each run of contiguous chunks from one call target "
+                         "to the next as ONE C function (branches between them "
+@@ -1320,6 +1341,12 @@ def main() -> None:
+               f"(`bi $rN` where rN is a brsl/bisl link reg): "
+               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
+     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
++    if args.skippable_funcs:
++        lifter.skippable = {int(x, 0) for x in args.skippable_funcs.split(",") if x.strip()}
++        missing = lifter.skippable - lifter.func_starts
++        if missing:
++            sys.exit("--skippable-funcs: no function starts at " +
++                     ", ".join("0x%X" % a for a in sorted(missing)))
+     groups = {}
+     if args.merge_chunks:
+         seeds = {base}

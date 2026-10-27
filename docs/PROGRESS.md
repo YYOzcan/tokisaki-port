@@ -1803,3 +1803,72 @@ map's); finding it gets the cost back: 12.99 / 13.56 frames/s against
 Weapon switching (Triangle at 90 s and 110 s, frames every 12): rifle ->
 pistol -> rifle, all textured in the scripted run; the texture loss seen in
 play needs its circumstances.
+
+## 71. Every job module lifted with merged chunks; the blur jobs skip their kernels
+
+Desktop, Corinth River from `run_bench_tpl/`, 160 s runs, the mean of the
+last 14 five-second windows: **14.14 / 14.31 frames/s before, 16.12 / 16.03 /
+18.10 after**.
+
+**The merged-chunk livelock of section 65, found** (`SPU_LIVELOCK_STOP=1`:
+a drain call that resumes at a lifted entry 4,096 times reports its state
+and stops the process for gdb). It was not `b5dd5976bcbd`: overlay 202 is
+`15e56deeec92` (jm_default_ast), and LS `0x6E90` there is a `stopd` -- the
+failure branch of `rdch SPU_RdMachStat; andi 1; brz -> stopd` at `0x68D0`,
+the job asserting that interrupts are on. The runtime answers that
+assertion 1 by recognising the pattern in the code at `ctx->pc`, which a
+chunk sets on entry; inside a merged group `ctx->pc` is the group's entry,
+the match failed, the read answered 0, the job stopped on its own assertion
+and the drain resumed it there forever. The lifter now publishes the
+instruction's address before that read (`ctx->pc = 0x68D0;`), and every
+module is lifted with `--merge-chunks` (`tools/lift_spu.sh`; gotos within a
+function instead of a trampoline at every branch target). Ten minutes of
+play, no stop. `pgo/spu.profdata` is now a profile of the merged code
+(`KZ2_SPU_PROFDATA` names another; the chunked one is kept as
+`pgo/spu-plain.profdata`). 14.2 -> 14.7 frames/s.
+
+**The blur jobs skip their kernels** (lifter `--skippable-funcs`,
+`JOBMOD_SKIPPABLE` in `tools/lift_spu.sh`, runtime `g_spu_skip_marked` set by
+`boot_main.cpp`). `SPU_DMA_LOG=<overlay>[+...]` shows where each
+post-processing job reads and writes: `e569adaf4ffe` and then `a27e818cca34`
+(on all four SPUs at once, ~12 ms of every frame) read the 640x360 and two
+320x180 targets the RSX renders into main memory and write only the
+640x360 layer at `0x0177D200` that section 68 zeroes; no other job reads that
+layer. Both modules are one template: the body takes its buffers through the
+job manager's API (`bisl` through the parameter block), calls a kernel with
+`brsl $r0` -- `0x4A20`, `0x4CB0`, `0x5138`, `0x5458` (`e569adaf4ffe`:
+`0x4A20`, `0x4C40`, `0x50C8`, `0x53E8`), none of which does channel I/O --
+and writes the layer with its own PUTL. Those entries now return at once:
+the buffers, the DMA and the job manager's bookkeeping are as before, only
+the arithmetic whose result was discarded is gone. The SPU workers went from
+~72% to ~57% busy. `KZ2_POST_BLUR=1` (or `SPU_SKIP_MARKED=0`) runs them.
+14.7 -> 15.4-15.9 frames/s.
+
+**Shadow maps through the GPU again.** With the SPU half shorter, the FIFO
+thread is the frame (`KZ2_RSX_TIMES`: drain 79%, of which GPU wait 16%,
+parked 20%), and `PS3RECOMP_VK_SUBMIT_STATS` puts ~380 GPU waits in every 5 s
+on two callers: `vk_eng_depth_readback` (~3.7 a frame) and `vk_eng_readback`
+(~2). The depth ones were section 70's `RSX_GPU_REINTERPRET_MASK=5`: every Z16
+read as X16 went through guest memory, the two shadow maps too.
+`RSX_XFORM_VERIFY=N` compares the GPU reinterpret with the guest round trip
+value by value: 0 differences in 1024x1024, 256x256 and 640x360 alike. So
+the GPU copy is right; `RSX_Z16_LOG` shows the one difference between the
+cases -- the 640x360 depth is sampled while it is the bound zeta (the soft
+particles test against and fade by it), the shadow maps from other passes.
+That case keeps the guest round trip (`RSX_Z16_GPU_FEEDBACK=1` builds it too),
+the shadow maps take the GPU path, the mask is 7 again: 15.4-15.9 -> 16.0-18.1.
+The hard black-and-white smoke at the left of Corinth River's first view is
+in the frame dumps of every variant (mask 5, 7, 7 with a sync before the
+copy) -- a separate problem, still open.
+
+**Main-memory targets.** `RSX_MAIN_WB_LOG=N` names the three targets written
+back at every back-end semaphore (0x0169C200 640x360, 0x01977600 320x180,
+0x019E7E00 320x180, fmt 11): the blur jobs' inputs. Not skipped:
+`SPU_DMA_RANGE=<lo>:<hi>[@<s>]` shows other jobs (`1c57090297b6`,
+`773efc443fa7`, `2d92086619cd` ...) reading and writing the same memory in the
+same frame.
+
+Where the frame is now: the FIFO thread drains ~80% of the frame; per frame
+~1,100 draws in ~270 render passes, ~175 texture creations and uploads
+(~5.5 MB), and ~5.7 GPU waits (~16 ms). The two colour readbacks and the
+soft particles' depth are what is left of the waits.

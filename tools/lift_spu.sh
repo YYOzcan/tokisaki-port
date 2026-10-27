@@ -39,10 +39,19 @@ PYEOF
 # runtime's SPU_INTERP_ENTRY_LOG=1 (they ran in the fallback interpreter --
 # the post-processing module 9de83b69cfa0 spent most of its time there).
 export JOBMOD_EXTRA_FUNCS="${JOBMOD_EXTRA_FUNCS:-9de83b69cfa0:0x4600,0x5300,0x8808}"
-# Lifted with merged chunks (one C function per run of chunks, loops as gotos):
-# 73d064721abc's hot loop spans five chunks, and as trampolines it was the
-# costliest job of Corinth River. Merging every module livelocks (PROGRESS 65).
-export JOBMOD_MERGE="${JOBMOD_MERGE-73d064721abc}"
+# Every module lifted with merged chunks (one C function per run of chunks,
+# loops as gotos, instead of a trampoline at every branch target). It
+# livelocked until SPU_RdMachStat's interrupts-on assertion check got the
+# instruction's own address (PROGRESS 71). JOBMOD_LIFTER_ARGS= (empty) lifts
+# chunk by chunk; JOBMOD_MERGE="<sha>,..." then merges only those modules.
+export JOBMOD_LIFTER_ARGS="${JOBMOD_LIFTER_ARGS---merge-chunks}"
+export JOBMOD_MERGE="${JOBMOD_MERGE-}"
+# The depth-of-field / motion-blur kernels of the two jobs that build the
+# blur layer the port zeroes (PROGRESS 68, 71): entries that return at once
+# while the runtime's g_spu_skip_marked is set (boot_main.cpp, unless
+# KZ2_POST_BLUR=1). Each is called from the job body as `brsl $r0` and does
+# no channel I/O; the body still takes its buffers and DMAs the layer out.
+export JOBMOD_SKIPPABLE="${JOBMOD_SKIPPABLE-a27e818cca34:0x4A20,0x4CB0,0x5138,0x5458;e569adaf4ffe:0x4A20,0x4C40,0x50C8,0x53E8}"
 "${PY}" -I "${T}/lift_jobmods.py" --jobmods "${OUT}/jobmods" --out "${SPU}" \
     --register "${SPU}/jobmods_register.c" --symbol-prefix kz2
 

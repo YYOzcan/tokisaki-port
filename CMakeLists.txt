@@ -37,6 +37,8 @@ option(KZ2_SPU_LS_DIAG "LS probes and watches (SPU_LS_WATCH, ...) in the lifted 
 # (run with KZ2_PGO=<start>,<end> frames; profiles land in build/pgo), then
 # llvm-profdata merge -o pgo/spu.profdata pgo/*.profraw and "use".
 set(KZ2_SPU_PGO "off" CACHE STRING "off | gen | use")
+set(KZ2_SPU_PROFDATA "${CMAKE_CURRENT_SOURCE_DIR}/pgo/spu.profdata" CACHE FILEPATH
+    "the profile KZ2_SPU_PGO=use reads (one per SPU lift: plain or merged chunks)")
 set(KZ2_RECOMP_COMPILE_OPTIONS "-O1" CACHE STRING
     "extra compile options for the lifted PPU chunks")
 
@@ -173,7 +175,7 @@ if(KZ2_SPU_PGO STREQUAL "gen")
     set(KZ2_SPU_PGO_FLAGS "-fprofile-generate=${CMAKE_BINARY_DIR}/pgo")
     target_link_options(killzone2 PRIVATE "-fprofile-generate=${CMAKE_BINARY_DIR}/pgo")
 elseif(KZ2_SPU_PGO STREQUAL "use")
-    set(KZ2_SPU_PGO_FLAGS "-fprofile-use=${CMAKE_SOURCE_DIR}/pgo/spu.profdata;-Wno-profile-instr-unprofiled;-Wno-profile-instr-out-of-date")
+    set(KZ2_SPU_PGO_FLAGS "-fprofile-use=${KZ2_SPU_PROFDATA};-Wno-profile-instr-unprofiled;-Wno-profile-instr-out-of-date")
 endif()
 if(KZ2_SPU_SOURCES)
     set_source_files_properties(${KZ2_SPU_SOURCES} PROPERTIES
