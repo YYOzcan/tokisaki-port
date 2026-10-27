@@ -1,0 +1,28 @@
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 88648586..493bf759 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -844,6 +844,23 @@ void (*spu_take_interrupt(spu_context* ctx,
+ 
+ /* Drain a translated call up to its explicit architectural return PC. */
+ void spu_drain_call(spu_context* ctx, uint32_t return_pc);
++/* Its common case, inline, for the lifted code (every brsl drains, ~6,300
++ * sites in Killzone 2's jobs): the callee came back on its own return -- no
++ * trampoline pending, pc at the return address -- which costs the out-of-line
++ * call nothing but the drain_ret_pc reset. Shallow calls only, so
++ * spu_depth_guard still sees a runaway recursion. */
++static inline void spu_drain_call_inl(spu_context* ctx, uint32_t return_pc)
++{
++    if (__builtin_expect(!g_spu_trampoline_fn && ctx->host_depth < 256u &&
++                         !(((uint32_t)ctx->pc ^ return_pc) & SPU_LS_MASK), 1)) {
++        ctx->drain_ret_pc = 0;
++        return;
++    }
++    spu_drain_call(ctx, return_pc);
++}
++#if defined(SPU_USE_DISPATCH_MT) && !defined(SPU_DRAIN_NO_INLINE)
++#define spu_drain_call(c, r) spu_drain_call_inl((c), (r))
++#endif
+ /* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
+  *
+  * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from

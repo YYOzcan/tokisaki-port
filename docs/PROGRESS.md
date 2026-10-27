@@ -1646,3 +1646,58 @@ return lands where it started, 4.3 billion times. The routine is a memcpy
 The next step is a watch on r0 at the `0x6D58` entry under the merged lift.
 Until then the plain lift stays, and loops split across chunks keep paying
 two drain round trips per iteration (`73d064721abc`'s `0x6254`/`0x6280`).
+
+## 66. Cheaper lifted calls; SPURS priorities; what the FIFO thread does
+
+**The drain after every lifted call, inline** (patch 0041). Every `brsl`
+in the lifted SPU code (~6,300 sites in the job modules) calls
+`spu_drain_call(ctx, return_pc)` after the callee: an out-of-line call, the
+depth guard (another call), an interrupt frame, a trampoline loop. In the
+common case the callee returned on its own -- no trampoline pending, pc at
+the return address -- and all that does is reset `drain_ret_pc`.
+`spu_drain_call_inl` (spu_context.h, the lifted sources only via
+`SPU_USE_DISPATCH_MT`) does that inline for calls less than 256 deep and
+falls back otherwise. `spu_drain_call` 4.1 -> 2.5% of all samples,
+`spu_depth_guard` 1.0 -> 0.2%, the SPU runtime ~82 -> ~72 ms of CPU a frame;
+frame rate unchanged (14.48 / 15.00 before, 14.75 / 14.16 after). Kept: the
+same semantics for less CPU.
+
+**SPURS priorities** (patch 0042, opt-in). The kernel took, for a free
+SPU, the first eligible workload in round-robin order; the per-SPU priority
+bytes were only read as "0 = not on this SPU". `SPURS_PRIO_LOG=1`: Killzone
+2 gives most of its workloads priority 8, w4 7, w8 and w9 1, jm_post (w7)
+8. `SPURS_PRIORITY=1` makes a free SPU take a workload with work before one
+without and then the best priority, as the real kernel does: 14.73 frames/s;
+jm_post at priority 1 (`SPURS_PRIO_OVERRIDE=7:1`, also `9:2,8:2`): 14.57.
+Neither changes anything, so the order is not what holds the
+post-processing back: when its jobs are ready there are free SPUs. Off by
+default. (The `SPURS_MAXCONT` parsing moved into `spurs_maxcont_override`,
+same behaviour.)
+
+**Where the FIFO thread is** (30 gdb samples in gameplay): 17 between
+drains (parked or sleeping), 13 inside `cellGcm_rsx_process_fifo`, every one
+of those on the CPU -- vertex fetch and its plan, texture slots and hashing,
+descriptor writes, the fragment program's structural hash. No hidden wait
+inside the drain: its half of the frame is CPU work, ~24 ms of it a frame.
+
+**What 60 frames/s would take**, from sections 59-66: the frame is the
+FIFO thread's ~35 ms of draw translation followed by ~30 ms of the SPU
+post-processing chain, and neither overlaps the other. Every latency knob
+(drain interval, SPURS pass, timer slack, spin backoff, priorities) is
+neutral; only more parallelism moved it (section 64). Left, largest first:
+1. **SPU code that does not leave a loop every iteration**: the lifter
+   starts a function at every branch target, so a loop with a branch inside
+   runs as several C functions joined by trampolines (two drain round trips
+   per iteration in `73d064721abc`'s bit loop). `--merge-chunks` removes
+   them but livelocks (section 65: a stale r0 after merged code); fixing it
+   is the largest single SPU saving.
+2. **A second RSX thread**: the draw engine decodes on the FIFO thread and a
+   submission thread records Vulkan and fills the ring. Needs the label and
+   semaphore writes held until the submission thread has read what the
+   draws reference, or the guest reuses its buffers early.
+3. **ps3recomp v0.16-v0.18** (578 commits since our pin): its SPU drain,
+   lock-line, vertex-fetch and draw-engine performance work does not apply
+   to this series without the refactors before it; a rebase of the 42
+   patches is the way to get it.
+4. Killzone 2 was made for 30 frames/s; above that its own timing has not
+   been tested.

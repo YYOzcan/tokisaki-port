@@ -1,0 +1,100 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index e4f19c89..cd55e757 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1760,6 +1760,20 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+     return 0;
+ }
+ 
++
++/* SPURS_MAXCONT="<wid>:<n>[,...]": let a workload run on more SPUs than it
++ * asked for (Killzone 2: jm_post, the SPU post-processing job list, was the
++ * in-level bottleneck at 1). 0 = no override for that workload. */
++static u32 spurs_maxcont_override(u32 wid)
++{
++    static int nov = -1; static u32 ov[16];
++    if (nov < 0) { nov = 0; const char* e = getenv("SPURS_MAXCONT");
++        while (e && *e) { char* q; unsigned w = (unsigned)strtoul(e, &q, 10);
++            if (*q != ':') break; unsigned n = (unsigned)strtoul(q + 1, &q, 10);
++            if (w < 16) { ov[w] = n; nov = 1; } e = (*q == ',') ? q + 1 : q; if (!*q) break; } }
++    return (nov && wid < 16) ? ov[wid] : 0u;
++}
++
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+ {
+     struct SpursInst* si = (struct SpursInst*)p;
+@@ -1788,9 +1802,60 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+         AcquireSRWLockExclusive(&s_workload_registry_lock);
+         si->pass_no++;
+         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
++        /* SPURS_PRIORITY=1 (default 0): a free SPU takes, of the workloads it
++         * may run, one with work (ready count or signal) before one without,
++         * and among those the best priority for that SPU (1 = highest, as the
++         * title set it per SPU in the workload info), ties in the old
++         * round-robin order, as a real SPURS kernel picks. Off by default: in
++         * Killzone 2 (priorities 8, w4 7, w8/w9 1) it changed nothing, nor did
++         * jm_post at priority 1 (SPURS_PRIO_OVERRIDE=7:1) -- PROGRESS 66.
++         * SPURS_PRIO_LOG=1 prints each instance's limits and priorities. */
++        static int s_prio = -1;
++        if (s_prio < 0) { const char* e = getenv("SPURS_PRIORITY"); s_prio = (e && e[0] == '1'); }
++        { static int s_log = -1; static u32 s_logged_mask[2], s_logged_ea[2];
++          if (s_log < 0) s_log = getenv("SPURS_PRIO_LOG") ? 1 : 0;
++          const int li = (s_logged_ea[0] == 0 || s_logged_ea[0] == ea) ? 0 : 1;
++          if (s_log && (s_logged_ea[li] != ea || s_logged_mask[li] != enabled)) {
++              s_logged_ea[li] = ea; s_logged_mask[li] = enabled;
++              for (u32 w = 0; w < 16; w++) if (enabled & (0x80000000u >> w)) {
++                  fprintf(stderr, "[spurs-prio] inst 0x%08X w%u maxcont %u prio", ea, w, vm_read8(ea + SPURS_WKL_MAXCONT + w));
++                  for (u32 k = 0; k < 8; k++) fprintf(stderr, " %u", vm_read8(ea + SPURS_WKL_INFO1 + w * SPURS_WKL_INFO_SZ + 0x18 + k));
++                  fprintf(stderr, "\n"); } } }
+         for (u32 sn = 0; sn < si->nspus; sn++) {
+             struct SpursPmSlot* slot = &si->slots[sn];
+             if (slot->busy) continue;
++            /* pass 1 (SPURS_PRIORITY): find the workload this SPU should take */
++            int best = -1;
++            if (s_prio) {
++                u32 best_score = ~0u;
++                for (u32 checked = 0; checked < 16; checked++) {
++                    const u32 wid = (si->cursor + checked) & 15;
++                    if (!(enabled & (0x80000000u >> wid)) || vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2 ||
++                        !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
++                        continue;
++                    u32 prio = vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn);
++                    if (!prio) continue;
++                    /* SPURS_PRIO_OVERRIDE="<wid>:<p>[,...]": that workload's
++                     * priority on every SPU it may run on (experiments). */
++                    { static int nov = -1; static u32 ov[16];
++                      if (nov < 0) { nov = 0; const char* e = getenv("SPURS_PRIO_OVERRIDE");
++                          while (e && *e) { char* q; unsigned w = (unsigned)strtoul(e, &q, 10);
++                              if (*q != ':') break; unsigned n = (unsigned)strtoul(q + 1, &q, 10);
++                              if (w < 16) { ov[w] = n; nov = 1; } e = (*q == ',') ? q + 1 : q; if (!*q) break; } }
++                      if (nov && ov[wid]) prio = ov[wid]; }
++                    u32 mc = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
++                    if (mc && spurs_maxcont_override(wid) > mc) mc = spurs_maxcont_override(wid);
++                    if (!mc || si->active[wid] >= mc || !spurs_resolve_pm(wid)) continue;
++                    const int kicked = vm_read8(ea + SPURS_WKL_READY1 + wid) ||
++                                       (vm_read16(ea + SPURS_WKL_SIGNAL1) & (0x8000u >> wid));
++                    if (!kicked && backoff && (si->pass_no & ((1u << si->idle[wid]) - 1)))
++                        continue;
++                    const u32 score = (kicked ? 0u : 16u) + prio;
++                    if (score < best_score) { best_score = score; best = (int)wid; }
++                }
++                if (best < 0) continue;            /* nothing this SPU may run */
++                si->cursor = (u32)best;            /* the loop below takes it first */
++            }
+             for (u32 checked = 0; checked < 16; checked++) {
+                 u32 wid = si->cursor;
+                 si->cursor = (wid + 1) & 15;
+@@ -1804,12 +1869,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                 /* SPURS_MAXCONT="<wid>:<n>[,...]": let a workload run on more
+                  * SPUs than it asked for (experiment: Killzone 2's jm_post, the
+                  * SPU post-processing job list, is the in-level bottleneck at 1). */
+-                { static int nov = -1; static u32 ov[16];
+-                  if (nov < 0) { nov = 0; const char* e = getenv("SPURS_MAXCONT");
+-                      while (e && *e) { char* q; unsigned w = (unsigned)strtoul(e, &q, 10);
+-                          if (*q != ':') break; unsigned n = (unsigned)strtoul(q + 1, &q, 10);
+-                          if (w < 16) { ov[w] = n; nov = 1; } e = (*q == ',') ? q + 1 : q; if (!*q) break; } }
+-                  if (nov && maxcont && ov[wid] > maxcont) maxcont = ov[wid]; }
++                if (maxcont && spurs_maxcont_override(wid) > maxcont) maxcont = spurs_maxcont_override(wid);
+                 if (!maxcont || si->active[wid] >= maxcont) continue;
+                 WklPm* pm = spurs_resolve_pm(wid);
+                 if (!pm) continue;
