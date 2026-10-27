@@ -1765,3 +1765,17 @@ ucode (`.vp.bin`), the pass dump's `vpc:` line has `c[25..28]`, and
 
 Still visible: smoke drawn as hard black-and-white blotches, a dark disc in
 the sky, and the colour grading (the LUT of section 28) is still identity.
+
+## 69. SIXAXIS from the mouse
+
+Killzone 2 turns its SIXAXIS sensors on (`cellPadSetPortSetting` 0x6:
+pressure and sensors) and uses them for valves and charges. The pad
+reported the accelerometers and gyro at rest, always. Patch 0046: while
+Ctrl is held the mouse tilts a virtual controller instead of turning the
+view -- left/right rolls it like a steering wheel, up/down pitches it,
+`PS3_PAD_GYRO_SENS` radians per 1000 counts (default 5) up to ~86 degrees --
+and the sensors report gravity for that attitude (X = 512 + 113 sin roll,
+Y = 512 - 113 cos roll cos pitch, the 399 of rest; Z = 512 + 113 sin pitch)
+and the roll rate on the gyro (G). Released, the pad settles back to rest in
+a few polls. The direct mouse-look hook gets no motion while Ctrl is held.
+Crouch is on C only now (Ctrl was its second key).

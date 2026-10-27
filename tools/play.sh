@@ -3,7 +3,8 @@
 #
 #   W A S D      move (left stick)     Mouse        look (right stick)
 #   Left click   fire (R1)             Right click  aim / zoom (L1)
-#   Space        jump (Cross)          Left Ctrl    crouch (Circle)
+#   Space        jump (Cross)          C            crouch (Circle)
+#   Ctrl (hold) + mouse: tilt the SIXAXIS (turn valves, arm charges)
 #   R / F        reload (Square)       T / C        switch weapon (Triangle)
 #   G            grenade (R2)          Z            cover (L2)
 #   Left Shift   sprint (L3)           V / middle   melee (R3)

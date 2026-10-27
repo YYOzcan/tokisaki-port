@@ -73,13 +73,13 @@ tools/play.sh
 |---|---|---|---|---|
 | W A S D | left stick (move) | | Mouse / Fare | right stick (look) |
 | Left click / Sol tık | R1 (fire) | | Right click / Sağ tık | L1 (aim) |
-| Space | Cross (jump) | | Left Ctrl | Circle (crouch) |
+| Space | Cross (jump) | | C | Circle (crouch) |
 | R / F | Square (reload) | | T / C | Triangle (weapon) |
 | G | R2 (grenade) | | Z | L2 (cover) |
 | Left Shift | L3 (sprint) | | V / middle click | R3 (melee) |
 | Enter | START (pause) | | Esc / Backspace | Circle (back) |
 | Arrow keys / Ok tuşları | D-pad | | Tab | SELECT |
-| F1 | release / recapture the mouse | | | |
+| F1 | release / recapture the mouse | | Ctrl (hold) + mouse | SIXAXIS tilt (valves, charges) |
 
 An SDL game controller also works. `tools/install_desktop_entry.sh` adds
 *Killzone 2* to the application menu (it runs `tools/play.sh`; with Tk

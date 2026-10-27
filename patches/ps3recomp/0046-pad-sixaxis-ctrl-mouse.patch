@@ -1,0 +1,112 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 52e9424e..1dc88413 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -304,6 +304,52 @@ static float pad_mouse_sens(void)
+     return sens;
+ }
+ 
++/* SIXAXIS from the mouse: while Ctrl is held the mouse tilts the controller
++ * instead of turning the view -- left/right rolls it like a steering wheel
++ * (valves, charges), up/down pitches it -- and the accelerometers report
++ * gravity for that attitude, the gyro the roll rate. Released, it settles
++ * back to rest. PS3_PAD_GYRO_SENS: radians per 1000 mouse counts (default 5). */
++static volatile int s_gyro_active = 0;
++static volatile int s_gyro_dx = 0, s_gyro_dy = 0;   /* motion not yet applied */
++static float s_gyro_roll = 0.0f, s_gyro_pitch = 0.0f;
++static u16 s_sensor[4] = { 512, 399, 512, 512 };    /* X, Y, Z, G as at rest */
++
++static void pad_gyro_update(int active)
++{
++    static float sens = -1.0f;
++    if (sens < 0.0f) { const char* e = getenv("PS3_PAD_GYRO_SENS"); sens = e ? (float)atof(e) : 5.0f;
++                       if (sens <= 0.0f) sens = 5.0f; }
++    const int dx = s_gyro_dx, dy = s_gyro_dy;
++    s_gyro_dx = 0; s_gyro_dy = 0;
++    float rate = 0.0f;
++    if (active) {
++        const float k = sens * 0.001f;
++        rate = dx * k;
++        s_gyro_roll += rate;
++        s_gyro_pitch += dy * k;
++        const float lim = 1.5f;   /* ~86 degrees */
++        if (s_gyro_roll > lim) s_gyro_roll = lim;
++        if (s_gyro_roll < -lim) s_gyro_roll = -lim;
++        if (s_gyro_pitch > lim) s_gyro_pitch = lim;
++        if (s_gyro_pitch < -lim) s_gyro_pitch = -lim;
++    } else {
++        s_gyro_roll *= 0.5f; s_gyro_pitch *= 0.5f;   /* back to rest in a few polls */
++        if (fabsf(s_gyro_roll) < 0.001f) s_gyro_roll = 0.0f;
++        if (fabsf(s_gyro_pitch) < 0.001f) s_gyro_pitch = 0.0f;
++    }
++    /* ~113 counts per g around 512; at rest gravity reads -1 g on Y (399). */
++    const float g = 113.0f;
++    float x = 512.0f + g * sinf(s_gyro_roll);
++    float y = 512.0f - g * cosf(s_gyro_roll) * cosf(s_gyro_pitch);
++    float z = 512.0f + g * sinf(s_gyro_pitch);
++    float w = 512.0f + rate * 400.0f;
++    const float v[4] = { x, y, z, w };
++    for (int i = 0; i < 4; i++) {
++        float c = v[i] < 0.0f ? 0.0f : v[i] > 1023.0f ? 1023.0f : v[i];
++        s_sensor[i] = (u16)(c + 0.5f);
++    }
++}
++
+ /* Direct mouse look: the relative motion (counts) since the last call, for a
+  * title whose look code is hooked to turn the view by it once per frame.
+  * Returns 0 (and no motion) while the mouse is not captured. Calling it keeps
+@@ -317,6 +363,10 @@ int cellPad_take_mouse_motion(int* dx, int* dy, float* sens, int* invert)
+     s_mouse_direct_ms = pad_now_ms();
+     if (!s_mouse_captured) return 0;
+     SDL_GetRelativeMouseState(dx, dy);
++    if (s_gyro_active) {          /* Ctrl held: the motion tilts the pad instead */
++        s_gyro_dx += *dx; s_gyro_dy += *dy;
++        *dx = *dy = 0;
++    }
+     return 1;
+ }
+ 
+@@ -433,8 +483,9 @@ static void pad_poll_sdl2(void)
+             if (keys[SDL_SCANCODE_P])                                 kbtns |= CELL_PAD_CTRL_START;
+             if (keys[SDL_SCANCODE_R] || keys[SDL_SCANCODE_E] || keys[SDL_SCANCODE_F])
+                 kbtns |= CELL_PAD_CTRL_SQUARE;
+-            if (keys[SDL_SCANCODE_C] || keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL])
+-                kbtns |= CELL_PAD_CTRL_CIRCLE;
++            if (keys[SDL_SCANCODE_C])                                 kbtns |= CELL_PAD_CTRL_CIRCLE;
++            /* Ctrl: SIXAXIS tilt from the mouse (pad_gyro_update) */
++            s_gyro_active = s_mouse_captured && (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]);
+             if (keys[SDL_SCANCODE_Q] || keys[SDL_SCANCODE_Z])         kbtns |= CELL_PAD_CTRL_L2;
+             if (keys[SDL_SCANCODE_G])                                 kbtns |= CELL_PAD_CTRL_R2;
+             if (keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT]) kbtns |= CELL_PAD_CTRL_L3;
+@@ -480,6 +531,7 @@ static void pad_poll_sdl2(void)
+                 if (mb & SDL_BUTTON(SDL_BUTTON_MIDDLE)) kbtns |= CELL_PAD_CTRL_R3;
+                 if (mb & SDL_BUTTON(SDL_BUTTON_X1))     kbtns |= CELL_PAD_CTRL_R3;
+                 if (mb & SDL_BUTTON(SDL_BUTTON_X2))     kbtns |= CELL_PAD_CTRL_R2;
++                if (s_gyro_active) { s_gyro_dx += dx; s_gyro_dy += dy; dx = dy = 0; }
+                 const float sens = pad_mouse_sens();
+                 float fx = dx * sens, fy = dy * sens;
+                 if (fx > 127.0f) fx = 127.0f;
+@@ -489,6 +541,7 @@ static void pad_poll_sdl2(void)
+                 mr_x = 128 + (int)fx; mr_y = 128 + (int)fy;
+             }
+             kbm_active = (ml_x != 128 || ml_y != 128 || mr_x != 128 || mr_y != 128);
++            pad_gyro_update(s_gyro_active);
+         }
+ 
+         if (!s_host_state[0].connected) {
+@@ -976,10 +1029,11 @@ skip_inject: ;
+     /* Sensor data (only meaningful if SENSOR_ON) */
+     if (setting & CELL_PAD_SETTING_SENSOR_ON) {
+         /* Default sensor values: accelerometer at rest (512 = 1g center) */
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = 512;
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = 399; /* gravity */
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
++        /* At rest (512 = 0 g, Y 399 = gravity) unless Ctrl + mouse tilts it */
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = s_sensor[0];
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = s_sensor[1];
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = s_sensor[2];
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = s_sensor[3];
+     }
+     }  /* end connected block */
+ 
