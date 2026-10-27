@@ -1614,3 +1614,35 @@ dumps unchanged; no frame-rate change measurable.
 - PGO from this scene (`KZ2_PGO=10000,10700`, merged 2:1 with the laptop's
   New Sun profile into `pgo/spu.profdata`): `a27e818cca34` 35.1 -> 33.2 ms;
   kept.
+
+## 65. Stability with the new SPURS limits; the merged-chunk livelock, narrowed
+
+**Stability.** With `SPURS_MAXCONT=0:6,2:6,3:6,4:6,5:6,7:4,8:6,9:6`: four
+runs in a row to gameplay (`tools/soak.sh 4 170`, 14.3-15.0 frames/s in the
+last minute) and three two-instance hunts (`tools/stallhunt.sh 2 230`, six
+runs at once in pairs): ten of ten reached gameplay and kept presenting.
+
+**`[spu] drain-resume` is normal** (patch 0040). Its counter was an `int`
+capped at 8; it now counts in 64 bits and prints the first 8 and every
+2^k-th. The plain lift resumes ~20,000 times a second in the level -- every
+WWS job module's body ends `bi $r0` to a continuation whose host frame is
+gone (spu_drain.c's comment), `return_pc=0x32C0`, entries 0x40DC / 0x412C.
+The 31 M lines of section 64 were the old counter wrapping after 2^32
+resumes, i.e. a real livelock.
+
+**The livelock under `--merge-chunks`** (job module `b5dd5976bcbd`, overlay
+202): the drain resumes at `0x6E90`; that chunk branches to `0x6DB4`, whose
+lifted function is `r3 = r15; SPU_RET(ctx)` -- and r0 holds `0x6E90`, so the
+return lands where it started, 4.3 billion times. The routine is a memcpy
+(`0x6D58`..`0x6EC0`, merged into one group). Things ruled out:
+- interrupts and the per-hop checks: a back-edge yield (return to the drain
+  at a merged loop head when an interrupt is pending, and every 1,024
+  iterations; 4,062 sites) changed nothing -- reverted;
+- the module alone: with only `b5dd5976bcbd` (or only `73d064721abc`) merged
+  there is no livelock in 240 s; it needs several merged modules, so the
+  stale r0 is probably left by another merged module's code on the same SPU
+  (a link register that the chunked lift rewrites at a trampoline and the
+  merged one does not).
+The next step is a watch on r0 at the `0x6D58` entry under the merged lift.
+Until then the plain lift stays, and loops split across chunks keep paying
+two drain round trips per iteration (`73d064721abc`'s `0x6254`/`0x6280`).
