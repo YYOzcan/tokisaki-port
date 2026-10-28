@@ -94,6 +94,7 @@ extern volatile unsigned g_spurs_pm_cur_wid, g_spurs_pm_cur_lane;   /* spurs_pol
 extern volatile unsigned long long g_spurs_pm_cur_since;
 extern volatile uint32_t g_spurs_last_task_arg[4];                   /* cellSpurs.c */
 uint32_t cellGcm_fifo_walker_get(void);
+int cellGcm_park_wait(uint32_t io, unsigned timeout_us);   /* cellGcmSys.c: woken by the SPU PUT that patches a park */
 void rsx_draw_engine_idle_flush(void);
 void spu_taskset_dump_all(const char* why);                             /* spu_workload.c */                                 /* rsx_draw_engine.c */
 unsigned long long ps3_ms_now(void);
@@ -266,7 +267,17 @@ static void frame_clock_loop(void)
 #ifdef _WIN32
         Sleep(1);
 #else
-        usleep(drain_us);
+        /* Parked on a jump to itself that an SPU job will patch: wait for
+         * that PUT (cellGcm_park_wait) instead of a whole sleep -- Killzone 2
+         * parks many times a frame. KZ2_PARK_WAKE=0 sleeps as before. */
+        {   static const bool park_wake = !(getenv("KZ2_PARK_WAKE") && getenv("KZ2_PARK_WAKE")[0] == '0');
+            const uint32_t g = cellGcm_fifo_walker_get();
+            const uint32_t w = __builtin_bswap32(*(uint32_t*)(vm_base + 0x40300000u + g));
+            if (park_wake && rsx_ok && (w & 0xE0000003u) == 0x20000000u && (w & 0x1FFFFFFCu) == g)
+                cellGcm_park_wait(g, drain_us);
+            else
+                usleep(drain_us);
+        }
 #endif
         if (times) {
             const uint64_t d = now_ns() - s0;

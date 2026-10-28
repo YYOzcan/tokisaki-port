@@ -2030,3 +2030,49 @@ Where the main thread is now (30 gdb samples, plain build): 6 in
 `sys_cond_wait` under `func_00803590`, 1 in the SPU progress spin, 19 in its
 own code -- ~30 ms of PPU work a frame, a ceiling near 32 frames/s until the
 lifted PPU code itself is faster.
+
+## 77. From the Killzone 3 port: SPU helpers in SSE/AVX2, the park wake, the overlay index
+
+[Project Helghast](https://github.com/undecuple/project-helghast) ports
+Killzone 3 (same engine, same WWS job manager) on ps3recomp v0.18 with a
+Direct3D 12 backend, so its 263 patches do not apply as they are. Their notes
+were read one by one; what fits this port's runtime is re-written here
+(patch 0053; CREDITS.md):
+
+- **SPU helpers on x86** (their 1097, 1131, 1132). Compiled alone, the
+  runtime's per-lane loops came out as scalar code: `cgt` ~23 instructions
+  instead of one `pcmpgtd`, `ceqi` ~17, the float compares ~45, `frest` /
+  `frsqest` ~45, `cwd` a 16-byte loop -- and the lifted jobs call them
+  thousands of times (`cwd` 5,620 sites, `ceqi` 3,515, `cgt` 3,224, `fcgt`
+  1,972 ...). `runtime/spu/spu_helpers_x86.h` has SSE4.1 / AVX2 forms of ~65
+  of them (word, halfword and byte arithmetic and compares, the variable
+  shifts as `vpsllvd`/`vpsrlvd`/`vpsravd`, sign extension, the select masks
+  and gathers, the generate-controls, the extended-range float compares,
+  `frest`/`frsqest` with `vpgatherdd` from the hardware tables), included at
+  the end of `spu_helpers.h` with function-like macros redirecting the lifted
+  code. `runtime/spu/tests/test_spu_helpers_x86.c` checks every one against
+  the original on edge and 2 million random values, `frest`/`frsqest` on all
+  2^32 inputs: 0 differences.
+- **The walker wakes on the PUT that patches its park** (their 1087).
+  The FIFO thread slept 1 ms between drains, and Killzone 2 parks the RSX on
+  a jump to itself many times a frame until an SPU job patches it.
+  `cellGcm_park_wait` publishes the park's IO offset and waits on a futex
+  that `gcm_note_spu_put` bumps when a PUT covers that word (the word is read
+  again after publishing, so a PUT in between is not missed); at most the
+  same 1 ms. `KZ2_PARK_WAKE=0` sleeps as before.
+- **The overlay source index** (their 1090): every MFC GET scanned every
+  registered job module source; now hash chains by first signature word and
+  source EA, the lowest matching index as before.
+
+Three runs each against the commit before: 22.48 / 21.55 / 21.49 against
+20.01 / 19.97 / 20.35 frames/s, no GPU error in the kernel log. (One earlier
+A/B of the helpers alone, 24.51 / 23.13 against 20.66 / 19.98, ended in a
+`Xid 13` graphics exception and then `Xid 79`, the GPU off the bus, needing
+a reboot; a 300 s run under the Khronos validation layer (Steam's
+`libVkLayer_khronos_validation.so` with a hand-written manifest) reported
+no Vulkan error, the helpers do not touch Vulkan, and the six runs after the
+reboot were clean -- watched, not explained.)
+
+Also found there and checked here: their 1058 (the selectWorkload answer) is
+already in this runtime as the opt-in `SPURS_PM_SELECT_CURRENT=1`; 1045
+(ready-count swap) is covered by `spurs_ready_exchange`.

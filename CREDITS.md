@@ -76,6 +76,19 @@ file: the output replaces `spu_recomp.c` under the same names (CMake
 `spu_helpers_vec.h`. Nothing else from that repository is used; its
 title-specific code carries no license and is not copied.
 
+## Killzone 3 PC port — Project Helghast
+
+**[undecuple/project-helghast](https://github.com/undecuple/project-helghast)**
+(Killzone 3 by static recompilation, on ps3recomp v0.18 with a Direct3D 12
+backend; MIT) is a port of the next game of the same engine. Its patch notes
+are the source of these changes here, re-written for this port's ps3recomp
+v0.15 series (patch 0053): SSE4.1/AVX2 forms of the SPU integer, mask,
+generate-controls, float compare and estimate helpers (its patches 1097,
+1131, 1132 -- ours are new code, bit-identical to this runtime's reference
+loops, `runtime/spu/tests/test_spu_helpers_x86.c`), the walker's wait at an
+SPU-patched park (1087) and the overlay source index (1090). Its Direct3D 12,
+Windows and Killzone 3 specific code is not used.
+
 ## Other software
 
 - **zlib** — host-side inflate for Edge Zlib requests.

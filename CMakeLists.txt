@@ -45,6 +45,10 @@ set(KZ2_RECOMP_COMPILE_OPTIONS "-O1" CACHE STRING
 # over thousands of functions): KZ2_PPU_PGO=gen, a run with KZ2_PGO=<start>,<end>,
 # llvm-profdata merge -o pgo/ppu.profdata <build>/pgo-ppu/*.profraw, then "use".
 set(KZ2_PPU_PGO "off" CACHE STRING "off | gen | use")
+# ThinLTO across the 42 lifted PPU chunks: calls between chunks (most of the
+# game's small accessors) can be inlined at link time. Links with lld.
+option(KZ2_PPU_THINLTO "ThinLTO for the lifted PPU chunks (lld)" OFF)
+set(KZ2_THINLTO_JOBS "6" CACHE STRING "parallel ThinLTO backends at link (~3 GB each)")
 set(KZ2_PPU_PROFDATA "${CMAKE_CURRENT_SOURCE_DIR}/pgo/ppu.profdata" CACHE FILEPATH
     "the profile KZ2_PPU_PGO=use reads")
 
@@ -169,6 +173,11 @@ else()
     target_compile_options(killzone2 PRIVATE -Wall -Wextra -Wno-unused-parameter -fno-strict-aliasing)
     # Generated code: no warnings, and no fused multiply-add the guest did not ask for.
     set(KZ2_RECOMP_FLAGS "-w;-ffp-contract=off;${KZ2_RECOMP_COMPILE_OPTIONS}")
+    if(KZ2_PPU_THINLTO)
+        list(APPEND KZ2_RECOMP_FLAGS -flto=thin)
+        target_link_options(killzone2 PRIVATE -fuse-ld=lld -flto=thin
+                            "-Wl,--thinlto-jobs=${KZ2_THINLTO_JOBS}" -O2)
+    endif()
     if(KZ2_PPU_PGO STREQUAL "gen")
         list(APPEND KZ2_RECOMP_FLAGS "-fprofile-generate=${CMAKE_BINARY_DIR}/pgo-ppu")
         target_link_options(killzone2 PRIVATE "-fprofile-generate=${CMAKE_BINARY_DIR}/pgo-ppu")
