@@ -2242,3 +2242,34 @@ commit): 26.58 / 26.26 against 28.29 / 24.19, no gain. A 125 Hz guest vblank
 shortest frames are ~26-28 ms (the RPCS3 wiki notes Killzone 2 runs at 60
 with a 120 Hz vblank, some elements bugged).
 Hand play on this build (the user): rarely below 30, 40-45 at times.
+
+## 84. The modules at LS 0x8400 lifted where they run; no SPU code interpreted
+
+With section 83's fix, the three job modules the game keeps at LS 0x8400 --
+215 `73d064721abc` (79 KB), 222 `8e97047fac2a`, 233 `eb97616444b5`, which
+rotate there beside the job code buffer's module -- ran entirely in the SPU
+interpreter: on the busiest SPURS lane `spu_step` 26%, `spu_lookup` 10%,
+`spu_interp_run_until` 4% (8.9% / 4.5% / 1.5% of all samples).
+
+- `tools/lift_jobmods.py` `JOBMOD_ALT_BASE="<sha>@<base>,..."` lifts a module a
+  second time at another base (`<name>_at<base>`, the 0x4000 lifts and their
+  image ids unchanged, the new ones after them; addresses given for the 0x4000
+  lift move with it) and registers it with `spu_overlay_register_sig_at` (sig,
+  image, base, size). `tools/lift_spu.sh` sets the three @0x8400.
+- The runtime makes a signature module resident only at a base it is lifted for;
+  at 0x8400 it becomes a code span (`spu_context.resident_code`), which the
+  fast resolver (`spu_indirect_branch_mt`) now consults too. A signature span
+  ends only when something lands on its 16-byte header -- the module's own data
+  DMAs into its image cleared the general rule's spans at once
+  (`[spu-ovl] code span image 236 at LS 0x08400 ...`).
+- Entries reached only through function pointers the jobs build (logged by
+  `SPU_INTERP_ENTRY_LOG=1`, which now also names every indirect call the
+  interpreter makes, `[spu-interp-call]`): 0x84C0, 0x8640, 0xBAE8 in the 0x8400
+  modules and 0x4620 ... 0x5228 (11) in module 202 `15e56deeec92`, which the
+  0x8400 module calls; in `JOBMOD_EXTRA_FUNCS`.
+
+After: `spu_step` gone from the profile, no interpreter entry in a run, no lane
+stop.
+Frame rate: 26.56 / 26.24 against 25.69 / 27.66 -- no change (the modules are
+mostly the always-running background job, off the frame's critical path); the
+lane they occupied has ~40% of a core back.

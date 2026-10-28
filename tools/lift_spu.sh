@@ -40,7 +40,10 @@ PYEOF
 # Entries the jobs reach only through computed branches, found with the
 # runtime's SPU_INTERP_ENTRY_LOG=1 (they ran in the fallback interpreter --
 # the post-processing module 9de83b69cfa0 spent most of its time there).
-export JOBMOD_EXTRA_FUNCS="${JOBMOD_EXTRA_FUNCS:-9de83b69cfa0:0x4600,0x5300,0x8808}"
+# 73d064721abc / 8e97047fac2a / eb97616444b5: entries reached only through
+# function pointers the job builds (SPU_INTERP_ENTRY_LOG at LS 0x8400: 0x84C0,
+# 0x8640, 0xBAE8), given at the job code buffer's base and moved with JOBMOD_ALT_BASE.
+export JOBMOD_EXTRA_FUNCS="${JOBMOD_EXTRA_FUNCS:-9de83b69cfa0:0x4600,0x5300,0x8808;73d064721abc:0x40C0,0x4240,0x76E8;8e97047fac2a:0x40C0,0x4240;eb97616444b5:0x40C0,0x4240;15e56deeec92:0x5050,0x5154,0x4C88,0x4868,0x4620,0x4660,0x4720,0x4DC8,0x50A0,0x5228,0x4D90}"
 # Every module lifted with merged chunks (one C function per run of chunks,
 # loops as gotos, instead of a trampoline at every branch target). It
 # livelocked until SPU_RdMachStat's interrupts-on assertion check got the
@@ -54,6 +57,10 @@ export JOBMOD_MERGE="${JOBMOD_MERGE-}"
 # KZ2_POST_BLUR=1). Each is called from the job body as `brsl $r0` and does
 # no channel I/O; the body still takes its buffers and DMAs the layer out.
 export JOBMOD_SKIPPABLE="${JOBMOD_SKIPPABLE-a27e818cca34:0x4A20,0x4CB0,0x5138,0x5458;e569adaf4ffe:0x4A20,0x4C40,0x50C8,0x53E8}"
+# Three modules the game keeps at LS 0x8400 beside the job code buffer's job
+# (73d064721abc, the always-running one, 8e97047fac2a, eb97616444b5): lifted
+# there too, so they run compiled instead of interpreted (PROGRESS 84).
+export JOBMOD_ALT_BASE="${JOBMOD_ALT_BASE-73d064721abc@0x8400,8e97047fac2a@0x8400,eb97616444b5@0x8400}"
 "${PY}" -I "${T}/lift_jobmods.py" --jobmods "${OUT}/jobmods" --out "${SPU}" \
     --register "${SPU}/jobmods_register.c" --symbol-prefix kz2
 

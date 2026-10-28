@@ -1,0 +1,325 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 36662928..c0aebc1f 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1719,7 +1719,8 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+  * the image id its lifted functions were registered under. The MFC GET path
+  * marks that overlay resident in the streaming context; dispatch retries a
+  * primary-image miss against the resident overlay's registry. */
+-typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span; } spu_ovl_src;
++typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
++                 uint32_t base;   /* signature sources: the LS base the lift is for (0: any) */ } spu_ovl_src;
+ /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
+  * the same job code buffer at LS 0x4000, dispatched by content signature). */
+ #define SPU_OVL_SRC_MAX 128
+@@ -1863,6 +1864,24 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
+         s_ovl_src[s_ovl_src_count].image_id = image_id;
+         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
+         s_ovl_src[s_ovl_src_count].has_sig = 1;
++        s_ovl_src[s_ovl_src_count].base = 0x4000u;     /* the job code buffer (tools/lift_jobmods.py) */
++        s_ovl_src_count++;
++    }
++}
++
++/* A module also lifted at another LS base (JOBMOD_ALT_BASE): resident only
++ * where it lands at `base`, as a code span of `size` bytes beside the job
++ * code buffer's module (spu_context.resident_code). */
++void spu_overlay_register_sig_at(const uint8_t sig[16], int image_id, uint32_t base, uint32_t size)
++{
++    if (image_id > 0 && image_id < SPU_OVL_SIG_IMAGES) s_ovl_sig_of[image_id] = sig;
++    if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
++        s_ovl_src[s_ovl_src_count].src_ea = 0;
++        s_ovl_src[s_ovl_src_count].image_id = image_id;
++        memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
++        s_ovl_src[s_ovl_src_count].has_sig = 1;
++        s_ovl_src[s_ovl_src_count].base = base & SPU_LS_MASK;
++        s_ovl_src[s_ovl_src_count].span = size;
+         s_ovl_src_count++;
+     }
+ }
+@@ -1956,14 +1975,23 @@ static void spu_ovl_index_build(void)
+     __atomic_store_n(&s_ovl_idx_lock, 0, __ATOMIC_RELEASE);
+ }
+ /* The index of the first source the old scan would have matched, or -1. */
+-static int spu_ovl_find(uint32_t ea, const uint8_t* ls, uint32_t size)
++/* `lsa`: where the GET landed. A signature source with a base matches only
++ * there; *offbase gets the image of a signature match at another base. */
++static int spu_ovl_find(uint32_t ea, const uint8_t* ls, uint32_t size, uint32_t lsa, int* offbase)
+ {
+     if (__atomic_load_n(&s_ovl_idx_built, __ATOMIC_ACQUIRE) != s_ovl_src_count) spu_ovl_index_build();
+     int best = -1;
++    *offbase = 0;
+     if (size >= 512) {
+         uint32_t k; memcpy(&k, ls, 4);
+         for (int i = s_ovl_sig_head[spu_ovl_h(k)]; i >= 0; i = s_ovl_chain[i])
+-            if (memcmp(ls, s_ovl_src[i].sig, 16) == 0) { best = i; break; }
++            if (memcmp(ls, s_ovl_src[i].sig, 16) == 0) {
++                if (s_ovl_src[i].base && s_ovl_src[i].base != lsa) {
++                    if (!*offbase) *offbase = s_ovl_src[i].image_id;
++                    continue;
++                }
++                best = i; break;
++            }
+     }
+     for (int i = s_ovl_ea_head[spu_ovl_h(ea)]; i >= 0 && (best < 0 || i < best); i = s_ovl_chain[i])
+         if (s_ovl_src[i].src_ea == ea) { best = i; break; }
+@@ -1975,15 +2003,52 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+     uint32_t lsa = (uint32_t)(ls - ctx->ls);
+     spu_ovl_dump(ctx, ea, lsa, ls, size);
+     for (unsigned slot = 0; slot < 4; ++slot) {
+-        if (!ctx->resident_code[slot].image_id) continue;
++        const int img = ctx->resident_code[slot].image_id;
++        if (!img) continue;
+         uint32_t base = ctx->resident_code[slot].lsa;
+         uint32_t end = base + ctx->resident_code[slot].size;
++        /* A module known by its signature (a job module lifted at a second
++         * base) spans its whole image, data and buffers included, and the job
++         * DMAs into those all the time; it is gone only when something lands
++         * on its header -- another module or anything else. */
++        if (img > 0 && img < SPU_OVL_SIG_IMAGES && s_ovl_sig_of[img]) {
++            if (lsa < base + 16u && lsa + size > base) {
++                ctx->resident_code[slot].image_id = 0;
++                static int _c = 0; if (_c++ < 8)
++                    fprintf(stderr, "[spu-ovl] code span image %d at LS 0x%05X gone: GET 0x%05X+%u from 0x%08X\n",
++                            img, base, lsa, size, ea);
++            }
++            continue;
++        }
+         if (lsa < end && lsa + size > base &&
+             (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
+             ctx->resident_code[slot].image_id = 0;
+     }
+     {
+-        const int i = spu_ovl_find(ea, ls, size);
++        int offbase = 0;
++        const int i = spu_ovl_find(ea, ls, size, lsa, &offbase);
++        if (i < 0 && offbase) {
++            /* A job module is lifted at the job code buffer, LS 0x4000
++             * (tools/lift_jobmods.py: every module streams there), or at a
++             * base given for it (JOBMOD_ALT_BASE). Seen anywhere else --
++             * Killzone 2 keeps three modules at LS 0x8400 -- its lifted
++             * functions do not belong to those bytes, and making it resident
++             * sent the job manager's next 0x4000 job into this module's lifted
++             * entry at the same 0x4030: wrong code on another module's data,
++             * the lane wrecked its local store and branched to LS 0 or into
++             * garbage (docs/PROGRESS.md 83). It stays out; the bytes there run
++             * through the interpreter as code no lift covers.
++             * SPU_OVL_SIG_ANYBASE=1 takes it anywhere, as before. */
++            static int anybase = -1;
++            if (anybase < 0) { const char* e = getenv("SPU_OVL_SIG_ANYBASE"); anybase = e && e[0] == '1'; }
++            if (!anybase) {
++                static int _m = 0;
++                if (_m++ < 4)
++                    fprintf(stderr, "[spu-ovl] img=%d overlay %d at LS 0x%05X, not at a base it is lifted for: "
++                            "not made resident\n", ctx->image_id, offbase, lsa);
++                return;
++            }
++        }
+         if (i >= 0) {
+             const spu_ovl_src* o = &s_ovl_src[i];
+             if (o->span) {
+@@ -1995,34 +2060,15 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+                     ctx->resident_code[slot].size = o->span;
+                     ctx->resident_code[slot].source_ea = ea;
+                     ctx->resident_code[slot].image_id = o->image_id;
++                    { static int _s = 0; if (_s++ < 8)
++                        fprintf(stderr, "[spu-ovl] img=%d code span image %d at LS 0x%05X size 0x%X (slot %u, GET %u bytes)\n",
++                                ctx->image_id, o->image_id, lsa, o->span, slot, size); }
+                     return;
+                 }
+                 fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+                 return;
+             }
+-            if (o->has_sig) {
+-                /* A job module is lifted at the job code buffer, LS 0x4000
+-                 * (tools/lift_jobmods.py: every module streams there). Seen
+-                 * anywhere else -- Killzone 2 keeps its always-running job,
+-                 * 73d064721abc, at LS 0x8400 -- its lifted functions do not
+-                 * belong to those bytes, and making it resident sent the
+-                 * job manager's next 0x4000 job into this module's lifted
+-                 * entry at the same 0x4030: wrong code on another module's
+-                 * data, the lane wrecked its local store and branched to LS 0
+-                 * or into garbage (docs/PROGRESS.md 83). It stays out; the
+-                 * bytes there run through the interpreter as code no lift
+-                 * covers. SPU_OVL_SIG_ANYBASE=1 takes it anywhere, as before. */
+-                static int anybase = -1;
+-                if (anybase < 0) { const char* e = getenv("SPU_OVL_SIG_ANYBASE"); anybase = e && e[0] == '1'; }
+-                if (!anybase && lsa != 0x4000u) {
+-                    static int _m = 0;
+-                    if (_m++ < 4)
+-                        fprintf(stderr, "[spu-ovl] img=%d overlay %d at LS 0x%05X, not at its lift base 0x4000: "
+-                                "not made resident\n", ctx->image_id, o->image_id, lsa);
+-                    return;
+-                }
+-                spu_ovl_base_note(ctx, lsa);
+-            }
++            if (o->has_sig && !o->span) spu_ovl_base_note(ctx, lsa);
+             if (ctx->resident_ovl != o->image_id) {
+                 ctx->resident_ovl = o->image_id;
+                 { static int _n = 0; if (_n++ < 32)
+diff --git a/runtime/spu/spu_dispatch_mt.c b/runtime/spu/spu_dispatch_mt.c
+index 33e742b8..eb99abeb 100644
+--- a/runtime/spu/spu_dispatch_mt.c
++++ b/runtime/spu/spu_dispatch_mt.c
+@@ -63,6 +63,18 @@ void spu_indirect_branch_mt(spu_context* ctx)
+         spu_overlay_check_entry(ctx);
+     }
+     if (!special) {
++        /* A resident code span owns its range (a job module lifted at a
++         * second base, beside the job code buffer's): resolve there or let
++         * the full resolver decide, as it does. */
++        for (unsigned slot = 0; slot < 4; ++slot) {
++            const int img = ctx->resident_code[slot].image_id;
++            if (img && pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
++                spu_dispatch_fn fs = spu_lookup(pc, img);
++                if (!fs) __attribute__((musttail)) return spu_indirect_branch(ctx);
++                ctx->pc = pc;
++                __attribute__((musttail)) return fs(ctx);
++            }
++        }
+         /* Resident overlay first (mirrors the full resolver): streamed plugin
+          * code owns its LS range; base-image entries at the same address are
+          * stale bytes and must lose. */
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index 9a3bfc09..f47e001d 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -317,7 +317,18 @@ static int spu_step(spu_context* ctx) {
+     } while (0)
+     case SPU_bi:   next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); break;
+     case SPU_bisl: { uint32_t tg = PREF(A) & 0x3FFFC;   /* read ra BEFORE the link write: rt may alias ra */
+-        DST = spu_link((pc + 4) & 0x3FFFC); next = tg; break; }
++        DST = spu_link((pc + 4) & 0x3FFFC); next = tg;
++        /* SPU_INTERP_ENTRY_LOG=1: the indirect calls the interpreter makes, once
++         * each -- function-pointer targets a lift missed, all of them in one run
++         * (the entry log only names where the interpreter was entered). */
++        { static int en = -1; if (en < 0) en = getenv("SPU_INTERP_ENTRY_LOG") ? 1 : 0;
++          if (en) { static uint64_t seen[256]; static int ns;
++            const uint64_t key = ((uint64_t)(uint32_t)ctx->resident_ovl << 32) | tg; int f = 0;
++            for (int k = 0; k < ns; k++) if (seen[k] == key) { f = 1; break; }
++            if (!f && ns < 256) { seen[ns++] = key;
++                fprintf(stderr, "[spu-interp-call] img=%d ovl=%d pc=0x%05X -> 0x%05X\n",
++                        ctx->image_id, ctx->resident_ovl, pc, tg); } } }
++        break; }
+     case SPU_bisled: { uint32_t tg = PREF(A) & 0x3FFFC;   /* branch when an enabled event is pending */
+         DST = spu_link((pc + 4) & 0x3FFFC);
+         if ((__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
+diff --git a/tools/lift_jobmods.py b/tools/lift_jobmods.py
+index 0b2be762..91d48ee2 100644
+--- a/tools/lift_jobmods.py
++++ b/tools/lift_jobmods.py
+@@ -165,28 +165,46 @@ def main():
+     os.makedirs(OUTDIR, exist_ok=True)
+     manifest = []
+     tmp_elf = os.path.join(OUTDIR, "_tmp.elf")
++    # JOBMOD_ALT_BASE="<sha>@<base>[,<sha>@<base>...]": a module the title
++    # loads somewhere other than the job code buffer (Killzone 2 keeps three at
++    # LS 0x8400 next to the buffer's job) is lifted a second time at that base,
++    # as <name>_at<base>, and registered with spu_overlay_register_sig_at so
++    # it is resident there beside the 0x4000 module; at 0x4000 its first lift
++    # keeps working. Addresses given for the 0x4000 lift move with it.
++    alt = {}
++    for item in os.environ.get("JOBMOD_ALT_BASE", "").split(","):
++        if "@" in item:
++            h, b = item.strip().split("@", 1)
++            alt.setdefault(h, []).append(int(b, 0))
++    work = []
+     for path in mods:
++        name = os.path.splitext(os.path.basename(path))[0]
++        work.append((path, name, BASE))
++        for b in alt.get(name.split("_")[1], []):
++            work.append((path, f"{name}_at{b:X}", b))
++    for path, name, base in work:
+         raw = open(path, "rb").read()
+-        name = os.path.splitext(os.path.basename(path))[0]         # jobmod_<sha>_e<entry>
+         sha  = name.split("_")[1]
++        shift = base - BASE                                         # 0 for the job code buffer
+         entry_off = struct.unpack_from(">I", raw, 0x10)[0]
+-        entry = BASE + entry_off
++        entry = base + entry_off
+         prefix = f"{name}_"
+         outsub = os.path.join(OUTDIR, name)
+         # content signature: first 16 bytes (the 4 ila header uniquely identify a module)
+         sig = raw[:16]
+ 
+-        elf = wrap(raw, base=BASE, entry=entry)
++        elf = wrap(raw, base=base, entry=entry)
+         with open(tmp_elf, "wb") as f:
+             f.write(elf)
+ 
+-        cmd = [sys.executable, LIFTER, "--auto-functions", tmp_elf, "--base", hex(BASE),
++        cmd = [sys.executable, LIFTER, "--auto-functions", tmp_elf, "--base", hex(base),
+                "--symbol-prefix", prefix, "-o", outsub,
+                "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h"]
+-        if name in CODE_END:
+-            cmd += ["--code-end", hex(CODE_END[name])]
++        base_name = name.split("_at")[0]
++        if base_name in CODE_END:
++            cmd += ["--code-end", hex(CODE_END[base_name] + shift)]
+         # Only offer addresses that fall inside THIS module's image.
+-        inside = [a for a in EXTRA_FUNCS if BASE <= int(a, 0) < BASE + len(raw)]
++        inside = [hex(int(a, 0) + shift) for a in EXTRA_FUNCS if BASE <= int(a, 0) < BASE + len(raw)]
+         # The module's first function starts right after the 0x30-byte header
+         # (`4 ila | entry | size | 0 | 0 | C0DEC0DE | 0 | 0 | n`). Usually it is
+         # reached by a branch and found anyway, but in two modules it is a bare
+@@ -197,14 +215,14 @@ def main():
+         # corrupted stack (drain-mismatch return_pc=0x50C8 pc=0xA800, jobmod
+         # ef33c6c99dc7). Seeding it is exact, not a heuristic: every module's
+         # first instruction is at +0x30.
+-        inside.append(hex(BASE + 0x30))
+-        inside += MODULE_EXTRA_FUNCS.get(sha, [])
+-        inside += [hex(a) for a in manual_link_targets(raw)]
+-        inside += [hex(a) for a in switch_table_targets(raw)]
++        inside.append(hex(base + 0x30))
++        inside += [hex(int(a, 0) + shift) for a in MODULE_EXTRA_FUNCS.get(sha, [])]
++        inside += [hex(a) for a in manual_link_targets(raw, base=base)]
++        inside += [hex(a) for a in switch_table_targets(raw, base=base)]
+         if inside:
+             cmd += ["--extra-funcs", ",".join(inside)]
+         if sha in MODULE_SKIPPABLE:
+-            cmd += ["--skippable-funcs", ",".join(MODULE_SKIPPABLE[sha])]
++            cmd += ["--skippable-funcs", ",".join(hex(int(a, 0) + shift) for a in MODULE_SKIPPABLE[sha])]
+         # JOBMOD_LIFTER_ARGS: extra spu_lifter.py options for every module
+         # (e.g. --merge-chunks).
+         cmd += os.environ.get("JOBMOD_LIFTER_ARGS", "").split()
+@@ -226,7 +244,7 @@ def main():
+             if "unsupported instruction(s)" in s:
+                 unsup = int(s.split()[0])
+         manifest.append({
+-            "name": name, "prefix": prefix, "base": BASE, "entry": entry,
++            "name": name, "prefix": prefix, "base": base, "entry": entry,
+             "entry_off": entry_off, "sig": sig.hex(), "size": len(raw),
+             "funcs": funcs, "unsupported": unsup,
+         })
+@@ -263,19 +281,29 @@ def emit_register(manifest, REGISTER_C, sym_prefix):
+     L.append("")
+     L.append("extern void spu_begin_image(int image_id);")
+     L.append("extern void spu_overlay_register_sig(const uint8_t sig[16], int image_id);")
++    if any(m["base"] != BASE for m in manifest):
++        L.append("extern void spu_overlay_register_sig_at(const uint8_t sig[16], int image_id, "
++                 "uint32_t base, uint32_t size);")
+     L.append("")
+     for m in manifest:
+         L.append(f"extern void {m['prefix']}spu_recomp_register(void);")
+     L.append("")
+     L.append(f"void {sym_prefix}_jobmods_register_all(void)")
+     L.append("{")
+-    for i, m in enumerate(manifest):
++    # The job code buffer's modules keep their image ids (200 + index among
++    # them); the copies lifted at another base follow.
++    ordered = [m for m in manifest if m["base"] == BASE] + [m for m in manifest if m["base"] != BASE]
++    for i, m in enumerate(ordered):
+         img = JOBMOD_IMAGE_BASE + i
+         sig = bytes.fromhex(m["sig"])
+         arr = ",".join(f"0x{b:02X}" for b in sig)
+         L.append(f"    {{ static const uint8_t sig[16] = {{{arr}}};")
+         L.append(f"      spu_begin_image({img}); {m['prefix']}spu_recomp_register();")
+-        L.append(f"      spu_overlay_register_sig(sig, {img}); }}   /* {m['name']} entry 0x{m['entry']:X} */")
++        if m["base"] == BASE:
++            L.append(f"      spu_overlay_register_sig(sig, {img}); }}   /* {m['name']} entry 0x{m['entry']:X} */")
++        else:
++            L.append(f"      spu_overlay_register_sig_at(sig, {img}, 0x{m['base']:X}u, 0x{m['size']:X}u); }}"
++                     f"   /* {m['name']} entry 0x{m['entry']:X} */")
+     L.append("    spu_begin_image(0);")
+     L.append("}")
+     L.append("")
