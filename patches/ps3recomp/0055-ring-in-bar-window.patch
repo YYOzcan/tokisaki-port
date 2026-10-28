@@ -1,0 +1,54 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 1daf72df..b26e279d 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -845,11 +845,38 @@ static void vk_batch_init(void)
+         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+-    int ring_bad = vk_create_host_buffer_ex(&s_b.ring, VK_RING_BYTES, ring_usage, ring_dl) || !s_b.ring.coherent;
++    /* The ring's size. Without resizable BAR the device-local memory the CPU
++     * can write is a 256 MB window, and the ring is only placed there when
++     * that heap holds twice its size: the 192 MB ring went to host memory,
++     * and every draw read its vertices, indices and constants -- and every
++     * depth snapshot and reinterpret its staging -- across PCIe (Killzone 2 on
++     * an RTX 3060 at PCIe 3.0 x8: 22.9 frames/s; in the window 64 MB 27.8,
++     * 96 MB 27.3, 112 MB 26.4 -- the driver wants room there too). So where
++     * the window cannot hold the 192 MB ring twice, it is 64 MB in the window.
++     * PS3RECOMP_VK_RING_MB=<n> sets it. */
++    static VkDeviceSize ring_bytes = 0;
++    if (!ring_bytes) {
++        const char* e = getenv("PS3RECOMP_VK_RING_MB");
++        const unsigned mb = e ? (unsigned)atoi(e) : 0;
++        ring_bytes = (mb >= 16 && mb <= 1024) ? (VkDeviceSize)mb << 20 : VK_RING_BYTES;
++        if (!mb && ring_dl) {
++            const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++            VkDeviceSize bar = 0;
++            for (u32 i = 0; i < s_vk.memprops.memoryTypeCount; i++) {
++                const VkMemoryType* mt = &s_vk.memprops.memoryTypes[i];
++                const VkDeviceSize hs = s_vk.memprops.memoryHeaps[mt->heapIndex].size;
++                if ((mt->propertyFlags & want) == want && hs > bar) bar = hs;
++            }
++            const VkDeviceSize small = (VkDeviceSize)64u << 20;
++            if (bar && bar < 2u * ring_bytes && bar >= 2u * small) ring_bytes = small;
++        }
++    }
++    int ring_bad = vk_create_host_buffer_ex(&s_b.ring, ring_bytes, ring_usage, ring_dl) || !s_b.ring.coherent;
+     s_b.ring_vram = !ring_bad && s_last_buffer_dl;
+     if (ring_bad && ring_dl) {         /* the BAR window may be smaller than the ring */
+         vk_destroy_buffer(&s_b.ring);
+-        ring_bad = vk_create_host_buffer_ex(&s_b.ring, VK_RING_BYTES, ring_usage, 0) || !s_b.ring.coherent;
++        ring_bad = vk_create_host_buffer_ex(&s_b.ring, ring_bytes, ring_usage, 0) || !s_b.ring.coherent;
+         s_b.ring_vram = 0;
+     }
+     if (ring_bad) {
+@@ -903,7 +930,7 @@ static void vk_batch_init(void)
+     vk_slot_select(0);
+     VK_LOG("batch: %s (ring %u MB in %s memory, %u sets, %u in flight, async after %u operations)\n",
+            s_b.sync ? "off, one submission per operation" : "on",
+-           VK_RING_BYTES >> 20, s_b.ring_vram ? "device-local" : "host", VK_BATCH_SETS,
++           (unsigned)(s_b.ring.size >> 20), s_b.ring_vram ? "device-local" : "host", VK_BATCH_SETS,
+            s_b.nslots, s_b.async_ops);
+ }
+ 

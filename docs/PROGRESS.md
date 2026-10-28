@@ -2120,3 +2120,18 @@ Tried, not kept: the inFAMOUS port's PPU register cache (`ppu_regcache.py`,
 1366/1990 functions of a chunk transformed with this lifter's helpers added):
 20.46 / 20.20 against 22.29 -- slower here (part of it the PGO profile no
 longer matching). `SPURS_PM_SELECT_CURRENT=1`: no change.
+
+## 80. The batch ring in the GPU's window: 22 -> ~27.5 frames/s
+
+Why the GPU was ~13 ms behind at every readback: without resizable BAR, the
+device-local memory the CPU can write is a 256 MB window (246 MB here), and the
+backend only puts its 192 MB batch ring there when the heap holds twice its
+size -- so the ring was in host memory, and every draw read its vertices,
+indices and constants, and every depth snapshot and reinterpret its staging,
+across PCIe (this RTX 3060 sits at PCIe 3.0 x8). `PS3RECOMP_VK_RING_MB=<n>`
+(patch 0055) sets the size; in the window 64 MB gave 27.79, 96 MB 27.27,
+112 MB 26.36 frames/s against 22.91 in host memory, so where the window cannot
+hold the 192 MB ring twice the ring is now 64 MB in it. Two alternating runs
+against the commit before: 29.51 / 25.59 against 21.92 / 22.84 (the second
+run's script ended in a heavier view). `RSX_ASYNC_WB=1` (section 79) adds
+nothing on top (27.25), so it stays opt-in.
