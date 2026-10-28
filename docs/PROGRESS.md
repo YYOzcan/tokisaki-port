@@ -2170,3 +2170,31 @@ Sun), the vertex fetch block loops (Helghast/Pyrrhus 2040, 2073, 2074 on
 `rsx_vertex_compact.c`, which this port has too), 7003 (getenv once).
 Not taken: `KZ2_SPU_POST=0` (drops the SPU post-processing: changes the
 picture), the Direct3D 12 renderer patches.
+
+## 82. Quiet per-event logs, the half decode, and two SPURS findings
+
+- **Per-event log lines** (after Pyrrhus patch 6030): `ps3_log_event` in
+  `runtime/ps3_log.h` gates the lines printed once per SPURS task (CreateTask,
+  _TaskAttributeInitialize, TaskAttr R8-form, dispatch HIT, async RETURNED,
+  built SpursTasksetContext with its fflush). `PS3_LOG_EVENTS=0`: the first 8 of
+  each, then a count at every power of two; default: every line, as before.
+  With `PS3_LOG_EVENTS=0 PS3_VERBOSE=0`: 27.84 / 28.75 against 27.01 / 26.26
+  frames/s, 99k log lines against 637k -- **but in both quiet runs one SPURS
+  kernel lane of the job manager branched to LS 0 mid-level** (`[spu] img=100
+  exit: synthesised stop 0x0000 at LS 0x00000`, `[pm-end] lane 0 halted=1
+  pc=0x00000`), never in the verbose runs: a timing race the slower logging
+  hides, as Pyrrhus found with an SPU assert in The New Sun. The default stays
+  verbose until it is found.
+- **Big-endian half decode without branches** (after Helghast patch 2074):
+  `rsx_compact_be_f16`, the same bits for all 65,536 inputs
+  (`libs/video/tests/test_vtx_f16.c`).
+- **The task pool of section 81 is now opt-in** (`SPU_ASYNC_POOL=1`): with it,
+  a profile shows one SPURS kernel lane at 100% of a core in the job manager's
+  state loop (LS 0x2CC0..0x2D90, polling LS 0x12A0 / 0x12F0, 86% of it in
+  `spu_indirect_branch` / `spu_lookup` / `spu_run_with_halt`); without it, no
+  thread above 67%. Not yet understood -- likely the same job-manager timing
+  sensitivity as the quiet-log stop above.
+
+Profile now (default build, 20 s): FIFO thread 67%, main thread 60% (20% of
+it the SPU progress spin), the five SPURS lanes 60-64%; the FIFO thread's top
+is `rsx_vertex_fetch_all` 10%, `vc_hash` 9%, the NVIDIA driver 9-11%.

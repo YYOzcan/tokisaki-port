@@ -1,0 +1,186 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 31c31e78..cc088a0a 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1086,6 +1086,8 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+             /* Last task argument, for a delayed dump of what it points at. */
+             { extern volatile uint32_t g_spurs_last_task_arg[4];
+               for (int k = 0; k < 4; k++) g_spurs_last_task_arg[k] = task_arg[k]; }
++            static volatile unsigned s_log_ct;
++            if (ps3_log_event(&s_log_ct, "cellSpurs CreateTask"))
+             printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
+                    " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
+                    s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
+@@ -1222,6 +1224,8 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
+       if (s_r8) {
+           attr->argument_ea  = (u32)sizeContext;   /* r8 */
+           attr->lsPattern_ea = 0;                  /* r9 was a leftover */
++          static volatile unsigned s_log_r8;
++          if (ps3_log_event(&s_log_r8, "cellSpurs TaskAttr R8-form"))
+           printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
+                  attr->argument_ea, (u32)(uintptr_t)argument);
+       } }
+@@ -1256,6 +1260,8 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
+                  d, (u32)attr->eaContext, attr->sizeContext,
+                  attr->lsPattern_ea, attr->argument_ea);
+       } }
++    static volatile unsigned s_log_tai;
++    if (ps3_log_event(&s_log_tai, "cellSpurs _TaskAttributeInitialize"))
+     printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
+            (u32)eaElf, (u32)eaContext, sizeContext,
+            attr->lsPattern_ea, attr->argument_ea);
+diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
+index 4a4dc51f..e21cf6f4 100644
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -15,19 +15,18 @@ static float rsx_compact_be_f32(const u8* p)
+     return f;
+ }
+ 
+-static float rsx_compact_be_f16(const u8* p)
++/* Big-endian half to float, without branches (after Killzone 3 port patch
++ * 2074, Project Helghast by undecuple, MIT): exponents 1-30 give
++ * (h & 0x7FFF) << 13 plus a rebias of 112 << 23, exponent 31 (Inf/NaN) the
++ * rebias 224 << 23, exponent 0 (zero and denormals) the sign alone, as the
++ * branching form did -- the same bits for all 65,536 inputs
++ * (tests/test_vtx_f16.c). The selects compile to cmov. */
++static inline float rsx_compact_be_f16(const u8* p)
+ {
+-    const u16 h = (u16)((p[0] << 8) | p[1]);
+-    const u32 sign = (u32)(h >> 15) << 31;
+-    const u32 exp = (h >> 10) & 0x1F;
+-    const u32 man = h & 0x3FF;
+-    u32 out;
+-    if (exp == 0)
+-        out = sign;
+-    else if (exp == 31)
+-        out = sign | 0x7F800000u | (man << 13);
+-    else
+-        out = sign | ((exp + 112) << 23) | (man << 13);
++    const u32 h = ((u32)p[0] << 8) | p[1];
++    const u32 e = h & 0x7C00u;
++    const u32 mag = ((h & 0x7FFFu) << 13) + (e == 0x7C00u ? (224u << 23) : (112u << 23));
++    const u32 out = ((h & 0x8000u) << 16) | (e ? mag : 0u);
+     float f;
+     memcpy(&f, &out, sizeof(f));
+     return f;
+diff --git a/libs/video/tests/test_vtx_f16.c b/libs/video/tests/test_vtx_f16.c
+new file mode 100644
+index 00000000..2dbf84dc
+--- /dev/null
++++ b/libs/video/tests/test_vtx_f16.c
+@@ -0,0 +1,26 @@
++/* Host test: the branch-free big-endian half decode of rsx_vertex_compact.c
++ * gives the same bits as the branching one for all 65,536 inputs.
++ *   cc -O2 -o /tmp/tf test_vtx_f16.c && /tmp/tf */
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++static uint32_t ref(uint32_t h)          /* the decode before: zero/denormal flush, Inf/NaN, normal */
++{
++    const uint32_t sign = (h >> 15) << 31, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
++    if (exp == 0) return sign;
++    if (exp == 31) return sign | 0x7F800000u | (man << 13);
++    return sign | ((exp + 112) << 23) | (man << 13);
++}
++static uint32_t nb(uint32_t h)           /* rsx_compact_be_f16 now */
++{
++    const uint32_t e = h & 0x7C00u;
++    const uint32_t mag = ((h & 0x7FFFu) << 13) + (e == 0x7C00u ? (224u << 23) : (112u << 23));
++    return ((h & 0x8000u) << 16) | (e ? mag : 0u);
++}
++int main(void)
++{
++    unsigned bad = 0;
++    for (uint32_t h = 0; h < 65536u; h++) if (ref(h) != nb(h)) { if (!bad) printf("first diff h=%04X %08X %08X\n", h, ref(h), nb(h)); bad++; }
++    printf("%s: %u of 65536 differ\n", bad ? "FAIL" : "ok", bad);
++    return bad != 0;
++}
+diff --git a/runtime/ps3_log.h b/runtime/ps3_log.h
+index 4b7df8c5..d1f22262 100644
+--- a/runtime/ps3_log.h
++++ b/runtime/ps3_log.h
+@@ -45,4 +45,27 @@ static __inline int ps3_log_verbose(void)
+     return v;
+ }
+ 
++
++/* ps3_log_event(&counter, what): for the lines a title prints once per event
++ * (Killzone 2 creates and runs ~150 SPURS tasks a second, ~4,000 lines a
++ * second in a level -- each stderr line a write(2) under the FILE lock).
++ * PS3_LOG_EVENTS=0: the first 8 of each kind, then one "[log] <what>: N so far"
++ * line at every power of two; unset or 1: every line, as before. After the
++ * Killzone 2 port's patch 6030 (Project Pyrrhus by undecuple, MIT), which
++ * found that the quieter log changed the title's timing (an SPU assert race
++ * it then hit), so the default stays every line. */
++#ifdef __cplusplus
++static inline int ps3_log_event(volatile unsigned* counter, const char* what)
++#else
++static __inline int ps3_log_event(volatile unsigned* counter, const char* what)
++#endif
++{
++    static int all = -1;
++    if (all < 0) { const char* e = getenv("PS3_LOG_EVENTS"); all = !(e && e[0] == '0'); }
++    if (all) return 1;
++    const unsigned k = __atomic_add_fetch(counter, 1u, __ATOMIC_RELAXED);
++    if (k <= 8u) return 1;
++    if ((k & (k - 1u)) == 0u) fprintf(stderr, "[log] %s: %u so far\n", what, k);
++    return 0;
++}
+ #endif /* PS3_LOG_H */
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 1eb7a16f..f70656ae 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -689,9 +689,11 @@ static void spu_async_run(spu_async_job* j)
+                  * both audio tasks run task 1's descriptor). */
+                 if (j->taskset_ea) {
+                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
++                    static volatile unsigned s_log_tsc;
++                    if (ps3_log_event(&s_log_tsc, "taskset built SpursTasksetContext")) {
+                     fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                             "taskset=0x%08X task=%u\n", j->image_id,
+-                            j->taskset_ea, j->taskid); fflush(stderr);
++                            j->taskset_ea, j->taskid); fflush(stderr); }
+                 }
+             }
+             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
+@@ -830,6 +832,8 @@ static void spu_async_run(spu_async_job* j)
+                   FILE* f = fopen(path, "wb");
+                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
+                       fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
++            static volatile unsigned s_log_ret;
++            if (ps3_log_event(&s_log_ret, "spu_workload async RETURNED"))
+             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+                     "(job ran to completion, did not loop)\n", j->image_id, rc);
+             spu_serial_release();
+@@ -1394,6 +1398,8 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
+     }
+ 
++    static volatile unsigned s_log_hit;
++    if (ps3_log_event(&s_log_hit, "spu_workload dispatch HIT (async)"))
+     fprintf(stderr,
+         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
+         (unsigned long long)fp, args_ea, image_id);
+@@ -1437,13 +1443,16 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+      * mmap'd and committed on touch, so this reserves address space rather
+      * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
+      * the guard page above. */
+-    /* SPU_ASYNC_POOL=0: a new thread per task, as before; otherwise a pool
+-     * thread (spu_async_pool.h; SPU_ASYNC_POOL_IDLE_MS, default 10000, is how
+-     * long a parked one waits for the next task before it ends). */
++    /* SPU_ASYNC_POOL=1: a pool thread (spu_async_pool.h; SPU_ASYNC_POOL_IDLE_MS,
++     * default 10000, is how long a parked one waits for the next task before
++     * it ends); unset or 0 (default): a new thread per task, as before. Off by
++     * default: in Killzone 2 with the pool, one SPURS kernel lane spins at
++     * 100% in the job manager's state loop (LS 0x2CC0..0x2D90, through
++     * spu_indirect_branch), not yet understood (docs/PROGRESS.md 82). */
+     static int pool = -1;
+     if (pool < 0) {
+         const char* e = getenv("SPU_ASYNC_POOL");
+-        pool = !(e && e[0] == '0');
++        pool = e && e[0] == '1';
+         const char* ms = getenv("SPU_ASYNC_POOL_IDLE_MS");
+         if (ms && atoi(ms) > 0) s_pool_idle_ms = (unsigned)atoi(ms);
+         s_pool_after = spu_async_pool_after;
