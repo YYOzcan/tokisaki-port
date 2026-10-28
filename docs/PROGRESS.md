@@ -2198,3 +2198,47 @@ picture), the Direct3D 12 renderer patches.
 Profile now (default build, 20 s): FIFO thread 67%, main thread 60% (20% of
 it the SPU progress spin), the five SPURS lanes 60-64%; the FIFO thread's top
 is `rsx_vertex_fetch_all` 10%, `vc_hash` 9%, the NVIDIA driver 9-11%.
+
+## 83. A SPURS lane that went wild in half of all runs: off-base job modules
+
+Since at least the merged job-manager lift, about half of all runs had one
+SPURS kernel lane of the WWS job manager (policy image 100) stop mid-level:
+`[spu] img=100 exit: synthesised stop ... at LS 0x00000` (or at an odd
+address in the job area), `[pm-end] lane 0 ... halted=1`; the game went on, the
+lane's claimed jobs stranded. Quieter logging (section 82), the lean accessors
+below and the task pool made it more frequent.
+
+A dump at the stop (`[spu] img=100 ... LS0 regs/code/stack/state`, printed only
+then) showed the policy context's local store overwritten -- its interrupt
+vector at LS 0 (`bra 0xA2C`, written at its entry 0x2C40), its stack and its
+job-pipeline words gone to zero or to float data -- and the interpreter
+fallback before it named the cause: `resident_ovl=215` while LS 0x4000 held job
+module 202. Every Killzone 2 job module is lifted at the job code buffer, LS
+0x4000 (`tools/lift_jobmods.py`), but the game keeps three modules --
+215 `73d064721abc` (the always-running job of section 72), 222 and 233 -- at
+LS 0x8400. Their signature landing there made 215 "resident", and the next
+job at 0x4000 resolved its entry 0x4030 to 215's lifted function: one module's
+code on another's data.
+
+`spu_overlay_note_get` now makes a signature module resident only at its lift
+base, 0x4000 (`[spu-ovl] ... overlay 215 at LS 0x08400, not at its lift base
+0x4000: not made resident`); the bytes at 0x8400 run through the interpreter as
+code no lift covers, as they effectively always had to. `SPU_OVL_SIG_ANYBASE=1`
+= before. Also: a check at every call from the policy module into the job area
+compares the resident module's header with the bytes at its base
+(`spu_overlay_check_entry`, in the fast resolver too; `SPU_OVL_ENTRY_CHECK=0`
+off), and a GET over a policy module's LS 0 is named (`[spu-ls0]`).
+Four runs after: no stop (before: about one run in two).
+
+**Lean guest-memory checks** (lifter header, `PPU_VM_CHECKED` restores the old
+ones): the inline accessors of the lifted PPU code tested `vm_inline_ok`,
+`ppu_vm_size` and the store-watch flags on every access -- globals the compiler
+had to load again after each guest store. With the whole 4 GB reserved and the
+watches off they are constant; the lean test is the range and the HLE inject
+word only (stores keep the null-sweep and SPU-reservation tests). 28.24 / 27.01
+against 26.38 / 27.09 frames/s. ThinLTO (`KZ2_PPU_THINLTO`, rebuilt at this
+commit): 26.58 / 26.26 against 28.29 / 24.19, no gain. A 125 Hz guest vblank
+(`KZ2_VBLANK_MS=8`): no higher rate -- the game is not at its frame cap; the
+shortest frames are ~26-28 ms (the RPCS3 wiki notes Killzone 2 runs at 60
+with a 120 Hz vblank, some elements bugged).
+Hand play on this build (the user): rarely below 30, 40-45 at times.
