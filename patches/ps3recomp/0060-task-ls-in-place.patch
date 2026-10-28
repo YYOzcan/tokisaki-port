@@ -1,0 +1,76 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index c0aebc1f..cc956170 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -975,7 +975,9 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+          * polling the MMIO window, whereas SPURS-thread mailboxes are drained
+          * by paths that do not wake a stalled writer. A raw SPU's local store
+          * is the guest window, not its own buffer. */
+-        if (ctx->ls != ctx->ls_store)
++        /* raw: the local store is the guest window (a task's own buffer,
++         * spu_context_init_ls, is not raw) */
++        if (ctx->ls != ctx->ls_store && ctx->ls >= vm_base && ctx->ls < vm_base + 0x100000000ull)
+             while (ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH && ctx->status != SPU_STATUS_STOPPED)
+                 Sleep(0);
+         spu_channel_write(&ctx->ch_out_mbox, v);
+diff --git a/runtime/spu/spu_lifted_job.h b/runtime/spu/spu_lifted_job.h
+index bc57dec6..b20358d2 100644
+--- a/runtime/spu/spu_lifted_job.h
++++ b/runtime/spu/spu_lifted_job.h
+@@ -21,6 +21,27 @@
+ #include <stdlib.h>
+ 
+ typedef void (*spu_lifted_entry_fn)(spu_context*);
++
++/* spu_context_init for a context that runs on a local store it is given (a
++ * task's or job's own buffer, which the caller owns for the run): `ls` points
++ * there, and the 256 KB ls_store is neither cleared nor copied in and out
++ * around the run -- a SPURS task paid a 256 KB memset and two 256 KB copies,
++ * ~1,300 tasks a second in Killzone 2. SPU_TASK_LS_COPY=1: copy as before. */
++#include <stddef.h>
++static inline int spu_task_ls_in_place(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("SPU_TASK_LS_COPY"); on = !(e && e[0] == '1'); }
++    return on;
++}
++static inline void spu_context_init_ls(spu_context* ctx, uint32_t spu_id, uint8_t* ls)
++{
++    memset(ctx, 0, offsetof(spu_context, ls_store));
++    memset((uint8_t*)ctx + offsetof(spu_context, ls), 0, sizeof(*ctx) - offsetof(spu_context, ls));
++    ctx->ls     = ls;
++    ctx->spu_id = spu_id;
++    ctx->status = SPU_STATUS_STOPPED;
++}
+ /* Guest RAM base, for decoding a raw SPU thread's argument block. */
+ extern uint8_t* vm_base;
+ 
+@@ -161,7 +182,9 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+ {
+     if (!entry) return -1;
+     spu_context ctx;
+-    spu_context_init(&ctx, 0);
++    const int in_place = local_store && spu_task_ls_in_place();
++    if (in_place) spu_context_init_ls(&ctx, 0, local_store);
++    else          spu_context_init(&ctx, 0);
+     { static int s_cl = -1;
+       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
+       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d\n",
+@@ -190,7 +213,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+      * this it is 0 from spu_context_init, so the first `r1 -= frame` wraps
+      * negative -> garbage stack -> null function pointers -> branch to LS 0. */
+     ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;   /* 0x3FFF0 for a 256KB LS */
+-    if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);  /* job's LS in */
++    if (local_store && !in_place) memcpy(ctx.ls, local_store, SPU_LS_SIZE);  /* job's LS in */
+     /* A SpursTasksetContext at LS 0x2700 (built by spurs_pm_build_context) writes
+      * syscallAddr=0xA70 at STC_SYSCALL_ADDR (0x27C4). That sentinel means "this is
+      * a generic SPURS taskset task" (LBP's audio SPEEX/MultiStream tasks) -- flOw
+@@ -335,7 +358,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+      * GH3's Havok task returning is what first hit it. */
+     spu_mfc_release(&ctx);
+     spu_coh_unregister(&ctx);
+-    if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
++    if (local_store && !in_place) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
+     return 0;
+ }
+ 

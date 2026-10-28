@@ -2284,3 +2284,25 @@ no lane stop in six runs with them, and the task pool's lane spinning at 100%
 29.48 / 30.50 frames/s. `src/boot_main.cpp` now sets the three unless the
 environment already does (the log of a 160 s run drops from 57 MB to a few).
 Against the previous play build: 30.39 against 26.81 (one pair).
+
+## 86. Where the frame goes at 30, and two copies less
+
+At ~30 frames/s the FIFO thread drains 71-82% of the time (6-7% of it waiting
+for the GPU), is parked on an SPU-patched jump 17-28% and never waits for the
+PPU (`KZ2_RSX_TIMES=1`): its own CPU work is most of the frame. Its library
+time, named now (`build/kzprof` writes the executable mappings into the raw
+dump; `tools/kzprof_libs.py <raw> [tid]` resolves them): `memcpy` 13.4%, the
+NVIDIA driver ~11%. An LD_PRELOAD `memcpy` counter by caller showed the
+process copying ~3.5 GB/s: SPU DMA 2.6 GB/s (`mfc_do_transfer`, the jobs' own
+data), every SPURS task's 256 KB local store copied in and out (~650 MB/s),
+and on the FIFO thread ~0.8 GB/s (draw constants, vertices, indices).
+
+- SPURS tasks run on their own local store buffer (`spu_context_init_ls`,
+  `runtime/spu/spu_lifted_job.h`): no 256 KB clear, no copy in or out.
+  `SPU_TASK_LS_COPY=1` = before. The raw-SPU mailbox test now asks whether the
+  local store is the guest window, not merely another buffer.
+  30.32 / 30.68 against 31.30 / 29.71 -- no change in rate, ~650 MB/s less.
+
+The main thread at ~30: 64% running (the SPU-progress spin included), blocked
+36%: SPU job counters (`func_004D3D00`) ~12%, condition waits under
+`func_00803590` ~13%, the label wait ~6%.

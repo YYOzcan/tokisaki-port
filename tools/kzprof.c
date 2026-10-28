@@ -116,13 +116,14 @@ int main(int argc, char** argv)
     ssize_t el = readlink(path, exe, sizeof exe - 1); if (el > 0) exe[el] = 0;
     snprintf(path, sizeof path, "/proc/%d/maps", pid);
     FILE* m = fopen(path, "r"); char line[1024];
-    typedef struct { uint64_t lo, hi; char n[64]; } map_t; static map_t maps[4096]; int nm = 0;
+    typedef struct { uint64_t lo, hi, off; char n[64]; char path[256]; } map_t; static map_t maps[4096]; int nm = 0;
     while (m && fgets(line, sizeof line, m)) {
         uint64_t lo, hi, off; char perm[8], file[512] = ""; int fo = 0;
         if (sscanf(line, "%lx-%lx %7s %lx %*s %*s %n", &lo, &hi, perm, &off, &fo) < 4) continue;
         if (fo > 0) { snprintf(file, sizeof file, "%s", line + fo); file[strcspn(file, "\n")] = 0; }
         if (!base && strcmp(file, exe) == 0 && off == 0) base = lo;
-        if (perm[2] == 'x' && nm < 4096) { maps[nm].lo = lo; maps[nm].hi = hi;
+        if (perm[2] == 'x' && nm < 4096) { maps[nm].lo = lo; maps[nm].hi = hi; maps[nm].off = off;
+            snprintf(maps[nm].path, sizeof maps[nm].path, "%s", file);
             const char* sl = strrchr(file, '/'); snprintf(maps[nm].n, 64, "%s", sl ? sl + 1 : file); nm++; }
     }
     if (m) fclose(m);
@@ -130,6 +131,12 @@ int main(int argc, char** argv)
      * executable's load base) for offline analysis (tools/kzprof_ips.py) */
     { const char* rawp = getenv("KZPROF_RAW"); FILE* rf = rawp ? fopen(rawp, "w") : 0;
       if (rf) { fprintf(rf, "# exe %s\n", exe);
+                /* the executable mappings, so library samples can be named
+                 * offline: "# map <lo> <hi> <file offset> <path>" (absolute ips) */
+                for (int j = 0; j < nm; j++)
+                    fprintf(rf, "# map %lx %lx %lx %s\n", (unsigned long)maps[j].lo, (unsigned long)maps[j].hi,
+                            (unsigned long)maps[j].off, maps[j].path);
+                fprintf(rf, "# base %lx\n", (unsigned long)base);
                 for (size_t i = 0; i < s_n; i++) fprintf(rf, "%u %lx %lu\n", s_samp[i].tid, (unsigned long)(s_samp[i].ip - base), (unsigned long)s_samp[i].t);
                 fclose(rf); } }
     char cmd[700]; snprintf(cmd, sizeof cmd, "nm --defined-only '%s' 2>/dev/null", exe);
