@@ -1,0 +1,342 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 6cfb1d41..63b97393 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -505,6 +505,39 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+     uint8_t* ls  = &ctx->ls[lsa];
+     uint8_t* mem = vm_base + ea;
+ 
++    /* SPU_ATOM_STATS=1: every 5 s, the lines with the most atomic commands,
++     * by command, with the image, job overlay and pc of the last one (racy
++     * counters, one table for all SPU threads). */
++    { static int on = -1; if (on < 0) { const char* e = getenv("SPU_ATOM_STATS"); on = e && e[0] == '1'; }
++      if (on) {
++          enum { N = 64 };
++          static struct { uint32_t ea; unsigned long long n[4]; int img, ovl; uint32_t pc; } t[N];
++          static double t0;
++          const int k = cmd == MFC_GETLLAR_CMD ? 0 : cmd == MFC_PUTLLC_CMD ? 1 : cmd == MFC_PUTLLUC_CMD ? 2 : 3;
++          int i = (int)((ea >> 7) * 2654435761u >> 26) & (N - 1);
++          for (int probe = 0; probe < N; probe++, i = (i + 1) & (N - 1))
++              if (t[i].ea == ea || !t[i].ea) { t[i].ea = ea; t[i].n[k]++; t[i].img = ctx->image_id;
++                                               t[i].ovl = ctx->resident_ovl; t[i].pc = (uint32_t)ctx->pc & SPU_LS_MASK; break; }
++          struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++          const double now = ts.tv_sec + ts.tv_nsec * 1e-9;
++          if (!t0) t0 = now;
++          if (now - t0 >= 5.0) {
++              t0 = now;
++              for (int r = 0; r < 8; r++) {
++                  int best = -1; unsigned long long bn = 0;
++                  for (int j = 0; j < N; j++) {
++                      const unsigned long long tot = t[j].n[0] + t[j].n[1] + t[j].n[2] + t[j].n[3];
++                      if (t[j].ea && tot > bn) { bn = tot; best = j; }
++                  }
++                  if (best < 0) break;
++                  fprintf(stderr, "[atom-stats] line 0x%08X: getllar %llu putllc %llu putlluc %llu putqlluc %llu (img %d ovl %d pc 0x%05X)\n",
++                          t[best].ea, t[best].n[0], t[best].n[1], t[best].n[2], t[best].n[3],
++                          t[best].img, t[best].ovl, t[best].pc);
++                  t[best].ea = 0;
++              }
++              memset(t, 0, sizeof t);
++          }
++      } }
+     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
+       if (s_t) { static uint64_t s_n = 0; static uint32_t s_lastea = 0;
+         if ((++s_n % 2000000) == 0 || ea != s_lastea) {
+@@ -638,6 +671,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+          * peer that must WRITE the line waits for it (canersaka ticks the
+          * GETLLAR fast+slow paths for exactly this reason). */
+         yz_lockstep_tick(ctx);
++        if (spu_getllar_fast(ctx, ea, ls, mem)) { ctx->dbg_getllar++; return 1; }
+         spu_lockline_lock();
+         /* Tell the PPU store paths this line is live, so a store into it goes
+          * through the lock and raises SPU_EVENT_LR here instead of landing
+@@ -1103,6 +1137,43 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+     ctx->status = SPU_STATUS_RUNNING;
+ }
+ 
++/* The "wait for this line to change" read -- GETLLAR, find nothing to take,
++ * rdch SPU_RdEventStat with only the lost-reservation event enabled -- parks
++ * for a while even without SPU_CH_BLOCK: every writer of a reserved line
++ * raises SPU_EVENT_LR and wakes the holder (spu_coh_notify_write*), and the
++ * line is compared again on every timeout. Without it the read came back at
++ * once and the loop span: Killzone 2's SPU task image 5 waited on a semaphore
++ * line with ~740,000 GETLLARs a second. Capped (SPU_LR_WAIT_US, default 2000;
++ * 0 = never park): a writer that did not wake costs at most that. */
++static void spu_lr_wait(spu_context* ctx)
++{
++    static long cap_us = -1;
++    if (cap_us < 0) { const char* e = getenv("SPU_LR_WAIT_US"); cap_us = e ? atol(e) : 2000; }
++    if (cap_us <= 0) return;
++    spu_resv_lost_poll(ctx);
++    for (int i = 0; i < 64 && !(ctx->event_status & ctx->event_mask); i++) {
++#if defined(__x86_64__) || defined(__i386__)
++        __builtin_ia32_pause();
++#endif
++        spu_resv_lost_poll(ctx);
++    }
++    if (ctx->event_status & ctx->event_mask) return;
++    struct timespec t0, t;
++    clock_gettime(CLOCK_MONOTONIC, &t0);
++    for (;;) {
++        AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
++        spu_resv_lost_poll(ctx);
++        if (!(__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask))
++            SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
++                                      (SRWLOCK*)&ctx->ch_wait_lock, 1, 0);
++        ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
++        spu_resv_lost_poll(ctx);
++        if (__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) return;
++        clock_gettime(CLOCK_MONOTONIC, &t);
++        if ((t.tv_sec - t0.tv_sec) * 1000000L + (t.tv_nsec - t0.tv_nsec) / 1000L >= cap_us) return;
++    }
++}
++
+ /* ===========================================================================
+  * Channel read (returns value in the preferred word slot)
+  * ===========================================================================*/
+@@ -1130,6 +1201,8 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
+         spu_ch_wait(ctx, channel, "rdch");
+     else if (channel == SPU_RdEventStat && ctx->event_mask != 0)
+         spu_ch_wait(ctx, channel, "rdch");
++    if (channel == SPU_RdEventStat && ctx->event_mask == 0x400u && ctx->resv_valid && !yz_ch_block())
++        spu_lr_wait(ctx);
+ 
+     uint32_t v = 0;
+ 
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 037245e4..9793e70e 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <stdlib.h>
++#include <string.h>
+ #include "spu_coherency.h"
+ 
+ #include <stdint.h>
+@@ -51,9 +52,74 @@ void spu_lockline_lock(void)
+ void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
+ #else
+ #include <stdatomic.h>
+-static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
+-void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
+-void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
++#include <sched.h>
++#if defined(__x86_64__) || defined(__i386__)
++#include <immintrin.h>
++#define SPU_LL_PAUSE() _mm_pause()
++#else
++#define SPU_LL_PAUSE() ((void)0)
++#endif
++/* Test-and-test-and-set as on Windows above. The bare test-and-set loop had
++ * every waiter hammer the line with locked exchanges: in Killzone 2's level
++ * five SPU threads and the PPU take this lock for every PUT and atomic, and
++ * the waiters slowed the holder and their SMT siblings (spu_lockline_lock
++ * ~5% of an SPU thread, ~3% of the main thread). */
++static atomic_int g_lockline = 0;
++static atomic_uint g_ll_seq = 0;
++/* SPU_LL_STATS=1: every 5 s, the callers that took the lock most, with how
++ * many of those acquisitions had to wait and for how many spins. */
++static void spu_ll_stats(void* ra, unsigned long long spun);
++static int s_ll_stats = -1;
++__attribute__((noinline)) void spu_lockline_lock(void)
++{
++    unsigned spins = 0;
++    unsigned long long spun = 0;
++    while (atomic_exchange_explicit(&g_lockline, 1, memory_order_acquire)) {
++        do {
++            SPU_LL_PAUSE();
++            spun++;
++            if (++spins >= 4096) { spins = 0; sched_yield(); }
++        } while (atomic_load_explicit(&g_lockline, memory_order_relaxed));
++    }
++    /* odd while held: spu_getllar_fast's snapshot is valid only if this
++     * stayed even and unchanged across its copy */
++    atomic_store_explicit(&g_ll_seq, atomic_load_explicit(&g_ll_seq, memory_order_relaxed) + 1u,
++                          memory_order_relaxed);
++    atomic_thread_fence(memory_order_release);
++    if (__builtin_expect(s_ll_stats != 0, 0)) {
++        if (s_ll_stats < 0) { const char* e = getenv("SPU_LL_STATS"); s_ll_stats = e && e[0] == '1'; }
++        if (s_ll_stats) spu_ll_stats(__builtin_return_address(0), spun);
++    }
++}
++#include <stdio.h>
++#include <time.h>
++static void spu_ll_stats(void* ra, unsigned long long spun)
++{
++    /* called with the lock held: no other synchronisation needed */
++    static struct { void* ra; unsigned long long n, waited, spins; } t[32];
++    static double t0;
++    for (int i = 0; i < 32; i++)
++        if (t[i].ra == ra || !t[i].ra) { t[i].ra = ra; t[i].n++; if (spun) { t[i].waited++; t[i].spins += spun; } break; }
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    const double now = ts.tv_sec + ts.tv_nsec * 1e-9;
++    if (!t0) t0 = now;
++    if (now - t0 < 5.0) return;
++    t0 = now;
++    fprintf(stderr, "[ll-stats] per 5 s (caller offset from spu_lockline_lock: taken / waited / spins):");
++    for (int i = 0; i < 32 && t[i].ra; i++)
++        fprintf(stderr, " %+lld:%llu/%llu/%llu", (long long)((char*)t[i].ra - (char*)(void*)spu_lockline_lock),
++                t[i].n, t[i].waited, t[i].spins);
++    fprintf(stderr, "\n");
++    for (int i = 0; i < 32; i++) t[i].ra = 0, t[i].n = t[i].waited = t[i].spins = 0;
++}
++void spu_lockline_unlock(void)
++{
++    atomic_thread_fence(memory_order_release);
++    atomic_store_explicit(&g_ll_seq, atomic_load_explicit(&g_ll_seq, memory_order_relaxed) + 1u,
++                          memory_order_relaxed);
++    atomic_store_explicit(&g_lockline, 0, memory_order_release);
++}
++#define SPU_HAVE_GETLLAR_FAST 1
+ #endif
+ 
+ /* ===========================================================================
+@@ -92,6 +158,13 @@ typedef struct spu_coh_entry {
+     struct spu_coh_entry* next;
+ } spu_coh_entry;
+ static spu_coh_entry* s_coh_ctxs;
++/* Registration, remembered per thread for spu_getllar_fast: the (context,
++ * generation) this thread last registered or found registered. Every removal
++ * from s_coh_ctxs bumps the generation, so a context freed and another built
++ * at the same address is not taken for registered. */
++static volatile unsigned s_coh_gen = 1;
++static SPU_THREAD_LOCAL spu_context* t_coh_ctx;
++static SPU_THREAD_LOCAL unsigned t_coh_gen;
+ 
+ unsigned long g_spu_lr_raise = 0;
+ 
+@@ -102,6 +175,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+     s_coh_armed = 1;
+ 
+     if (!ctx) return;
++    t_coh_ctx = ctx; t_coh_gen = s_coh_gen;   /* under the lock: registered once this returns */
+     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
+         if (entry->ctx == ctx) return;
+     spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
+@@ -134,6 +208,7 @@ void spu_coh_unregister(spu_context* ctx)
+      * (or its whole async thread) was gone. GH3 at -O2 crashed that way in
+      * spu_coh_notify_write, reading a freed thread stack. */
+     spu_lockline_lock();
++    __atomic_add_fetch(&s_coh_gen, 1u, __ATOMIC_SEQ_CST);
+     for (spu_coh_entry** link = &s_coh_ctxs; *link; link = &(*link)->next) {
+         if ((*link)->ctx != ctx) continue;
+         spu_coh_entry* entry = *link;
+@@ -144,6 +219,62 @@ void spu_coh_unregister(spu_context* ctx)
+     spu_lockline_unlock();
+ }
+ 
++/* GETLLAR without the lock, for a context already registered on a line
++ * already marked -- the policy modules' and the job manager's poll loops,
++ * millions a second in Killzone 2's level, ~45% of them waiting for the lock.
++ * The reservation is published first, so a lock holder that writes the line
++ * from then on raises SPU_EVENT_LR as before; the 128 bytes are a seqlock read
++ * against the lock's counter, so they are not torn by any lock holder. A
++ * write that lands between publishing and the copy costs a spurious lost
++ * reservation, which hardware allows and PUTLLC's compare would catch anyway.
++ * Returns 0 when the caller must take the locked path. SPU_GETLLAR_FAST=0
++ * always takes it. */
++int spu_getllar_fast(spu_context* ctx, uint32_t ea, void* ls, const void* mem)
++{
++#ifdef SPU_HAVE_GETLLAR_FAST
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("SPU_GETLLAR_FAST"); on = !(e && e[0] == '0'); }
++    if (!on || !ctx) return 0;
++    /* SPU_LL_STATS=1 also counts what this path did (racy counters) */
++    static unsigned long long st[5]; static double st_t0;
++    const int stats = s_ll_stats > 0;
++    if (stats) {
++        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++        const double now = ts.tv_sec + ts.tv_nsec * 1e-9;
++        if (!st_t0) st_t0 = now;
++        if (now - st_t0 >= 5.0) {
++            st_t0 = now;
++            fprintf(stderr, "[getllar-fast] per 5 s: ok %llu, line not marked %llu, not registered %llu, torn %llu\n",
++                    st[0], st[1], st[2], st[3]);
++            memset(st, 0, sizeof st);
++        }
++    }
++    const uint32_t line = ea >> SPU_COH_LINE_SHIFT;
++    if (!(s_coh_bitmap[line >> 3] & (1u << (line & 7)))) { if (stats) st[1]++; return 0; }
++    if (t_coh_ctx != ctx || t_coh_gen != __atomic_load_n(&s_coh_gen, __ATOMIC_ACQUIRE)) { if (stats) st[2]++; return 0; }
++    __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
++    __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_SEQ_CST);
++    /* A held lock (odd counter) is waited out with pauses -- reads, not the
++     * locked exchanges of the lock itself -- up to ~2k pauses, then the lock. */
++    for (int tries = 0, waits = 0; tries < 8 && waits < 2048;) {
++        const unsigned s1 = atomic_load_explicit(&g_ll_seq, memory_order_acquire);
++        if (s1 & 1u) { SPU_LL_PAUSE(); waits++; continue; }
++        tries++;
++        memcpy(ls, mem, MFC_ATOMIC_LINE);
++        atomic_thread_fence(memory_order_acquire);
++        if (atomic_load_explicit(&g_ll_seq, memory_order_relaxed) != s1) continue;
++        memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);
++        ctx->atomic_stat = 4;
++        if (stats) st[0]++;
++        return 1;
++    }
++    if (stats) st[3]++;
++#else
++    (void)ctx; (void)ea; (void)ls; (void)mem;
++#endif
++    return 0;
++}
++
+ /* Drop every registered context that lies in [lo, hi) -- a host thread's
+  * stack, called as that thread exits. A stack-local context still registered
+  * then has leaked past its unregister; the next walker would read an unmapped
+@@ -153,6 +284,7 @@ void spu_coh_unregister(spu_context* ctx)
+ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
+ {
+     spu_lockline_lock();
++    __atomic_add_fetch(&s_coh_gen, 1u, __ATOMIC_SEQ_CST);
+     for (spu_coh_entry** link = &s_coh_ctxs; *link;) {
+         spu_coh_entry* entry = *link;
+         uintptr_t c = (uintptr_t)entry->ctx;
+diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
+index 74f7b77b..397056ec 100644
+--- a/runtime/spu/spu_coherency.h
++++ b/runtime/spu/spu_coherency.h
+@@ -50,11 +50,14 @@ void spu_lockline_unlock(void);
+  * reserved again microseconds later, so unmarking would buy nothing; a stale
+  * mark costs one locked PPU store to a line the kernel owns anyway. */
+ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
++/* GETLLAR without the lock when ctx is registered and the line marked
++ * (seqlock read); 0 = take the locked path. */
++int spu_getllar_fast(spu_context* ctx, uint32_t ea, void* ls, const void* mem);
+ 
+ /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
+  * lookup guarded by a global that is zero until the first GETLLAR. */
+ int spu_coh_is_reserved(uint32_t addr);
+-int spu_coh_armed(void);
++int spu_coh_armed(void);
+ 
+ /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
+  * whose live reservation covers it, drop that reservation, and wake the host
+@@ -66,7 +69,7 @@ void spu_coh_notify_write(uint32_t ea);
+ /* Remove a context from the reserving set. MUST be called before a
+  * transient (stack-allocated) spu_context goes out of scope. */
+ void spu_coh_unregister(spu_context* ctx);
+-void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
++void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
+ /* As above, but leaves `self`'s own reservation alone: an SPU's own MFC
+  * write does not cost it its reservation on hardware. */
+ void spu_coh_notify_write_except(uint32_t ea, const void* self);
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 382c1826..2e945d63 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -719,7 +719,12 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
+ #define SPU_CH_LOCK(ch)   while (_InterlockedExchange(&(ch)->lock, 1)) _mm_pause()
+ #define SPU_CH_UNLOCK(ch) _InterlockedExchange(&(ch)->lock, 0)
+ #else
++#if defined(__x86_64__) || defined(__i386__)
++#define SPU_CH_LOCK(ch)   while (__atomic_exchange_n(&(ch)->lock, 1, __ATOMIC_ACQUIRE)) \
++                              while (__atomic_load_n(&(ch)->lock, __ATOMIC_RELAXED)) __builtin_ia32_pause()
++#else
+ #define SPU_CH_LOCK(ch)   while (__atomic_exchange_n(&(ch)->lock, 1, __ATOMIC_ACQUIRE)) {}
++#endif
+ #define SPU_CH_UNLOCK(ch) __atomic_store_n(&(ch)->lock, 0, __ATOMIC_RELEASE)
+ #endif
+ 

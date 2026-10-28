@@ -1945,3 +1945,39 @@ the sparse texture hash (`PS3RECOMP_ENG_TEXHASH_FULL=1`), not the VS constant
 prefix of section 64 (`RSX_VP_CONST_ALL=1`, new), not the WPOS row. Burning
 debris in that view gives off black smoke lit by its fire, so part of it may
 be how the game looks; it needs a reference frame (RPCS3 on this machine).
+
+## 74. The lock-line lock: test-and-test-and-set, GETLLAR without it, a parked LR wait
+
+**What the lock was doing** (`SPU_LL_STATS=1`: callers, waits and spins per
+5 s). Per 5 s in the level: ~8.2 M acquisitions from `spu_wrch` (the SPU
+atomics), ~45% of them waiting, ~80 M spins; 1 M from `vm_write32` (PPU
+stores to reserved lines); the rest small. On Linux the lock was a bare
+`atomic_flag` test-and-set loop -- every waiter hammering the line with
+locked exchanges (the Windows build already had test-and-test-and-set with a
+pause and a yield).
+
+1. **Test-and-test-and-set with `pause`, a yield after 4,096 spins** (and a
+   pause in the per-channel `SPU_CH_LOCK`): 17.70 / 17.08 -> 18.81 / 18.76.
+2. **GETLLAR without the lock** (`spu_getllar_fast`, `SPU_GETLLAR_FAST=0`
+   turns it off). When the context is registered (a per-thread (context,
+   generation) cache; every removal from the holder list bumps the
+   generation) and the line is already marked, the reservation is published
+   first and the 128 bytes are a seqlock read against a counter the lock
+   holders keep odd. A write between publishing and the copy costs a spurious
+   lost reservation, which hardware allows and PUTLLC's compare catches
+   anyway. ~5.5 M GETLLARs per 5 s take it, ~100 fall back. Three runs each,
+   same binary: 19.69 / 19.09 / 19.29 against 17.64 / 19.00 / 18.39.
+3. **The lost-reservation wait parks** (`spu_lr_wait`, `SPU_LR_WAIT_US`,
+   default 2000, 0 = off). `SPU_ATOM_STATS=1` (lines with the most atomics)
+   put one line at the top with 3.7 M GETLLARs and 3 thousand PUTLLCs per 5 s:
+   SPU task image 5 (`spu_0004_at_00C9B980`) taking a semaphore -- GETLLAR,
+   count zero, `rdch SPU_RdEventStat` with only `SPU_EVENT_LR` enabled, retry.
+   Without `SPU_CH_BLOCK` that read never blocked, so the loop span a core.
+   Now, with only LR enabled and a reservation held, it waits on the
+   context's condition variable (every writer of a reserved line wakes the
+   holder), re-comparing the line on each 1 ms timeout, for at most the cap.
+   The line left the list; frame rate the same (19.60 against 19.54, three
+   runs each), a core less spinning.
+
+Frame rate now ~19-20 at Corinth River (windows of 21-22), from 16.1 at the
+start of section 72.
