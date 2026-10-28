@@ -27,12 +27,14 @@ PYEOF
     --out "${OUT}/spu_pm/pm_DDD59DC528B4CED6.elf"
 "${PY}" -I "${T}/spu_lifter.py" --auto-functions "${OUT}/spu_pm/pm_DDD59DC528B4CED6.elf" \
     --symbol-prefix pm_DDD59DC528B4CED6_ -o "${SPU}/pm_DDD59DC528B4CED6" \
-    --extra-funcs 0xA2C,0xA84,0xA90,0xAD0
+    --extra-funcs 0xA2C,0xA84,0xA90,0xAD0 --merge-chunks
 # 0xA2C is the PM's SPU interrupt vector (MFC list stall-and-notify while a
 # job is being loaded); 0xA84/0xA90/0xAD0 are where it returns from the
 # register save/restore stub it generates at LS 0x3FEC0. Nothing branches to
 # them statically, so without these entries the whole handler ran in the
 # fallback interpreter and the PM ended mid-handler: no job ever started.
+# Merged chunks: its wait loops run as gotos instead of a trampoline and a
+# function lookup per branch (PROGRESS 75).
 
 "${PY}" -I "${ROOT}/tools/extract_jobmods_elf.py" "${ELF}" "${OUT}/jobmods"
 # Entries the jobs reach only through computed branches, found with the

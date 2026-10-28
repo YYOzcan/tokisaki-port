@@ -1981,3 +1981,24 @@ pause and a yield).
 
 Frame rate now ~19-20 at Corinth River (windows of 21-22), from 16.1 at the
 start of section 72.
+
+## 75. The job manager lifted with merged chunks
+
+One profile of the level found the thread that usually runs `73d064721abc`
+(section 72) running the WWS job manager's wait loop instead -- LS 0x2CC0 ->
+0x2CD0 -> 0x2CE0 -> 0x2D88 (`bie`/`bid` to let a pending interrupt in) and
+round again -- at 100%, all of it dispatch: `spu_lookup` 18%, the drain loop
+in `spu_run_with_halt` 17%, `spu_indirect_branch` 15%, `spu_pchist_tick` 10%,
+`spu_hop_check` 8%, `spu_irq_regs_maybe_restore` 5%. (Which of the two that
+SPU does varies from run to run.) The policy module was the one SPU image
+still lifted chunk by chunk; `tools/lift_spu.sh` now gives it
+`--merge-chunks` too, so its loops are gotos and only its indirect branches
+and interrupt windows go through the dispatcher. Three runs each, the merged
+build against the same commit's chunked one: 21.50 / 20.29 / 21.19 against
+19.65 / 20.06 / 19.81.
+
+The per-hop hooks are cheaper as well (patch 0051): `spu_hop_check` is always
+inlined, `spu_pchist_tick` is an inline gate on a global set once from
+`SPU_PCHIST` with the histogram out of line, and `spu_irq_regs_maybe_restore`
+is called only while a register file is saved. No measurable change on its
+own (19.51 / 20.78).

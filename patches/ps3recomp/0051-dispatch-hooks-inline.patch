@@ -1,0 +1,127 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 63b97393..7e66ee3b 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2353,7 +2353,7 @@ void spu_indirect_branch(spu_context* ctx)
+      * enforce the preserve-all-registers hardware contract here -- the first
+      * interrupts-enabled dispatch at the saved srr0 is the irete. */
+     { extern int spu_irq_regs_maybe_restore(spu_context*);
+-      if (spu_irq_regs_maybe_restore(ctx)) {
++      if (ctx->irq_saved && spu_irq_regs_maybe_restore(ctx)) {
+           static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+           static int _r = 0;
+           if (s_it && _r++ < 200)
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 2e945d63..d80e438d 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -832,7 +832,7 @@ extern int g_spu_hop_diag;
+ extern unsigned g_spu_stack_reset_n;
+ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*));
+ void spu_job_ls0_end(spu_context* ctx);
+-static inline void spu_hop_check(spu_context* ctx, void* fn)
++static inline __attribute__((always_inline)) void spu_hop_check(spu_context* ctx, void* fn)
+ {
+     if (__builtin_expect(g_spu_hop_diag != 0, 0)) { spu_task_launch_check(ctx, fn); return; }
+     if (g_spu_stack_reset_n && ctx->host_depth && !ctx->policy_mode)
+@@ -878,39 +878,14 @@ static inline void spu_drain_call_inl(spu_context* ctx, uint32_t return_pc)
+  *
+  * Extents from the .symtab embedded in ps1_netemu (firmware file offset
+  * 0x171100), so they are exact rather than guessed. */
+-static inline void spu_pchist_tick(const spu_context* ctx)
++/* The histogram's body lives in spu_drain.c; the gate is inline because
++ * it runs on every trampoline hop (a call there was ~10% of an idle job
++ * manager's thread). */
++extern int g_spu_pchist_on;
++void spu_pchist_tick_slow(const spu_context* ctx);
++static inline __attribute__((always_inline)) void spu_pchist_tick(const spu_context* ctx)
+ {
+-    static int en = -1;
+-    if (en < 0) en = getenv("SPU_PCHIST") ? 1 : 0;
+-    if (!en) return;
+-    static unsigned long long b[8][8], n;
+-    const unsigned sp = (unsigned)(ctx->spu_id & 7u);
+-    const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+-    const int k = pc < 0x00188u ? 0
+-                : pc < 0x00350u ? 1     /* BlockClear */
+-                : pc < 0x00758u ? 2     /* Host2Local_Body */
+-                : pc < 0x00928u ? 3     /* Host2Local */
+-                : pc < 0x010F8u ? 4     /* Local2Local */
+-                : pc < 0x051E8u ? 5     /* main */
+-                : pc < 0x08700u ? 6     /* DrawRect */
+-                : pc < 0x1493Cu ? 7     /* DrawEdge */
+-                : 0;
+-    b[sp][k]++;
+-    if ((++n % 4000000ull) == 0) {
+-        static const char* nm[8] = { "other", "BlockClear", "H2L_Body",
+-            "Host2Local", "Local2Local", "main", "DrawRect", "DrawEdge" };
+-        fprintf(stderr, "[pchist] %llu hops\n", n);
+-        for (unsigned q = 0; q < 8; q++) {
+-            int any = 0;
+-            for (int j = 0; j < 8; j++) if (b[q][j]) any = 1;
+-            if (!any) continue;
+-            fprintf(stderr, "   spu%u", q);
+-            for (int j = 0; j < 8; j++)
+-                if (b[q][j]) fprintf(stderr, " %s=%llu", nm[j], b[q][j]);
+-            fprintf(stderr, "\n");
+-        }
+-        fflush(stderr);
+-    }
++    if (__builtin_expect(g_spu_pchist_on, 0)) spu_pchist_tick_slow(ctx);
+ }
+ 
+ /* Drain the pending trampoline chain: run each queued transfer target until
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 4d0a15c6..74cdbdf5 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -10,6 +10,7 @@
+ #include <signal.h>
+ #include <stdlib.h>
+ #include <time.h>
++#include <stdio.h>
+ 
+ /* See spu_context.h `irq_frame`. */
+ typedef struct spu_irq_frame {
+@@ -21,6 +22,41 @@ typedef struct spu_irq_frame {
+ 
+ /* Pending cross-function transfer target for this host thread's SPU context. */
+ SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
++/* SPU_PCHIST=1 (spu_context.h's spu_pchist_tick gate) */
++int g_spu_pchist_on = 0;
++__attribute__((constructor)) static void spu_pchist_init(void) { g_spu_pchist_on = getenv("SPU_PCHIST") ? 1 : 0; }
++void spu_pchist_tick_slow(const spu_context* ctx)
++{
++    static unsigned long long b[8][8], n;
++    const unsigned sp = (unsigned)(ctx->spu_id & 7u);
++    const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
++    const int k = pc < 0x00188u ? 0
++                : pc < 0x00350u ? 1     /* BlockClear */
++                : pc < 0x00758u ? 2     /* Host2Local_Body */
++                : pc < 0x00928u ? 3     /* Host2Local */
++                : pc < 0x010F8u ? 4     /* Local2Local */
++                : pc < 0x051E8u ? 5     /* main */
++                : pc < 0x08700u ? 6     /* DrawRect */
++                : pc < 0x1493Cu ? 7     /* DrawEdge */
++                : 0;
++    b[sp][k]++;
++    if ((++n % 4000000ull) == 0) {
++        static const char* nm[8] = { "other", "BlockClear", "H2L_Body",
++            "Host2Local", "Local2Local", "main", "DrawRect", "DrawEdge" };
++        fprintf(stderr, "[pchist] %llu hops\n", n);
++        for (unsigned q = 0; q < 8; q++) {
++            int any = 0;
++            for (int j = 0; j < 8; j++) if (b[q][j]) any = 1;
++            if (!any) continue;
++            fprintf(stderr, "   spu%u", q);
++            for (int j = 0; j < 8; j++)
++                if (b[q][j]) fprintf(stderr, " %s=%llu", nm[j], b[q][j]);
++            fprintf(stderr, "\n");
++        }
++        fflush(stderr);
++    }
++}
++
+ int g_spu_skip_marked = 0;
+ double g_spu_t0;
+ __attribute__((constructor)) static void spu_skip_marked_init(void)
