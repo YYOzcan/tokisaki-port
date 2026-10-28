@@ -2076,3 +2076,18 @@ reboot were clean -- watched, not explained.)
 Also found there and checked here: their 1058 (the selectWorkload answer) is
 already in this runtime as the opt-in `SPURS_PM_SELECT_CURRENT=1`; 1045
 (ready-count swap) is covered by `spurs_ready_exchange`.
+
+## 78. A launcher
+
+`tools/kz2_launcher.py` (PyQt5; Tk is not on the desktop, PyQt5 and GTK4
+are): the player's own PIC1.PNG as the backdrop, PLAY / SETTINGS / QUIT and
+the controls at a glance. Settings (`~/.config/tokisaki-port/kz2.json`) are
+the runtime's switches: fullscreen (`PS3RECOMP_VK_FULLSCREEN`), vsync
+(`PS3RECOMP_VK_PRESENT` fifo / mailbox / immediate), the depth-of-field and
+motion blur (`KZ2_POST_BLUR`), mouse speed and inversion, SIXAXIS speed, the
+GPU. It hides while the game runs and shows the end of `logs/play.log` when
+the game stops within 20 s. `tools/install_desktop_entry.sh` now puts it in
+the application menu (`KZ2_ENTRY=play` for the game alone).
+
+`SPURS_PM_SELECT_CURRENT=1` (section 77) measured: 21.31 / 22.04 against
+21.93 / 21.31 -- no change, left off.

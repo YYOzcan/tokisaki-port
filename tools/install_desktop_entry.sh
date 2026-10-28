@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Tokisaki Port -- add "Killzone 2" to the application menu (and the desktop,
-# when there is one). It starts tools/play.sh in a window; the game's output
-# goes to logs/play.log. With Tk installed, tools/launcher.py offers more
-# (campaign quick start, GPU, mouse speed): KZ2_ENTRY=launcher picks it.
+# when there is one). It opens the launcher, tools/kz2_launcher.py (PyQt5:
+# play, settings, controls); KZ2_ENTRY=play starts tools/play.sh directly
+# (the game's output in logs/play.log), KZ2_ENTRY=tk the old Tk launcher.
 #   tools/install_desktop_entry.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APPS="${XDG_DATA_HOME:-${HOME}/.local/share}/applications"
 ENTRY="${APPS}/killzone2-tokisaki.desktop"
-if [ "${KZ2_ENTRY:-play}" = launcher ]; then
-    EXEC="exec python3 \\\"${ROOT}/tools/launcher.py\\\""
-else
-    EXEC="exec \\\"${ROOT}/tools/play.sh\\\" > \\\"${ROOT}/logs/play.log\\\" 2>&1"
-fi
+case "${KZ2_ENTRY:-launcher}" in
+    play) EXEC="exec \\\"${ROOT}/tools/play.sh\\\" > \\\"${ROOT}/logs/play.log\\\" 2>&1" ;;
+    tk)   EXEC="exec python3 \\\"${ROOT}/tools/launcher.py\\\"" ;;
+    *)    EXEC="exec python3 \\\"${ROOT}/tools/kz2_launcher.py\\\"" ;;
+esac
 mkdir -p "${APPS}" "${ROOT}/logs"
 cat > "${ENTRY}" <<EOF
 [Desktop Entry]
