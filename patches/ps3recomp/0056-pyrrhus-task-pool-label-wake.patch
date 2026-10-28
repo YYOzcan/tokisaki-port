@@ -1,0 +1,323 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 0ca83b87..7be8d995 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1398,6 +1398,37 @@ int cellGcm_park_wait(u32 io, unsigned timeout_us)
+     return patched;
+ }
+ 
++/* Label-release wake (after the Killzone 2 port's patch 6019, undecuple/
++ * project-pyrrhus, MIT): every label the FIFO releases bumps g_gcm_label_seq
++ * (rsx_draw_engine_label_release) and wakes the host threads waiting for one,
++ * only when there are any. A guest poll such as Killzone 2's Renderer::
++ * WaitLabel, `while (label < value) sys_timer_usleep(30)`, sleeps until the
++ * next release instead (tools/postlift_fixups.py, src/kz2_hle.cpp). */
++static u32 g_gcm_label_seq, g_gcm_label_waiters;
++void cellGcm_label_notify(void)
++{
++    __atomic_add_fetch(&g_gcm_label_seq, 1u, __ATOMIC_SEQ_CST);
++#ifndef _WIN32
++    if (__atomic_load_n(&g_gcm_label_waiters, __ATOMIC_SEQ_CST))
++        syscall(SYS_futex, &g_gcm_label_seq, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, NULL, NULL, 0);
++#endif
++}
++u32 cellGcm_label_seq(void) { return __atomic_load_n(&g_gcm_label_seq, __ATOMIC_SEQ_CST); }
++/* Sleep until a label is released after `seq` was read, or `timeout_us`. */
++void cellGcm_label_wait_seq(u32 seq, unsigned timeout_us)
++{
++    __atomic_add_fetch(&g_gcm_label_waiters, 1u, __ATOMIC_SEQ_CST);
++#ifndef _WIN32
++    if (__atomic_load_n(&g_gcm_label_seq, __ATOMIC_SEQ_CST) == seq) {
++        struct timespec ts = { (time_t)(timeout_us / 1000000u), (long)(timeout_us % 1000000u) * 1000L };
++        syscall(SYS_futex, &g_gcm_label_seq, FUTEX_WAIT_PRIVATE, seq, &ts, NULL, 0);
++    }
++#else
++    if (__atomic_load_n(&g_gcm_label_seq, __ATOMIC_SEQ_CST) == seq) Sleep(1);
++#endif
++    __atomic_sub_fetch(&g_gcm_label_waiters, 1u, __ATOMIC_SEQ_CST);
++}
++
+ void gcm_note_spu_put(u32 ea, u32 size)
+ {
+     if (!size || size > 0x40000u) return;
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 75629053..423fa81a 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1407,6 +1407,7 @@ static void eng_surface_writeback(u32 slot)
+  * at each release and each draw, all of it (waiting) when the FIFO stops,
+  * before a guest-memory texture or a coherence read over a queued target. */
+ extern void vm_write32(uint32_t a, uint32_t v);
++extern void cellGcm_label_notify(void);
+ enum { ENG_PEND_COLOR = 1, ENG_PEND_DEPTH, ENG_PEND_LABEL };
+ typedef struct {
+     u8  kind;
+@@ -1479,6 +1480,7 @@ void rsx_draw_engine_async_poll(int wait)
+         if (p->kind == ENG_PEND_LABEL) {
+             __atomic_thread_fence(__ATOMIC_RELEASE);     /* the stored targets before their label */
+             vm_write32(p->ea, p->val);
++            cellGcm_label_notify();
+         } else {
+             const void* rows = g.be->readback_result(g.be->user, p->ticket, wait);
+             if (!rows) return;
+@@ -1559,6 +1561,7 @@ void rsx_draw_engine_label_release(u32 ea, u32 val)
+     if (!g.ready || !eng_async_wb()) {
+         rsx_draw_engine_flush_main_targets();
+         vm_write32(ea, val);
++        cellGcm_label_notify();
+         return;
+     }
+     rsx_draw_engine_async_poll(0);
+@@ -1583,7 +1586,7 @@ void rsx_draw_engine_label_release(u32 ea, u32 val)
+         }
+         z->wb_pending = 0;
+     }
+-    if (!s_pend_n) { vm_write32(ea, val); return; }
++    if (!s_pend_n) { vm_write32(ea, val); cellGcm_label_notify(); return; }
+     eng_pend* p = eng_pend_push();
+     p->kind = ENG_PEND_LABEL; p->ea = ea; p->val = val;
+ }
+diff --git a/runtime/spu/spu_async_pool.h b/runtime/spu/spu_async_pool.h
+new file mode 100644
+index 00000000..87a4c4ae
+--- /dev/null
++++ b/runtime/spu/spu_async_pool.h
+@@ -0,0 +1,121 @@
++/* spu_async_pool.h -- asynchronous SPU tasks on reusable host threads (POSIX).
++ *
++ * spu_workload_dispatch_async started every SPURS task on a new detached
++ * thread with a 256 MB stack. Killzone 2 starts about 150 tasks a second in a
++ * level (the Killzone 2 port, Project Pyrrhus, measured it for its patch 6031,
++ * undecuple/project-pyrrhus, MIT; this is written for this runtime from that
++ * description): glibc does not cache stacks that large, so each task paid an
++ * mmap, a clone, the stack's first page faults and a munmap.
++ *
++ * spu_pool_submit hands the job to a parked thread when there is one, else
++ * starts a new one. It never queues: a task may wait for another task, so
++ * every task must start at once, as before. A thread that finishes its job
++ * runs the `after` hook, parks, and ends once it has been idle for
++ * idle_ms. Header-only (static), so a host test can build it alone
++ * (tests/test_spu_async_pool.c). */
++#ifndef SPU_ASYNC_POOL_H
++#define SPU_ASYNC_POOL_H
++#include <errno.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <time.h>
++
++typedef void (*spu_pool_fn)(void*);
++typedef struct spu_pool_thr {
++    pthread_mutex_t m;
++    pthread_cond_t  c;
++    spu_pool_fn     fn;           /* the job handed over (NULL: none yet) */
++    void*           arg;
++    struct spu_pool_thr* next;    /* the idle list */
++} spu_pool_thr;
++
++static pthread_mutex_t s_pool_lk = PTHREAD_MUTEX_INITIALIZER;
++static spu_pool_thr*   s_pool_idle;
++static unsigned        s_pool_idle_ms = 10000;
++static void          (*s_pool_after)(void);       /* run on the pool thread after each job */
++static volatile unsigned s_pool_threads, s_pool_reused;   /* started / handed to a parked one */
++
++static int spu_pool_unidle(spu_pool_thr* t)       /* s_pool_lk held */
++{
++    for (spu_pool_thr** p = &s_pool_idle; *p; p = &(*p)->next)
++        if (*p == t) { *p = t->next; return 1; }
++    return 0;
++}
++
++static void* spu_pool_main(void* a)
++{
++    spu_pool_thr* t = (spu_pool_thr*)a;
++    for (;;) {
++        pthread_mutex_lock(&t->m);
++        while (!t->fn) {
++            struct timespec ts;
++            clock_gettime(CLOCK_REALTIME, &ts);
++            ts.tv_sec += s_pool_idle_ms / 1000u;
++            ts.tv_nsec += (long)(s_pool_idle_ms % 1000u) * 1000000L;
++            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
++            if (pthread_cond_timedwait(&t->c, &t->m, &ts) == ETIMEDOUT && !t->fn) {
++                pthread_mutex_unlock(&t->m);
++                pthread_mutex_lock(&s_pool_lk);
++                const int was_idle = spu_pool_unidle(t);
++                pthread_mutex_unlock(&s_pool_lk);
++                if (was_idle) {
++                    pthread_cond_destroy(&t->c);
++                    pthread_mutex_destroy(&t->m);
++                    free(t);
++                    return NULL;
++                }
++                pthread_mutex_lock(&t->m);    /* a submitter took it: its job is on the way */
++            }
++        }
++        const spu_pool_fn fn = t->fn;
++        void* arg = t->arg;
++        t->fn = NULL;
++        pthread_mutex_unlock(&t->m);
++        fn(arg);
++        if (s_pool_after) s_pool_after();
++        pthread_mutex_lock(&s_pool_lk);
++        t->next = s_pool_idle;
++        s_pool_idle = t;
++        pthread_mutex_unlock(&s_pool_lk);
++    }
++}
++
++/* Run fn(arg) on a pool thread now. `stack` is the stack size a new thread
++ * asks for (the default when that is refused). Returns 0 when no thread could
++ * be started. */
++static int spu_pool_submit(spu_pool_fn fn, void* arg, size_t stack)
++{
++    pthread_mutex_lock(&s_pool_lk);
++    spu_pool_thr* t = s_pool_idle;
++    if (t) s_pool_idle = t->next;
++    pthread_mutex_unlock(&s_pool_lk);
++    if (t) {
++        pthread_mutex_lock(&t->m);
++        t->fn = fn; t->arg = arg;
++        pthread_cond_signal(&t->c);
++        pthread_mutex_unlock(&t->m);
++        __atomic_add_fetch(&s_pool_reused, 1u, __ATOMIC_RELAXED);
++        return 1;
++    }
++    t = (spu_pool_thr*)calloc(1, sizeof *t);
++    if (!t) return 0;
++    pthread_mutex_init(&t->m, NULL);
++    pthread_cond_init(&t->c, NULL);
++    t->fn = fn; t->arg = arg;
++    pthread_t th;
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    int rc = EINVAL;
++    if (stack && pthread_attr_setstacksize(&attr, stack) == 0)
++        rc = pthread_create(&th, &attr, spu_pool_main, t);
++    pthread_attr_destroy(&attr);
++    if (rc != 0) rc = pthread_create(&th, NULL, spu_pool_main, t);
++    if (rc != 0) {
++        pthread_cond_destroy(&t->c); pthread_mutex_destroy(&t->m); free(t);
++        return 0;
++    }
++    pthread_detach(th);
++    __atomic_add_fetch(&s_pool_threads, 1u, __ATOMIC_RELAXED);
++    return 1;
++}
++#endif /* SPU_ASYNC_POOL_H */
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 9cfea8ce..1eb7a16f 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -5,6 +5,9 @@
+  * it with the SPURS task ABI. cellSpurs's AddWorkload/CreateTask call
+  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
+  */
++#if !defined(_WIN32) && !defined(_GNU_SOURCE)
++#define _GNU_SOURCE            /* pthread_getattr_np (spu_async_pool_after) */
++#endif
+ #include "spu_workload.h"
+ #include "spu_lifted_job.h"   /* spu_run_lifted_job */
+ #include "../ps3_log.h"      /* ps3_log_verbose */
+@@ -862,6 +865,23 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
+ }
+ #else
+ static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
++#include "spu_async_pool.h"
++static void spu_async_pool_job(void* p) { spu_async_run((spu_async_job*)p); }
++/* After a job on a pool thread: nothing on its stack may stay in the
++ * lock-line reserver set, as the Windows thread does when it ends -- the next
++ * job runs on the same stack. */
++static void spu_async_pool_after(void)
++{
++    pthread_attr_t a;
++    void* lo = NULL; size_t sz = 0;
++    if (pthread_getattr_np(pthread_self(), &a) != 0) return;
++    if (pthread_attr_getstack(&a, &lo, &sz) == 0 && lo && sz) {
++        extern void spu_coh_forget_range(uintptr_t, uintptr_t);
++        spu_coh_forget_range((uintptr_t)lo, (uintptr_t)lo + sz);
++        spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)lo + sz);
++    }
++    pthread_attr_destroy(&a);
++}
+ #endif
+ 
+ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+@@ -1417,6 +1437,22 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+      * mmap'd and committed on touch, so this reserves address space rather
+      * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
+      * the guard page above. */
++    /* SPU_ASYNC_POOL=0: a new thread per task, as before; otherwise a pool
++     * thread (spu_async_pool.h; SPU_ASYNC_POOL_IDLE_MS, default 10000, is how
++     * long a parked one waits for the next task before it ends). */
++    static int pool = -1;
++    if (pool < 0) {
++        const char* e = getenv("SPU_ASYNC_POOL");
++        pool = !(e && e[0] == '0');
++        const char* ms = getenv("SPU_ASYNC_POOL_IDLE_MS");
++        if (ms && atoi(ms) > 0) s_pool_idle_ms = (unsigned)atoi(ms);
++        s_pool_after = spu_async_pool_after;
++    }
++    if (pool) {
++        if (spu_pool_submit(spu_async_pool_job, j, 256u << 20)) return 1;
++        free(j);
++        return 0;
++    }
+     pthread_t th;
+     pthread_attr_t attr;
+     pthread_attr_init(&attr);
+diff --git a/runtime/spu/tests/test_spu_async_pool.c b/runtime/spu/tests/test_spu_async_pool.c
+new file mode 100644
+index 00000000..df12506a
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_async_pool.c
+@@ -0,0 +1,50 @@
++/* Host test for spu_async_pool.h: jobs run on reused threads, jobs that wait
++ * for each other all run at once (the pool never queues), and an idle thread
++ * ends after idle_ms.
++ *   cc -O2 -pthread -o /tmp/tp test_spu_async_pool.c && /tmp/tp */
++#include "../spu_async_pool.h"
++#include <stdio.h>
++#include <unistd.h>
++
++static volatile int s_done, s_arrived;
++static pthread_t s_tid[64];
++static void job_note(void* p) { s_tid[(long)p] = pthread_self(); __atomic_add_fetch(&s_done, 1, __ATOMIC_SEQ_CST); }
++/* 16 jobs that each wait until all 16 have started */
++static void job_barrier(void* p)
++{
++    (void)p;
++    __atomic_add_fetch(&s_arrived, 1, __ATOMIC_SEQ_CST);
++    for (int i = 0; i < 4000 && __atomic_load_n(&s_arrived, __ATOMIC_SEQ_CST) < 16; i++) usleep(1000);
++    __atomic_add_fetch(&s_done, 1, __ATOMIC_SEQ_CST);
++}
++static int wait_done(int n)
++{
++    for (int i = 0; i < 5000 && __atomic_load_n(&s_done, __ATOMIC_SEQ_CST) < n; i++) usleep(1000);
++    return __atomic_load_n(&s_done, __ATOMIC_SEQ_CST) == n;
++}
++
++int main(void)
++{
++    int fail = 0;
++    s_pool_idle_ms = 300;
++    /* 1. sequential jobs reuse one thread */
++    for (long k = 0; k < 8; k++) {
++        if (!spu_pool_submit(job_note, (void*)k, 1u << 20)) { puts("FAIL submit"); return 1; }
++        if (!wait_done((int)k + 1)) { puts("FAIL job did not run"); return 1; }
++        usleep(2000);                         /* let it park */
++    }
++    for (int k = 1; k < 8; k++) if (!pthread_equal(s_tid[k], s_tid[0])) { puts("FAIL not reused"); fail = 1; break; }
++    if (s_pool_threads != 1) { printf("FAIL %u threads for sequential jobs\n", s_pool_threads); fail = 1; }
++    /* 2. 16 mutually waiting jobs all start */
++    s_done = 0;
++    for (int k = 0; k < 16; k++) spu_pool_submit(job_barrier, NULL, 1u << 20);
++    if (!wait_done(16) || s_arrived != 16) { printf("FAIL barrier: %d arrived\n", s_arrived); fail = 1; }
++    /* 3. idle threads end */
++    usleep(1500 * 1000);
++    pthread_mutex_lock(&s_pool_lk);
++    int idle = 0; for (spu_pool_thr* t = s_pool_idle; t; t = t->next) idle++;
++    pthread_mutex_unlock(&s_pool_lk);
++    if (idle) { printf("FAIL %d idle threads left after idle_ms\n", idle); fail = 1; }
++    printf("%s: %u threads started, %u jobs handed to parked threads\n", fail ? "FAIL" : "ok", s_pool_threads, s_pool_reused);
++    return fail;
++}

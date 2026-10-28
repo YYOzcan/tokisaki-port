@@ -75,6 +75,28 @@ loc_009A2284:
         "void func_003BD660(ppu_context* ctx) {\n"
         "        /* kz2 postlift: progress wait on the host */ if (kz2_spu_progress_wait(ctx)) return;\n",
     ),
+    # Renderer::WaitLabel's poll sleeps until the next label release instead
+    # of 30 us at a time (src/kz2_hle.cpp, kz2_label_sleep; after the
+    # Killzone 2 port Project Pyrrhus, patch 6019).
+    (
+        "func_00048208",
+        "void func_00048208(ppu_context* ctx) {\n",
+        'extern "C" void kz2_label_sleep(ppu_context*);\n'
+        "void func_00048208(ppu_context* ctx) {\n",
+    ),
+    (
+        "func_00048208",
+        "        ctx->gpr[11] = (int64_t)(int32_t)(0x8D);\n"
+        "        ctx->gpr[3] = (int64_t)(int32_t)(0x1E);\n"
+        "        lv2_syscall(ctx);\n"
+        "        ctx->gpr[3] = (int64_t)(int32_t)(0);\n"
+        "        goto loc_00048240;\n",
+        "        ctx->gpr[11] = (int64_t)(int32_t)(0x8D);\n"
+        "        ctx->gpr[3] = (int64_t)(int32_t)(0x1E);\n"
+        "        /* kz2 postlift: sleep until a label release */ kz2_label_sleep(ctx);\n"
+        "        ctx->gpr[3] = (int64_t)(int32_t)(0);\n"
+        "        goto loc_00048240;\n",
+    ),
     # Direct mouse look (src/kz2_mouse.cpp): the player aim update takes the
     # mouse motion itself once per frame -- marked where the local player's
     # look input is read, applied where the new pitch and the turn input are

@@ -825,3 +825,34 @@ extern "C" int kz2_spu_progress_wait(ppu_context* ctx)
         } else if ((pass & 255) == 0) sched_yield();
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * func_00048208 (v1.01; Renderer::WaitLabel(this, idx, value), 0x48AE8 in the
+ * 1.29 update): the main thread waits for a GCM label to reach a value with
+ * `while (label < value) sys_timer_usleep(30)` -- thousands of syscalls a
+ * second, each sleeping ~80 us under the kernel's timer slack, so a released
+ * label was seen up to that late. tools/postlift_fixups.py puts this in place
+ * of the loop's usleep: it re-reads the label (address = *(0xFAF394) + idx *
+ * *(0xFAF398), the GcmDevice's label base and stride; idx in r30, value in
+ * r31) and sleeps until the FIFO releases the next label (cellGcm_label_notify)
+ * or 2 ms pass; the lifted loop then checks again, as before. After the
+ * Killzone 2 port's patch 6019 and its WaitLabel replacement (undecuple/
+ * project-pyrrhus, MIT). KZ2_LABEL_WAIT=0 sleeps the guest's 30 us.
+ * -------------------------------------------------------------------------*/
+extern "C" uint32_t cellGcm_label_seq(void);
+extern "C" void cellGcm_label_wait_seq(uint32_t seq, unsigned timeout_us);
+extern "C" void lv2_syscall(ppu_context* ctx);
+extern "C" void kz2_label_sleep(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("KZ2_LABEL_WAIT"); on = !(e && e[0] == '0'); }
+    if (!on) { lv2_syscall(ctx); return; }          /* r11 = 141, r3 = 30: the guest's own sleep */
+    auto rd32 = [](uint32_t ea) -> uint32_t {
+        uint32_t v; memcpy(&v, vm_base + ea, 4); return __builtin_bswap32(v); };
+    const uint32_t seq = cellGcm_label_seq();
+    const uint32_t base = rd32(0x00FAF394u), stride = rd32(0x00FAF398u);
+    const uint32_t idx = (uint32_t)ctx->gpr[30], value = (uint32_t)ctx->gpr[31];
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (rd32(base + idx * stride) >= value) return;    /* released meanwhile: the loop leaves */
+    cellGcm_label_wait_seq(seq, 2000);
+}

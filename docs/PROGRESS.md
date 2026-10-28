@@ -2135,3 +2135,38 @@ hold the 192 MB ring twice the ring is now 64 MB in it. Two alternating runs
 against the commit before: 29.51 / 25.59 against 21.92 / 22.84 (the second
 run's script ended in a heavier view). `RSX_ASYNC_WB=1` (section 79) adds
 nothing on top (27.25), so it stays opt-in.
+
+## 81. From the Killzone 2 port Project Pyrrhus: pooled SPU tasks, the label wake
+
+[Project Pyrrhus by undecuple](https://github.com/undecuple/project-pyrrhus)
+is the same game on ps3recomp v0.18 and Direct3D 12 (23 frames/s in its scripted
+run). Its 216 patches were read for what fits this port; first (patch 0056,
+CREDITS.md):
+
+- **SPURS tasks on reusable threads** (its 6031). The game starts ~150 SPURS
+  tasks a second; each was a new detached thread with a 256 MB stack, which
+  glibc does not cache. `runtime/spu/spu_async_pool.h` hands a task to a parked
+  thread, else starts one (never queues: tasks wait for each other); a parked
+  thread ends after `SPU_ASYNC_POOL_IDLE_MS` (10000); after each task the lock-
+  line sets forget its stack, as the Windows thread did at its end.
+  `SPU_ASYNC_POOL=0` = a thread per task. Host test
+  `runtime/spu/tests/test_spu_async_pool.c` (reuse, 16 mutually waiting tasks,
+  idle retirement; clean under ThreadSanitizer).
+- **The label wake** (its 6019 and WaitLabel). Every label release bumps a
+  sequence and wakes its waiters (`cellGcm_label_notify` in
+  `rsx_draw_engine_label_release`); `func_00048208` (v1.01's
+  Renderer::WaitLabel, 0x48AE8 in 1.29), `while (label < value) usleep(30)`,
+  sleeps on it instead (`kz2_label_sleep`, a post-lift fixup in place of the
+  usleep; label = *(0xFAF394) + idx * *(0xFAF398)). `KZ2_LABEL_WAIT=0` = the
+  guest's 30 us.
+
+Two alternating runs, both on against both off: 27.28 / 27.01 against
+25.51 / 27.71 frames/s -- within the noise, no regression, no GPU error.
+
+Read and left for later: its 6030 (per-event log lines counted unless verbose:
+a run here writes ~4,000 lines a second, 57 MB in 160 s; Pyrrhus did not make
+it the default because quieter logging exposed an SPU assert race in The New
+Sun), the vertex fetch block loops (Helghast/Pyrrhus 2040, 2073, 2074 on
+`rsx_vertex_compact.c`, which this port has too), 7003 (getenv once).
+Not taken: `KZ2_SPU_POST=0` (drops the SPU post-processing: changes the
+picture), the Direct3D 12 renderer patches.

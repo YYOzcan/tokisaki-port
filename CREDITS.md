@@ -76,6 +76,20 @@ file: the output replaces `spu_recomp.c` under the same names (CMake
 `spu_helpers_vec.h`. Nothing else from that repository is used; its
 title-specific code carries no license and is not copied.
 
+## Killzone 2 PC port — Project Pyrrhus
+
+**Project Pyrrhus by undecuple** (<https://github.com/undecuple/project-pyrrhus>,
+MIT, Copyright (c) 2026 undecuple) ports this same game on ps3recomp v0.18
+with a Direct3D 12 backend for Windows. Taken here, re-written for this port's
+v0.15 series and its Vulkan/Linux runtime (no file copied; patch 0056,
+`src/kz2_hle.cpp`, `tools/postlift_fixups.py`):
+- its patch 6031: SPURS tasks on reusable host threads
+  (`runtime/spu/spu_async_pool.h`, host test `runtime/spu/tests/test_spu_async_pool.c`);
+- its patch 6019 and its Renderer::WaitLabel host wait: a label-release wake
+  (`cellGcm_label_notify`) and the main thread's label poll sleeping on it,
+  here at the v1.01 address `func_00048208` (its 1.29 address 0x48AE8; it
+  had no v1.01 entry).
+
 ## Killzone 3 PC port — Project Helghast
 
 **[undecuple/project-helghast](https://github.com/undecuple/project-helghast)**
