@@ -1,0 +1,140 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 0ccc5ef4..ab65cc21 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1662,6 +1662,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+      * SHADER_CONTROL, the cube and vertex-texture masks, the input layout,
+      * and the structural render state. */
+     u64 key = 1469598103934665603ull;
++    u32 shader_window = 0;
+     if (fixed) {
+         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
+         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
+@@ -1681,6 +1682,19 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
+         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
+         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
++        /* A program reading WPOS depends on SET_SHADER_WINDOW's origin and
++         * height (rsx_fp_apply_wpos); RSX_WPOS_HOST=1 keeps the host's. */
++        static int wpos_host = -1;
++        if (wpos_host < 0) { const char* e = getenv("RSX_WPOS_HOST"); wpos_host = e && e[0] == '1'; }
++        if (!wpos_host && rsx_fp_reads_wpos(fp_uc, fp_size)) {
++            shader_window = g.rsx.regs[0x1D88 >> 2] & 0xFFFFu;
++            key = eng_fnv1a(&shader_window, sizeof shader_window, key);
++            { static u32 seen[8]; static u32 n;
++              u32 k = 0; while (k < n && seen[k] != shader_window) k++;
++              if (k == n && n < 8) { seen[n++] = shader_window;
++                  fprintf(stderr, "[rsx engine] WPOS read with shader window 0x%05X (height %u, origin %s)\n",
++                          shader_window, shader_window & 0xFFFu, ((shader_window >> 12) & 15u) == 1u ? "bottom" : "top"); } }
++        }
+     }
+     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
+     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
+@@ -1714,6 +1728,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
+                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
+             fi = -1;
++        if (fi > 0 && shader_window &&
++            rsx_fp_apply_wpos(s_ps_hlsl, sizeof s_ps_hlsl, shader_window) < 0)
++            fi = -1;
+         if (fi > 0 && srgb_output &&
+             rsx_fp_apply_srgb_output(s_ps_hlsl, sizeof s_ps_hlsl) < 0)
+             fi = -1;
+@@ -3225,9 +3242,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
+      * for the fixed-function VS. s_vp_cn: how many the backend was given
+      * with the current const_gen; a program that reads more refreshes it. */
+     static u32 s_cn_vpgen = ~0u, s_cn_start = ~0u, s_cn = RSX_DSP_NUM_CONSTANTS, s_vp_cn = 0;
+-    {   const u32 start = rsx_dsp_vp_start(&g.rsx);
++    {   u32 start = rsx_dsp_vp_start(&g.rsx);
+         if (g.rsx.vp_gen != s_cn_vpgen || start != s_cn_start) {
+             u32 n = RSX_DSP_NUM_CONSTANTS;
++            static int all = -1;     /* RSX_VP_CONST_ALL=1: every constant, every time */
++            if (all < 0) { const char* e = getenv("RSX_VP_CONST_ALL"); all = e && e[0] == '1'; }
++            if (all) start = RSX_DSP_VP_INSTR;
+             if (start >= RSX_DSP_VP_INSTR ||
+                 !rsx_vp_analyze_constants((const u8*)(g.rsx.vp + start * 4),
+                                           (RSX_DSP_VP_INSTR - start) * 16u, &n))
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index 4e175d2b..9fbf2684 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -461,6 +461,64 @@ u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes)
+     return units;
+ }
+ 
++/* Does the program read WPOS (an input-type source while OPDEST's input
++ * select is 0)? Only those programs depend on SET_SHADER_WINDOW. */
++int rsx_fp_reads_wpos(const u8* ucode, u32 max_bytes)
++{
++    if (!ucode) return 0;
++    for (u32 off = 0; off + 16 <= max_bytes;) {
++        const u32 w0 = rsx_fp_read_word(ucode + off);
++        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
++        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
++        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
++        if (!(w2 & FP_BRANCH) && ((w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT) == 0 &&
++            ((w1 & 3u) == 1 || (w2 & 3u) == 1 || (w3 & 3u) == 1))
++            return 1;
++        off += 16;
++        if (!(w2 & FP_BRANCH) && ((w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2))
++            off += 16;
++        if (w0 & FP_END) break;
++    }
++    return 0;
++}
++
++/* WPOS in the RSX window convention (SET_SHADER_WINDOW, 0x1D88: height in
++ * bits 0-11, origin in 12-15, 1 = bottom). The host's SV_Position counts rows
++ * from the top of the target, which is also the guest's row order; with the
++ * origin at the bottom the guest's y is height - y (RPCS3 get_wpos). Killzone
++ * 2's soft particles turn WPOS back into a texel row of the depth they fade
++ * against (y' = 360 - y): read with the host's y they sampled the mirrored
++ * row -- smoke as hard white and black blotches wherever the mirrored depth
++ * was far from the particle. Returns 0 when nothing needed changing. */
++int rsx_fp_apply_wpos(char* hlsl, u32 capacity, u32 shader_window)
++{
++    if (!hlsl) return 0;
++    if (((shader_window >> 12) & 15u) != 1u) return 0;          /* origin top */
++    const u32 height = shader_window & 0xFFFu;
++    static const char head[] = "PSOutput main(PSInput input) {\n";
++    char* at = strstr(hlsl, head);
++    if (!at || !strstr(hlsl, "input.position")) return 0;
++    /* Every read of input.position becomes _rsx_wpos (5 characters shorter). */
++    char decl[160];
++    snprintf(decl, sizeof decl,
++             "    float4 _rsx_wpos = float4(input.position.x, %u.0 - input.position.y, input.position.zw);\n",
++             height);
++    u32 used = (u32)strlen(hlsl);
++    for (char* p = strstr(at + sizeof head - 1, "input.position"); p; p = strstr(p, "input.position")) {
++        if (used + 2 > capacity) return -1;
++        memmove(p + 9, p + 14, used - (u32)(p + 14 - hlsl) + 1);   /* "input.position" -> "_rsx_wpos" */
++        memcpy(p, "_rsx_wpos", 9);
++        used -= 5;
++        p += 9;
++    }
++    const u32 dl = (u32)strlen(decl);
++    if (used + dl + 1 > capacity) return -1;
++    char* ins = at + sizeof head - 1;
++    memmove(ins + dl, ins, used - (u32)(ins - hlsl) + 1);
++    memcpy(ins, decl, dl);
++    return 1;
++}
++
+ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
+                               const rsx_fp_shadow_desc* d)
+ {
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+index e0122551..4ecb6316 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -89,6 +89,10 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
+  * unnorm_mask selects the units; dim[u] gives that unit's {width, height};
+  * cube units are skipped. Returns the number of Sample sites patched, or -1 if
+  * the buffer would overflow. A no-op when unnorm_mask is 0. */
++/* WPOS: whether a program reads it, and its HLSL rewritten to the RSX
++ * window convention of SET_SHADER_WINDOW (origin at the bottom: y = height - y). */
++int rsx_fp_reads_wpos(const u8* ucode, u32 max_bytes);
++int rsx_fp_apply_wpos(char* hlsl, u32 capacity, u32 shader_window);
+ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+                               const u32 dim[][2], u32 cube_mask);
+ 

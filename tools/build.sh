@@ -6,8 +6,9 @@
 #
 #   KZ2_MAX=1 BUILD_JOBS=8 tools/build.sh
 # builds for this machine only, at full strength: -march=native, the lifted
-# PPU chunks at -O2 (~3 GB per job instead of ~2), and the lifted SPU code with
-# the profile in pgo/spu.profdata when there is one. The binary does not run
+# PPU chunks at -O2 (~3 GB per job instead of ~2), and the lifted SPU and PPU
+# code with the profiles in pgo/spu.profdata and pgo/ppu.profdata when there
+# are (docs/PROGRESS.md section 60, 73). The binary does not run
 # on an older CPU. KZ2_BUILD_DIR picks the build directory (default build/);
 # CMAKE_ARGS passes anything else to the first configure, e.g. a Vulkan
 # headers directory: CMAKE_ARGS=-DPS3RECOMP_VULKAN_INCLUDE_DIR=/path/include
@@ -18,6 +19,7 @@ EXTRA=()
 if [ "${KZ2_MAX:-0}" = 1 ]; then
     EXTRA+=(-DKZ2_ARCH=native -DKZ2_RECOMP_COMPILE_OPTIONS=-O2)
     [ -f "${ROOT}/pgo/spu.profdata" ] && EXTRA+=(-DKZ2_SPU_PGO=use)
+    [ -f "${ROOT}/pgo/ppu.profdata" ] && EXTRA+=(-DKZ2_PPU_PGO=use)
 fi
 if [ ! -f "${BUILD}/build.ninja" ]; then
     # shellcheck disable=SC2086

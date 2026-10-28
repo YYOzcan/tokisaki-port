@@ -1912,3 +1912,36 @@ Tried, not kept:
 - a short `sys_timer_usleep` as a yield-spin to its deadline instead of
   nanosleep's ~55 us (`KZ2_USLEEP_SPIN_US=<n>`, opt-in in `kz2_hle.cpp`):
   n=1 16.91 / 16.83 / 16.6 against 16.26 / 17.12, n=50 16.00.
+
+## 73. Profile-guided PPU code; WPOS in the RSX window convention
+
+**PGO for the lifted PPU chunks** (CMake `KZ2_PPU_PGO=gen|use`,
+`KZ2_PPU_PROFDATA`, default `pgo/ppu.profdata`; `tools/build.sh` uses it
+with `KZ2_MAX=1` when it is there). The main thread's profile is flat --
+game code over thousands of functions, no one above 2% -- which is what a
+profile helps most. An instrumented build (`build-pgo/`, 13 min, a 627 MB
+binary) loads more slowly, so the profile is taken over frames 9900-10300
+(`KZ2_PGO=9900,10300`, 92 MB). 17.70 / 17.08 frames/s against 16.2-17.1 for
+the same build without it: ~+5%.
+
+**WPOS** (patch 0049). `SET_SHADER_WINDOW` (0x1D88) was never read: a
+fragment program's WPOS was the host's `SV_Position`, rows counted from the
+top, while Killzone 2 sets the origin at the bottom (heights 720, 360 and 180
+in the level) and turns WPOS back into texel rows itself (`y' = 360 - y` in
+the soft particles, `720 - y` in the light accumulation). Programs that read
+WPOS (`rsx_fp_reads_wpos`) now get `y = height - y` (`rsx_fp_apply_wpos`, as
+RPCS3's `get_wpos`), and the window is part of their pipeline key; 15
+programs in Corinth River. No visible change: the lights use WPOS for a
+dither, and the soft particles' depth comes from a downsample that reads
+WPOS too, so the two mirrors had cancelled. `RSX_WPOS_HOST=1` keeps the
+host's.
+
+**The hard black-and-white smoke, narrowed but open.** Pipeline bisection
+with frame dumps (`RSX_ENGINE_SKIP_PIPES`): all smoke of the first view, the
+smooth and the blotchy, is one pipeline -- the soft particles, whose alpha
+is `texture alpha * vertex alpha * |particle depth - scene depth|` with no
+clamp (no saturate, fp32/fp16 precision only: decoded from the ucode). Not
+the sparse texture hash (`PS3RECOMP_ENG_TEXHASH_FULL=1`), not the VS constant
+prefix of section 64 (`RSX_VP_CONST_ALL=1`, new), not the WPOS row. Burning
+debris in that view gives off black smoke lit by its fire, so part of it may
+be how the game looks; it needs a reference frame (RPCS3 on this machine).

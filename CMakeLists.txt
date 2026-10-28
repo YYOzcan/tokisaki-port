@@ -41,6 +41,12 @@ set(KZ2_SPU_PROFDATA "${CMAKE_CURRENT_SOURCE_DIR}/pgo/spu.profdata" CACHE FILEPA
     "the profile KZ2_SPU_PGO=use reads (one per SPU lift: plain or merged chunks)")
 set(KZ2_RECOMP_COMPILE_OPTIONS "-O1" CACHE STRING
     "extra compile options for the lifted PPU chunks")
+# The same for the lifted PPU chunks, whose profile is flat (game code spread
+# over thousands of functions): KZ2_PPU_PGO=gen, a run with KZ2_PGO=<start>,<end>,
+# llvm-profdata merge -o pgo/ppu.profdata <build>/pgo-ppu/*.profraw, then "use".
+set(KZ2_PPU_PGO "off" CACHE STRING "off | gen | use")
+set(KZ2_PPU_PROFDATA "${CMAKE_CURRENT_SOURCE_DIR}/pgo/ppu.profdata" CACHE FILEPATH
+    "the profile KZ2_PPU_PGO=use reads")
 
 # The lifted SPU code is mostly 128-bit vector work: shufb, fa/fm/fma. Its
 # helpers (spu_helpers.h) only take their SSE4.1 forms when the compiler may
@@ -163,6 +169,13 @@ else()
     target_compile_options(killzone2 PRIVATE -Wall -Wextra -Wno-unused-parameter -fno-strict-aliasing)
     # Generated code: no warnings, and no fused multiply-add the guest did not ask for.
     set(KZ2_RECOMP_FLAGS "-w;-ffp-contract=off;${KZ2_RECOMP_COMPILE_OPTIONS}")
+    if(KZ2_PPU_PGO STREQUAL "gen")
+        list(APPEND KZ2_RECOMP_FLAGS "-fprofile-generate=${CMAKE_BINARY_DIR}/pgo-ppu")
+        target_link_options(killzone2 PRIVATE "-fprofile-generate=${CMAKE_BINARY_DIR}/pgo-ppu")
+    elseif(KZ2_PPU_PGO STREQUAL "use")
+        list(APPEND KZ2_RECOMP_FLAGS "-fprofile-use=${KZ2_PPU_PROFDATA}"
+             -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+    endif()
     if(KZ2_FTRACE)
         list(APPEND KZ2_RECOMP_FLAGS -finstrument-functions)
     endif()
