@@ -5,7 +5,7 @@ One row per busy thread, one character per bucket: what the thread ran most in
 it, '.' when it was not on a CPU (sleeping or waiting). The legend maps job
 modules to letters; S = PPU spin on SPU progress (func_003BD660),
 G = other guest PPU code, R = SPU runtime, V = vertex fetch, D = draw engine,
-K = Vulkan/driver/libc, P = SPURS policy module."""
+K = Vulkan/driver/libc, P = SPURS policy module, ~ = other code of ours."""
 import bisect, collections, gzip, re, sys
 
 base = sys.argv[1]
@@ -40,7 +40,7 @@ def cat(off):
     if n.startswith('rsx_vertex'): return 'V'
     if n.startswith(('rsx_', 'eng_', 'sink_', 'cellGcm')): return 'D'
     if n.startswith('vk_'): return 'K'
-    return 'o'
+    return '~'
 
 rows = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
 t0 = None

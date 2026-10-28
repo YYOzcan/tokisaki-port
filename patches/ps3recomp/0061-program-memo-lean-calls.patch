@@ -1,0 +1,540 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 423fa81a..f563046a 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1673,6 +1673,145 @@ static u32 eng_cube_mask(void)
+     return mask;
+ }
+ 
++/* What a draw needs from its two programs, worked out once per program
++ * rather than once per draw. Every draw walked the fragment program six times
++ * (its size twice, the sampled units, the gamma units, the constants and the
++ * structural hash, the last two byte at a time) and hashed the vertex
++ * program byte at a time: ~9% of the FIFO thread in Killzone 2.
++ *
++ * Vertex program: everything here depends on vp[] from the start slot on,
++ * so it holds while vp_gen (bumped by every vp[] write) and the start slot do.
++ *
++ * Fragment program: one entry per guest address, holding a copy of the
++ * program. It holds while every INSTRUCTION slot reads the same; the inline
++ * constant slots, which titles patch between draws, are read again each time
++ * (where they are follows from the instructions, so it cannot have moved).
++ * RSX_PROG_MEMO=0: work everything out per draw, as before. */
++static int eng_prog_memo_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_PROG_MEMO"); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++static struct {
++    int valid;
++    u32 gen, start;
++    u32 instrs;                 /* rsx_vp_program_size_instrs */
++    u64 hash;                   /* eng_fnv1a of the instrs * 16 bytes */
++    int in_ok;                  /* rsx_vp_analyze_inputs was exact */
++    u32 in_mask;
++} s_vpm;
++
++static void eng_vp_memo(const u8* vp_uc, u32 start)
++{
++    if (s_vpm.valid && s_vpm.gen == g.rsx.vp_gen && s_vpm.start == start) return;
++    s_vpm.valid = 1;
++    s_vpm.gen = g.rsx.vp_gen;
++    s_vpm.start = start;
++    s_vpm.instrs = rsx_vp_program_size_instrs(vp_uc, (RSX_DSP_VP_INSTR - start) * 16u);
++    s_vpm.hash = eng_fnv1a(vp_uc, s_vpm.instrs * 16u, 1469598103934665603ull);
++    rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
++    s_vpm.in_ok = s_vpm.instrs &&
++        rsx_vp_analyze_inputs(vp_uc, s_vpm.instrs * 16u, &analysis) == (int)s_vpm.instrs &&
++        analysis.exact && analysis.input_mask;
++    s_vpm.in_mask = analysis.input_mask;
++}
++
++#define ENG_FPM_SLOTS 1024u      /* a power of two */
++typedef struct eng_fp_memo {
++    u32 loc, off, used;
++    u32 size;                    /* rsx_fp_program_size */
++    u8* bytes;                   /* the program, constant slots zeroed */
++    u32 cap;
++    u32 nconst;
++    u16 const_at[RSX_FP_MAX_INLINE_CONSTANTS];  /* byte offsets of the constant slots */
++    int consts_ok;               /* rsx_fp_collect_constants did not fail */
++    u32 tex_units;
++    int reads_wpos;
++    u64 shash;                   /* rsx_fp_structural_hash, seed FNV basis */
++    int gamma_valid;
++    u8  gamma_in[RSX_DSP_NUM_TEXTURES];
++    u32 gamma_units;
++} eng_fp_memo;
++static eng_fp_memo s_fpm[ENG_FPM_SLOTS];
++static eng_fp_memo* s_fpm_cur;   /* the current draw's, set by eng_guest_programs */
++
++/* Does the program at p still have the instructions of m? */
++static int eng_fp_memo_same(const eng_fp_memo* m, const u8* p)
++{
++    u32 k = 0;
++    for (u32 o = 0; o < m->size; o += 16) {
++        if (k < m->nconst && m->const_at[k] == o) { k++; continue; }
++        if (memcmp(p + o, m->bytes + o, 16)) return 0;
++    }
++    return 1;
++}
++
++/* The program at (loc, off): its memo entry, refreshed when its instructions
++ * changed, with *out_uc pointing at it. NULL: no program there. */
++static eng_fp_memo* eng_fp_memo_get(u32 loc, u32 off, const u8** out_uc)
++{
++    const u32 h = ((off >> 4) * 0x9E3779B1u ^ loc) & (ENG_FPM_SLOTS - 1u);
++    eng_fp_memo* m = NULL;
++    for (u32 i = 0; i < 8; i++) {
++        eng_fp_memo* e = &s_fpm[(h + i) & (ENG_FPM_SLOTS - 1u)];
++        if (e->used && e->loc == loc && e->off == off) { m = e; break; }
++        if (!e->used && !m) m = e;
++    }
++    if (!m) m = &s_fpm[h];               /* a full run: take the home slot */
++    if (m->used && m->loc == loc && m->off == off && m->size) {
++        const u8* p = eng_guest_ptr(NULL, loc, off, m->size);
++        if (p && eng_fp_memo_same(m, p)) { *out_uc = p; return m; }
++    }
++    /* New, or its instructions changed: work it out again. */
++    m->used = 1; m->loc = loc; m->off = off;
++    m->size = 0; m->gamma_valid = 0;
++    const u8* uc = eng_guest_ptr(NULL, loc, off, 16);
++    const u32 size = uc ? rsx_fp_program_size(uc, ENG_FP_MAX_BYTES) : 0;
++    if (size) uc = eng_guest_ptr(NULL, loc, off, size);
++    if (!uc || !size) { *out_uc = NULL; return NULL; }
++    if (m->cap < size) {
++        u8* b = (u8*)realloc(m->bytes, size);
++        if (!b) { *out_uc = NULL; return NULL; }
++        m->bytes = b; m->cap = size;
++    }
++    memcpy(m->bytes, uc, size);
++    m->nconst = 0;
++    for (u32 o = 0; o + 16 <= size; o += 16) {   /* the walk of rsx_fp_collect_constants */
++        const u32 w0 = rsx_fp_read_word(uc + o), w1 = rsx_fp_read_word(uc + o + 4);
++        const u32 w2 = rsx_fp_read_word(uc + o + 8), w3 = rsx_fp_read_word(uc + o + 12);
++        (void)w0;
++        if (rsx_fp_instruction_has_constant(w1, w2, w3) && o + 32 <= size &&
++            m->nconst < RSX_FP_MAX_INLINE_CONSTANTS) {
++            m->const_at[m->nconst++] = (u16)(o + 16);
++            memset(m->bytes + o + 16, 0, 16);
++            o += 16;
++        }
++    }
++    rsx_fp_constant_block cb;
++    m->consts_ok = rsx_fp_collect_constants(uc, size, &cb) >= 0 && cb.count == m->nconst;
++    m->tex_units = rsx_fp_texture_units(uc, size);
++    m->reads_wpos = rsx_fp_reads_wpos(uc, size);
++    m->shash = rsx_fp_structural_hash(uc, size, 1469598103934665603ull);
++    m->size = size;
++    *out_uc = uc;
++    return m;
++}
++
++/* rsx_fp_collect_constants for a memoised program: the slots it found. */
++static int eng_fp_memo_constants(const eng_fp_memo* m, const u8* uc, rsx_fp_constant_block* out)
++{
++    memset(out, 0, sizeof *out);
++    if (!m->consts_ok) return -1;
++    for (u32 k = 0; k < m->nconst; k++)
++        for (u32 c = 0; c < 4; c++)
++            out->values[k][c] = rsx_fp_sanitize_constant_word(
++                rsx_fp_read_word(uc + m->const_at[k] + c * 4u));
++    out->count = m->nconst;
++    return (int)m->nconst;
++}
++
+ /* Are both of the guest's own programs resident? One answer, used by the
+  * layout and by the pipeline, because they must not disagree: the built-in
+  * program declares all sixteen inputs, so narrowing the layout for it would
+@@ -1682,10 +1821,12 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
+ {
+     const u8* vp_uc = NULL;
+     u32 vp_instrs = 0;
++    const int memo = eng_prog_memo_on();
+     const u32 start = rsx_dsp_vp_start(&g.rsx);
+     if (start < RSX_DSP_VP_INSTR) {
+         vp_uc = (const u8*)(g.rsx.vp + start * 4);
+-        vp_instrs = rsx_vp_program_size_instrs(
++        if (memo) { eng_vp_memo(vp_uc, start); vp_instrs = s_vpm.instrs; }
++        else vp_instrs = rsx_vp_program_size_instrs(
+             vp_uc, (RSX_DSP_VP_INSTR - start) * 16u);
+     }
+ 
+@@ -1694,13 +1835,19 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
+      * never read back as zero. */
+     const u8* fp_uc = NULL;
+     u32 fp_size = 0;
++    s_fpm_cur = NULL;
+     if (rsx_dsp_reg(&g.rsx, 0x08E4)) {
+         u32 fp_loc = 0;
+         const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
+-        fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
+-        fp_size = fp_uc ? rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) : 0;
+-        if (fp_size) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
+-        if (!fp_uc) fp_size = 0;
++        if (memo) {
++            s_fpm_cur = eng_fp_memo_get(fp_loc, fp_off, &fp_uc);
++            fp_size = s_fpm_cur ? s_fpm_cur->size : 0;
++        } else {
++            fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
++            fp_size = fp_uc ? rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) : 0;
++            if (fp_size) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
++            if (!fp_uc) fp_size = 0;
++        }
+     }
+ 
+     if (out_vp) *out_vp = vp_uc;
+@@ -1717,7 +1864,9 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
+     u32 mask = 0xFFFFu;
+     const u8* uc = NULL;
+     u32 instrs = 0;
+-    if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
++    if (eng_guest_programs(&uc, &instrs, NULL, NULL) && eng_prog_memo_on()) {
++        if (s_vpm.in_ok) mask = s_vpm.in_mask;
++    } else if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
+         rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
+         if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
+             analysis.exact && analysis.input_mask)
+@@ -1822,7 +1971,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+     const u32 vtex_mask = eng_vtex_mask();
+     rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
+     u32 shadow_mask = 0;
+-    const u32 sampled_units = fixed ? 0 : rsx_fp_texture_units(fp_uc, fp_size);
++    eng_fp_memo* const fpm = fixed ? NULL : s_fpm_cur;
++    const u32 sampled_units = fixed ? 0 : fpm ? fpm->tex_units
++                                            : rsx_fp_texture_units(fp_uc, fp_size);
+     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+         if (!(sampled_units & (1u << u))) continue;
+         rsx_dsp_texture t;
+@@ -1839,11 +1990,55 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+     /* RSX_TEX_GAMMA_OFF=1: sample textures without their sRGB decode (A/B). */
+     static int s_gamma_off = -1;
+     if (s_gamma_off < 0) s_gamma_off = getenv("RSX_TEX_GAMMA_OFF") ? 1 : 0;
+-    const u32 gamma_units = (fixed || s_gamma_off) ? 0
+-                          : rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
++    u32 gamma_units = 0;
++    if (!(fixed || s_gamma_off)) {
++        if (!fpm)
++            gamma_units = rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
++        else if (fpm->gamma_valid && !memcmp(fpm->gamma_in, gamma_masks, sizeof gamma_masks))
++            gamma_units = fpm->gamma_units;
++        else {
++            gamma_units = rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
++            memcpy(fpm->gamma_in, gamma_masks, sizeof gamma_masks);
++            fpm->gamma_units = gamma_units;
++            fpm->gamma_valid = 1;
++        }
++    }
+     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
+         if (!(gamma_units & (1u << u))) gamma_masks[u] = 0;
+ 
++    /* RSX_PROG_MEMO_CHECK=1: work everything out per draw as well and count
++     * where the memo disagrees ("[rsx engine] prog memo mismatch"). */
++    if (fpm) {
++        static int chk = -1;
++        if (chk < 0) { const char* e = getenv("RSX_PROG_MEMO_CHECK"); chk = e && e[0] == '1'; }
++        if (chk) {
++            static unsigned long n_chk, n_bad;
++            rsx_fp_constant_block a, b;
++            const int ca = rsx_fp_collect_constants(fp_uc, fp_size, &a);
++            const int cb = eng_fp_memo_constants(fpm, fp_uc, &b);
++            const u32 start = rsx_dsp_vp_start(&g.rsx);
++            rsx_vp_input_analysis an = { 0xFFFFu, 0 };
++            const int in_ok = rsx_vp_analyze_inputs(vp_uc, vp_instrs * 16u, &an) == (int)vp_instrs &&
++                              an.exact && an.input_mask;
++            const int bad =
++                rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) != fp_size ||
++                rsx_fp_texture_units(fp_uc, fp_size) != fpm->tex_units ||
++                rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks) != gamma_units ||
++                rsx_fp_reads_wpos(fp_uc, fp_size) != fpm->reads_wpos ||
++                rsx_fp_structural_hash(fp_uc, fp_size, 1469598103934665603ull) != fpm->shash ||
++                ca != cb || (ca >= 0 && memcmp(&a, &b, sizeof a)) ||
++                rsx_vp_program_size_instrs(vp_uc, (RSX_DSP_VP_INSTR - start) * 16u) != vp_instrs ||
++                eng_fnv1a(vp_uc, vp_instrs * 16u, 1469598103934665603ull) != s_vpm.hash ||
++                in_ok != s_vpm.in_ok || (in_ok && an.input_mask != s_vpm.in_mask);
++            n_chk++;
++            if (bad && ++n_bad <= 16)
++                fprintf(stderr, "[rsx engine] prog memo mismatch %lu of %lu (fp %u bytes, %u constants)\n",
++                        n_bad, n_chk, fp_size, fpm->nconst);
++            if ((n_chk & 0xFFFFu) == 0)
++                fprintf(stderr, "[rsx engine] prog memo check: %lu draws, %lu mismatches\n", n_chk, n_bad);
++        }
++    }
++
+     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
+     /* Shadow helpers normalize against the bound resource themselves. Only
+      * sampled ordinary UN units need baked dimensions or cache identity. */
+@@ -1854,7 +2049,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+             unnorm_dim[u][0] = unnorm_dim[u][1] = 0;
+ 
+     memset(&g.fp_constants, 0, sizeof g.fp_constants);
+-    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
++    if (!fixed && (fpm ? eng_fp_memo_constants(fpm, fp_uc, &g.fp_constants)
++                       : rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants)) < 0)
+         return 0;
+ 
+     /* Identity: the vertex program's own bytes, the fragment program's
+@@ -1868,9 +2064,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
+         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
+     } else {
+-        key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
+-        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+-        if (!key) return 0;
++        if (fpm) {      /* the memoised hashes of both, chained */
++            if (!fpm->shash) return 0;
++            key = eng_fnv1a(&s_vpm.hash, sizeof s_vpm.hash, key);
++            key = eng_fnv1a(&fpm->shash, sizeof fpm->shash, key);
++        } else {
++            key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
++            key = rsx_fp_structural_hash(fp_uc, fp_size, key);
++            if (!key) return 0;
++        }
+         const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
+         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
+         if (srgb_output) key = eng_fnv1a(&srgb_output, sizeof srgb_output, key);
+@@ -1887,7 +2089,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+          * height (rsx_fp_apply_wpos); RSX_WPOS_HOST=1 keeps the host's. */
+         static int wpos_host = -1;
+         if (wpos_host < 0) { const char* e = getenv("RSX_WPOS_HOST"); wpos_host = e && e[0] == '1'; }
+-        if (!wpos_host && rsx_fp_reads_wpos(fp_uc, fp_size)) {
++        if (!wpos_host && (fpm ? fpm->reads_wpos : rsx_fp_reads_wpos(fp_uc, fp_size))) {
+             shader_window = g.rsx.regs[0x1D88 >> 2] & 0xFFFFu;
+             key = eng_fnv1a(&shader_window, sizeof shader_window, key);
+             { static u32 seen[8]; static u32 n;
+@@ -1905,12 +2107,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+     key = eng_fnv1a(&rt_count, sizeof rt_count, key);
+     key = rsx_draw_engine_hash_render_state(rs, key);
+ 
+-    for (u32 i = 0; i < g.n_pipelines; i++)
++    /* s_pipe_ix: open addressing over the keys, entry i + 1 (0: empty); a
++     * draw searched all of g.pipelines. */
++    static u32 s_pipe_ix[ENG_MAX_PIPELINES * 2u];
++    u32 ix = (u32)(key ^ (key >> 29) ^ (key >> 47)) & (ENG_MAX_PIPELINES * 2u - 1u);
++    for (; s_pipe_ix[ix]; ix = (ix + 1u) & (ENG_MAX_PIPELINES * 2u - 1u)) {
++        const u32 i = s_pipe_ix[ix] - 1u;
+         if (g.pipelines[i].key == key) {
+             *out_fixed = g.pipelines[i].fixed;
+             *out_tex_used = g.pipelines[i].tex_used;
+             return g.pipelines[i].handle;
+         }
++    }
+     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
+ 
+     u32 handle = 0;
+@@ -1988,6 +2196,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+     g.pipelines[g.n_pipelines].tex_used =
+         (u16)(fixed ? 0xFFFFu : eng_sampled_units(s_ps_hlsl));
+     *out_tex_used = g.pipelines[g.n_pipelines].tex_used;
++    s_pipe_ix[ix] = g.n_pipelines + 1u;
+     g.n_pipelines++;
+     *out_fixed = fixed;
+     return handle;
+@@ -3785,6 +3994,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
+     sink.immediate_vertex = sink_immediate_vertex;
+     sink.flip             = sink_flip;
+     rsx_dispatch_init(&g.rsx, &sink);
++    s_vpm.valid = 0;                /* vp_gen starts over */
+     g.ready = 1;
+     /* Display buffers the title registered before the backend came up. */
+     cellGcm_replay_display_buffers_to_engine();
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index 9fbf2684..e047803e 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -143,6 +143,11 @@ static int fp_instruction_has_constant(u32 w1, u32 w2, u32 w3)
+             FP_REG_TYPE_CONST;
+ }
+ 
++int rsx_fp_instruction_has_constant(u32 w1, u32 w2, u32 w3)
++{
++    return fp_instruction_has_constant(w1, w2, w3);
++}
++
+ unsigned long long g_rsx_fp_nonfinite_constants = 0;
+ 
+ /* An inline fragment constant is never legitimately non-finite.  A NaN one
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+index 4ecb6316..ed907477 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -41,6 +41,9 @@ typedef struct rsx_fp_constant_block {
+  * word. The decoder operates on host-order words. */
+ u32 rsx_fp_read_word(const u8* p);
+ u32 rsx_fp_sanitize_constant_word(u32 w);
++/* Is the 16-byte slot after this instruction (host-order words 1..3) its
++ * inline constant? The walk every analysis below makes. */
++int rsx_fp_instruction_has_constant(u32 w1, u32 w2, u32 w3);
+ extern unsigned long long g_rsx_fp_nonfinite_constants;
+ 
+ /* Decompile an NV40 fragment program into an HLSL pixel shader.
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index c03063cd..7e91c010 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -2470,8 +2470,56 @@ extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
+     ps3_indirect_call(ctx);
+ }
+ 
++/* The indirect call with none of the diagnostics below switched on: look the
++ * target up and run it, with the same depth guard, vcall stack and trampoline
++ * loop as ps3_indirect_call_impl. Every switch there was a static test (and
++ * a few thread-local stores) per call -- ~3% of Killzone 2's main thread is
++ * indirect calls. 0: not handled (no switch-free state, a null target or one
++ * that is not a lifted function), the full path decides. PPU_ICALL_LEAN=0:
++ * always the full path. */
++static int ppu_icall_lean_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        static const char* const kSwitches[] = {
++            "PPU_CSCHECK", "PS3_ICALL_GATE", "BCTRL_RING", "PS3_BREADCRUMB",
++            "PPU_TOCWATCH", "PS3_CALLTRACE", "PS3_CALLTRACE_LR", "PS3_CALLTRACE_R5",
++            "PS3_CALLTRACE_FROM", "PS3_CALLTRACE_TO", "FLOW_FORCE_RTCFG", "SPURS_TRACE",
++            "PS3_PRX_CALLTRACE", "PPU_TOCFIX", "PPU_RETWATCH" };
++        int lean = 1;
++        const char* e = getenv("PPU_ICALL_LEAN");
++        if (e && e[0] == '0') lean = 0;
++        for (unsigned i = 0; lean && i < sizeof kSwitches / sizeof kSwitches[0]; i++)
++            if (getenv(kSwitches[i])) lean = 0;
++        on = lean;
++    }
++    return on;
++}
++static inline int ppu_icall_lean(ppu_context* ctx)
++{
++    const uint32_t addr = g_icall_target_set ? g_icall_target : (uint32_t)ctx->ctr;
++    if (!addr) return 0;
++    const ppu_fn fn = ppu_lookup(addr);
++    if (!fn || g_dispatch_depth > 4000) return 0;
++    g_icall_target_set = 0;
++    g_active_ctx = ctx;
++    g_dispatch_depth++;
++    if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
++    g_vcall_sp++;
++    fn(ctx);
++    while (g_trampoline_fn) {
++        void (*tf)(void*) = g_trampoline_fn;
++        g_trampoline_fn = 0;
++        tf(ctx);
++    }
++    if (g_vcall_sp > 0) g_vcall_sp--;
++    g_dispatch_depth--;
++    return 1;
++}
++
+ extern "C" void ps3_indirect_call(ppu_context* ctx)
+ {
++    if (ppu_icall_lean_on() && ppu_icall_lean(ctx)) return;
+     static int on = -1;
+     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
+     { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index e43ff562..bce68492 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -1031,6 +1031,16 @@ __declspec(selectany) __declspec(thread) unsigned g_spu_fp_saved;
+ __attribute__((weak)) __thread int g_spu_fp_rz;
+ __attribute__((weak)) __thread unsigned g_spu_fp_saved;   /* the thread's own MXCSR */
+ #endif
++/* SPU_FP_RZ_ASSUMED: the code being compiled only ever runs in the mode (the
++ * lifted images: spu_run_with_halt enters it), so the per-operation test of
++ * g_spu_fp_rz -- a thread-local load and a branch before every fa/fm/fma, and
++ * the code of the other mode -- goes. SPU_FP_RZ=0 then no longer reaches
++ * that code. */
++#if defined(SPU_FP_RZ_ASSUMED)
++#define SPU__FP_RZ_ON 1
++#else
++#define SPU__FP_RZ_ON __builtin_expect(g_spu_fp_rz, 1)
++#endif
+ /* The result alone says whether a lane needs the slow path: an exponent-255
+  * operand (the SPU's extended range, Inf or NaN to x86) always gives an
+  * exponent-255 result in IEEE add, multiply and fma -- x + Inf = Inf,
+@@ -1082,7 +1092,7 @@ SPU__XV_INLINE int spu__xv_onbnd(__m256d d, __m256d err) {
+ }
+ SPU__XV_INLINE u128 spu__xv_fa(u128 a, u128 b, uint32_t negb) {
+     __m128i res;
+-    if (__builtin_expect(g_spu_fp_rz, 1)) {
++    if (SPU__FP_RZ_ON) {
+         const __m128i A = spu__xv_ld(a), B = _mm_xor_si128(spu__xv_ld(b), _mm_set1_epi32((int)negb));
+         const __m128i r = _mm_castps_si128(_mm_add_ps(_mm_castsi128_ps(A), _mm_castsi128_ps(B)));
+         const __m128i bad = spu__rz_bad(A, B, r);
+@@ -1100,7 +1110,7 @@ SPU__XV_INLINE u128 spu__xv_fa(u128 a, u128 b, uint32_t negb) {
+ }
+ SPU__XV_INLINE u128 spu__xv_fm(u128 a, u128 b) {
+     __m128i res;
+-    if (__builtin_expect(g_spu_fp_rz, 1)) {
++    if (SPU__FP_RZ_ON) {
+         const __m128i A = spu__xv_ld(a), B = spu__xv_ld(b);
+         const __m128i r = _mm_castps_si128(_mm_mul_ps(_mm_castsi128_ps(A), _mm_castsi128_ps(B)));
+         const __m128i bad = spu__rz_bad(A, B, r);
+@@ -1116,7 +1126,7 @@ SPU__XV_INLINE u128 spu__xv_fm(u128 a, u128 b) {
+ }
+ SPU__XV_INLINE u128 spu__xv_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+     __m128i res;
+-    if (__builtin_expect(g_spu_fp_rz, 1)) {
++    if (SPU__FP_RZ_ON) {
+         const __m128i A = _mm_xor_si128(spu__xv_ld(a), _mm_set1_epi32((int)negp)), B = spu__xv_ld(b);
+         const __m128i C = _mm_xor_si128(spu__xv_ld(c), _mm_set1_epi32((int)negc));
+         const __m128i r = _mm_castps_si128(_mm_fmadd_ps(_mm_castsi128_ps(A), _mm_castsi128_ps(B), _mm_castsi128_ps(C)));
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index f70656ae..8e4511db 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -33,14 +33,54 @@ int g_cri_video_dma = 0;
+ 
+ /* ---- fingerprint ------------------------------------------------------- */
+ 
++/* The last few images fingerprinted, by address and size, with a copy of
++ * their bytes: an image dispatched again from the same place is compared
++ * (memcmp, tens of bytes a cycle) instead of hashed again (FNV-1a, a
++ * multiply per byte -- the registry's fingerprints are FNV, so the hash
++ * cannot change). Killzone 2 dispatches ~1,300 SPURS tasks a second from a
++ * handful of images, almost all from the PPU's main thread. SPU_FP_MEMO=0:
++ * hash every time. */
++#define SPU_FP_MEMO_N 8
++static struct { const void* p; size_t n; uint64_t fp; uint8_t* copy; size_t cap; }
++    s_fp_memo[SPU_FP_MEMO_N];
++static unsigned s_fp_memo_next;
++static SRWLOCK s_fp_memo_lock = SRWLOCK_INIT;
++
+ uint64_t spu_workload_fingerprint(const void* data, size_t n)
+ {
++    static int memo = -1;
++    if (memo < 0) { const char* e = getenv("SPU_FP_MEMO"); memo = !(e && e[0] == '0'); }
++    const int use = memo && n >= 256;
++    if (use) {
++        AcquireSRWLockExclusive(&s_fp_memo_lock);
++        for (unsigned k = 0; k < SPU_FP_MEMO_N; k++)
++            if (s_fp_memo[k].p == data && s_fp_memo[k].n == n &&
++                !memcmp(s_fp_memo[k].copy, data, n)) {
++                const uint64_t fp = s_fp_memo[k].fp;
++                ReleaseSRWLockExclusive(&s_fp_memo_lock);
++                return fp;
++            }
++        ReleaseSRWLockExclusive(&s_fp_memo_lock);
++    }
+     const uint8_t* p = (const uint8_t*)data;
+     uint64_t h = 1469598103934665603ULL;          /* FNV offset basis */
+     for (size_t i = 0; i < n; i++) {
+         h ^= p[i];
+         h *= 1099511628211ULL;                     /* FNV prime */
+     }
++    if (use) {
++        AcquireSRWLockExclusive(&s_fp_memo_lock);
++        const unsigned k = s_fp_memo_next++ % SPU_FP_MEMO_N;
++        if (s_fp_memo[k].cap < n) {
++            uint8_t* c = (uint8_t*)realloc(s_fp_memo[k].copy, n);
++            if (c) { s_fp_memo[k].copy = c; s_fp_memo[k].cap = n; }
++        }
++        if (s_fp_memo[k].cap >= n) {
++            memcpy(s_fp_memo[k].copy, data, n);
++            s_fp_memo[k].p = data; s_fp_memo[k].n = n; s_fp_memo[k].fp = h;
++        } else s_fp_memo[k].p = NULL;
++        ReleaseSRWLockExclusive(&s_fp_memo_lock);
++    }
+     return h;
+ }
+ 

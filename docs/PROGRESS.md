@@ -2306,3 +2306,56 @@ and on the FIFO thread ~0.8 GB/s (draw constants, vertices, indices).
 The main thread at ~30: 64% running (the SPU-progress spin included), blocked
 36%: SPU job counters (`func_004D3D00`) ~12%, condition waits under
 `func_00803590` ~13%, the label wait ~6%.
+
+## 87. The relay at 30: what the FIFO thread waits for
+
+A 2 ms timeline of the 30 frames/s profile (`tools/kzprof_timeline.py`,
+whose "other" letter is now `~` instead of `o`, which a job module also had)
+shows the FIFO thread idle -- parked on an SPU-patched jump -- in 6-10 ms
+gaps, each lined up with a burst of `9935c8f700db` on all five SPURS lanes
+(its `spu_func_000054C0`, the process's hottest symbol at 7% of all samples,
+reads byte bone indices and weights and multiplies matrices: skinning). So
+the FIFO thread's own work is not what the frame waits on; the SPU jobs, and
+the PPU that kicks them, are.
+
+Tried in this round:
+- **The draw's program work, once per program** (`eng_vp_memo`,
+  `eng_fp_memo_get`, `libs/video/rsx_draw_engine.c`): the fragment program's
+  six walks per draw (size twice, sampled units, gamma units, constants, the
+  byte-at-a-time structural hash) and the vertex program's byte-at-a-time hash
+  and input analysis are worked out when the program changes; a fragment
+  program is the same while its instruction slots read the same (its inline
+  constants are read again every draw). The pipeline lookup is a hash index
+  instead of a walk over all pipelines. `RSX_PROG_MEMO_CHECK=1` works
+  everything out both ways: 2.29 M draws, 0 mismatches. `RSX_PROG_MEMO=0` =
+  before. 30.55 / 29.85 against 30.29 / 29.74 -- the FIFO thread does ~9%
+  less, the frame rate does not move (it waits for the SPUs instead).
+- **A sixth SPURS worker** for the five-SPU instance (an experiment, not
+  kept): 30.16 against 30.89. The SPUs are not short of lanes.
+- **SPU image fingerprints** (`spu_workload_fingerprint`): every SPURS task
+  dispatch hashed its whole ELF image byte by byte (FNV-1a, which the
+  registry's fingerprints are); the last eight images are kept with a copy of
+  their bytes, and an image dispatched again from the same place is compared
+  instead (`SPU_FP_MEMO=0` = before).
+- **Indirect PPU calls without the diagnostics** (`ppu_icall_lean`,
+  `runtime/ppu/ppu_loader.cpp`): with none of the sixteen trace/watch
+  switches set, a call through a pointer looks the target up and runs it with
+  the same depth guard, vcall stack and trampoline loop and nothing else
+  (`PPU_ICALL_LEAN=0` = before). With the fingerprints: 30.95 / 31.27 against
+  30.21 / 31.69 -- noise; both kept, they only remove work.
+- **The job counter wait** (`func_004D3D00`, ~12% of the main thread blocked):
+  it reads a counter the SPU jobs count down, with `sys_timer_usleep(1)` (~55
+  us on Linux) between reads. Watching the counter for 100 us before each
+  sleep (an experiment, not kept) left ~1,000 sleeps a second on the main
+  thread -- the waits are long, not late -- and 30.89 frames/s.
+- `KZ2_SPU_FP_RZ_ASSUMED` (CMake, ON): the lifted SPU sources are built with
+  `SPU_FP_RZ_ASSUMED`, so their fa/fm/fma no longer test the thread's float
+  mode before every operation (a thread-local load and a branch, 188 of them
+  in `9935c8f700db`'s hot function, and the other mode's code); the lifted code
+  only runs under `spu_run_with_halt`, which enters the mode. It changes every
+  SPU function's shape, so it waits for the next SPU profile.
+
+Where the five SPURS lanes go now: job code 61%, DMA and atomics 11.5%
+(`mfc_do_transfer` 4%), dispatch 9.3% (`spu_indirect_branch` 3.7%,
+`spu_drain_call` 2.3%, `spu_lookup` 2.1%), libc 5.8%, the job manager 4.9%,
+channels 3%.

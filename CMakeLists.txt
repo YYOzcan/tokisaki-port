@@ -192,6 +192,7 @@ else()
         COMPILE_OPTIONS "${KZ2_RECOMP_FLAGS}")
 endif()
 
+option(KZ2_SPU_FP_RZ_ASSUMED "Lifted SPU code assumes the round-toward-zero float mode (no per-op test)" ON)
 set(KZ2_SPU_PGO_FLAGS "")
 if(KZ2_SPU_PGO STREQUAL "gen")
     set(KZ2_SPU_PGO_FLAGS "-fprofile-generate=${CMAKE_BINARY_DIR}/pgo")
@@ -204,7 +205,10 @@ if(KZ2_SPU_SOURCES)
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         # SPU_LS_DIAG=0: no LS probes/watches in the lifted code's local-store
         # accesses (the runtime keeps them); KZ2_SPU_LS_DIAG=ON to debug.
-        COMPILE_DEFINITIONS "SPU_USE_DISPATCH_MT;SPU_LS_DIAG=$<IF:$<BOOL:${KZ2_SPU_LS_DIAG}>,1,0>"
+        # SPU_FP_RZ_ASSUMED: the lifted code always runs in the SPU float
+        # mode spu_run_with_halt enters (spu_helpers.h); KZ2_SPU_FP_RZ_ASSUMED=OFF
+        # keeps the per-operation test (and SPU_FP_RZ=0 working for it).
+        COMPILE_DEFINITIONS "SPU_USE_DISPATCH_MT;SPU_LS_DIAG=$<IF:$<BOOL:${KZ2_SPU_LS_DIAG}>,1,0>;$<$<BOOL:${KZ2_SPU_FP_RZ_ASSUMED}>:SPU_FP_RZ_ASSUMED>"
         COMPILE_OPTIONS "-w;${KZ2_SPU_OPT};${KZ2_SPU_PGO_FLAGS}")
 endif()
 
