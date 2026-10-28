@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <sched.h>
 #include <initializer_list>
 
 #include <zlib.h>
@@ -608,6 +610,24 @@ static lv2_syscall_fn s_orig_sys_timer_usleep = nullptr;
 static int64_t kz2_sys_timer_usleep(ppu_context* ctx)
 {
     const uint32_t caller_lr = (uint32_t)ctx->lr;
+    /* KZ2_USLEEP_SPIN_US=<n>: a request of at most n microseconds waits to
+     * its deadline yielding the core, as the runtime does on Windows, instead
+     * of in nanosleep -- which on Linux takes ~55 us however short the request
+     * (the 50 us timer slack). The main thread polls an SPU job counter with
+     * sys_timer_usleep(1) in func_004D3D00, ~a quarter of its time. */
+    static const long spin_us = [] { const char* e = getenv("KZ2_USLEEP_SPIN_US"); return e ? atol(e) : 0L; }();
+    if (spin_us > 0) {
+        const uint64_t usec = ctx->gpr[3];
+        if (usec <= (uint64_t)spin_us) {
+            struct timespec t0, t;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            const long long end = t0.tv_sec * 1000000000ll + t0.tv_nsec + (long long)usec * 1000;
+            do { sched_yield(); clock_gettime(CLOCK_MONOTONIC, &t); }
+            while (t.tv_sec * 1000000000ll + t.tv_nsec < end);
+            ctx->gpr[3] = 0;
+            return 0;
+        }
+    }
     /* Off by default since the SPURS taskset fixes (docs/PROGRESS.md section
      * 47): the menu-music stream now finishes stopping on its own, and the
      * forged stop below left the sound engine's voice lists broken -- the

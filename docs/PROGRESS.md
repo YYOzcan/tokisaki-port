@@ -1872,3 +1872,43 @@ Where the frame is now: the FIFO thread drains ~80% of the frame; per frame
 ~1,100 draws in ~270 render passes, ~175 texture creations and uploads
 (~5.5 MB), and ~5.7 GPU waits (~16 ms). The two colour readbacks and the
 soft particles' depth are what is left of the waits.
+
+## 72. Render targets pooled; what the frame waits on now
+
+**Targets through the texture pool** (patch 0048). Gdb samples of the FIFO
+thread (25, in gameplay) found 6 in driver `ioctl`s under `vkCreateImage` /
+`vkAllocateMemory` (`vk_create_image_levels` from `vk_eng_color_target_create`
+and `vk_eng_color_snapshot`) and under the pool's own destruction of what it
+could not keep: colour and depth targets and snapshots were created and
+destroyed by the dozen a frame, outside the reuse pool of section 59's
+textures. `vk_create_image_levels` now keys every image by format, size,
+levels, usage and aspect and takes it from the pool (bit 62 keeps the keys
+apart from the textures'), and the pool keeps up to 1 GB
+(`PS3RECOMP_VK_TEXPOOL_MB`; `PS3RECOMP_VK_TARGET_POOL=0` creates each one).
+30 new samples: no `ioctl` left, and the FIFO thread asleep in half of them --
+it is no longer the frame. Frame rate unchanged (16.21 / 16.24).
+
+**What the frame is now.** Per 1 ms bucket of a 20 s profile: the main
+thread is busy in 64% (19% of it the SPU progress spin), any of the four
+SPURS workers in 81%, the FIFO thread in 45%; all three idle in 1%. Main
+thread, 30 gdb samples: 7 in `sys_timer_usleep(1)` under `func_004D3D00`
+(the job counter wait), 5 in `kz2_spu_progress_wait`, 2 in `sys_cond_wait`
+under `func_004EED70` (the Havok step), 15 in its own code -- it waits for
+SPU jobs ~40% of the time.
+
+Tried, not kept:
+- the always-running job `73d064721abc` (one SPU worker at 99%;
+  `SPU_JOB_WATCH=<overlay>` prints a job's registers every 5 s): it took its
+  four input buffers once and never wrote anything in two minutes; its outer
+  counter advances every ~10 s with pseudo-random values in r8/r9, and it only
+  polls the signal-notification channels -- a background job by design.
+  Under `SCHED_IDLE`: 16.4 -> 14.8 over the run, the same slope as a normal
+  run, no gain.
+- the register-cached SPU sources of section 62 again, now that the merged
+  functions hold whole loops: 15.38 / 16.20 (with a profile of the uncached
+  code), no gain.
+- SPURS latency again (`SPURS_LINE_WAKE=1` 15.70, `SPURS_KERNEL_POLL_US=250`
+  15.47, `SPURS_IDLE_BACKOFF=0` 14.23).
+- a short `sys_timer_usleep` as a yield-spin to its deadline instead of
+  nanosleep's ~55 us (`KZ2_USLEEP_SPIN_US=<n>`, opt-in in `kz2_hle.cpp`):
+  n=1 16.91 / 16.83 / 16.6 against 16.26 / 17.12, n=50 16.00.

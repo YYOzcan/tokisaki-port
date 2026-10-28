@@ -1,0 +1,121 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 8a6e038e..07609c94 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -409,10 +409,26 @@ static int vk_find_memory_type(u32 type_bits, VkMemoryPropertyFlags want, u32* o
+     return -1;
+ }
+ 
++static int vk_tpool_take(const u64 key[3], vk_image* out);
+ static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 levels,
+                                   VkImageUsageFlags usage, VkImageAspectFlags aspect)
+ {
+     if (!levels) levels = 1;
++    /* Colour and depth targets and their snapshots come and go by the dozen
++     * a frame as well (a title reusing one address for targets of several
++     * sizes and formats): each was a vkCreateImage + vkAllocateMemory + view
++     * and later their destruction, ~a quarter of the FIFO thread's wall time
++     * in driver ioctls in Killzone 2. They go through the reuse pool like
++     * sampled textures, keyed by everything they were created with (bit 62
++     * keeps the keys apart from the textures' bit 63). A pooled image comes
++     * back in GENERAL with old contents; every caller transitions it from
++     * UNDEFINED and fills it, as for a new one. PS3RECOMP_VK_TARGET_POOL=0
++     * creates each one. */
++    static int tpool_on = -1;
++    if (tpool_on < 0) { const char* e = getenv("PS3RECOMP_VK_TARGET_POOL"); tpool_on = !(e && e[0] == '0'); }
++    const u64 key[3] = { ((u64)fmt << 32) | ((u64)levels << 8) | (1ull << 62),
++                         ((u64)w << 32) | h, ((u64)usage << 32) | (u64)aspect };
++    if (tpool_on && vk_tpool_take(key, im)) return 0;
+     VkImageCreateInfo ici = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+         .format = fmt, .extent = { w, h, 1 }, .mipLevels = levels, .arrayLayers = 1,
+@@ -438,6 +454,7 @@ static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32
+         .subresourceRange = { aspect, 0, levels, 0, 1 },
+     };
+     VK_CHECK(pvkCreateImageView(s_vk.device, &vci, NULL, &im->view), "vkCreateImageView");
++    if (tpool_on) { memcpy(im->pkey, key, sizeof key); im->psize = req.size; }
+     return 0;
+ }
+ 
+@@ -460,7 +477,8 @@ static void vk_destroy_image(vk_image* im)
+  * vkAllocateMemory + view costs ~0.25 ms of driver ioctls -- a fifth of the
+  * FIFO thread. A released texture's image, memory and view are kept here once
+  * the GPU is done with it, and the next texture with the same parameters
+- * takes them. PS3RECOMP_VK_TEXPOOL_MB caps the memory kept (default 256). */
++ * takes them. PS3RECOMP_VK_TEXPOOL_MB caps the memory kept (default 1024:
++ * render targets are pooled too, see vk_create_image_levels). */
+ #define VK_TPOOL_MAX 1024
+ static vk_image s_tpool[VK_TPOOL_MAX];
+ static u32 s_tpool_n;
+@@ -469,7 +487,7 @@ static void vk_tpool_put(vk_image* im)
+ {
+     static VkDeviceSize cap = 0;
+     if (!cap) { const char* e = getenv("PS3RECOMP_VK_TEXPOOL_MB");
+-                cap = (VkDeviceSize)(e ? atoi(e) : 256) << 20; if (!cap) cap = 1; }
++                cap = (VkDeviceSize)(e ? atoi(e) : 1024) << 20; if (!cap) cap = 1; }
+     if (!im->pkey[0] || cap <= 1) { vk_destroy_image(im); return; }
+     while ((s_tpool_n == VK_TPOOL_MAX || s_tpool_bytes + im->psize > cap) && s_tpool_n) {
+         s_tpool_bytes -= s_tpool[0].psize;          /* oldest out */
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index b7a55478..6cfb1d41 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -21,6 +21,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <setjmp.h>
++#include <pthread.h>
++#include <unistd.h>
+ #ifndef _WIN32
+ #include <sched.h>   /* sched_yield */
+ #endif
+@@ -333,10 +335,49 @@ static __thread mfc_engine*  t_mfc_eng;
+ static __thread unsigned     t_mfc_gen;
+ 
+ static mfc_engine* mfc_for_slow(spu_context* ctx);
++/* SPU_JOB_WATCH=<overlay id>: every 5 s a monitor thread prints the
++ * registers of each SPU context that has that job module resident (contexts
++ * are noted at their first MFC use). Racy reads; a diagnostic for a job that
++ * never ends. */
++static spu_context* volatile s_watch_ctx[32];
++static void* spu_job_watch_main(void* arg)
++{
++    const int ovl = (int)(intptr_t)arg;
++    for (;;) {
++        sleep(5);
++        for (int i = 0; i < 32; i++) {
++            spu_context* c = s_watch_ctx[i];
++            if (!c || c->resident_ovl != ovl) continue;
++            fprintf(stderr, "[job-watch] ctx %p ovl %d pc 0x%05X:", (void*)c, ovl, (unsigned)(c->pc & SPU_LS_MASK));
++            for (int r = 0; r < 128; r++) {
++                if (r == 3 || r == 80 || r == 100 || r == 120) fprintf(stderr, "\n   r%-3d", r);
++                if (r >= 3 && r < 16) fprintf(stderr, " %08X", c->gpr[r]._u32[0]);
++                if (r >= 80 && r < 128) fprintf(stderr, " %08X", c->gpr[r]._u32[0]);
++            }
++            fprintf(stderr, "\n");
++        }
++    }
++    return 0;
++}
++static void spu_job_watch_note(spu_context* ctx)
++{
++    static int ovl = -2;
++    if (ovl == -2) {
++        const char* e = getenv("SPU_JOB_WATCH");
++        ovl = e ? atoi(e) : -1;
++        if (ovl >= 0) { pthread_t t; pthread_create(&t, 0, spu_job_watch_main, (void*)(intptr_t)ovl); }
++    }
++    if (ovl < 0) return;
++    for (int i = 0; i < 32; i++) {
++        if (s_watch_ctx[i] == ctx) return;
++        if (!s_watch_ctx[i]) { s_watch_ctx[i] = ctx; return; }
++    }
++}
+ static mfc_engine* mfc_for(spu_context* ctx)
+ {
+     const unsigned gen = __atomic_load_n(&s_mfc_gen, __ATOMIC_ACQUIRE);
+     if (t_mfc_ctx == ctx && t_mfc_gen == gen) return t_mfc_eng;
++    spu_job_watch_note(ctx);
+     mfc_engine* e = mfc_for_slow(ctx);
+     t_mfc_ctx = ctx; t_mfc_eng = e; t_mfc_gen = gen;
+     return e;
