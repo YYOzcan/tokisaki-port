@@ -686,6 +686,13 @@ static void guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2,
 
 int main(int argc, char** argv)
 {
+    /* Killzone 2's defaults for the runtime's switches (an explicit setting in
+     * the environment wins): SPURS tasks on reusable threads (PROGRESS 81, 85)
+     * and the once-per-task log lines counted, not printed (82) -- 57 MB of
+     * log in a 160 s run before; with both, 30.0 frames/s against 28.8. */
+    setenv("SPU_ASYNC_POOL", "1", 0);
+    setenv("PS3_LOG_EVENTS", "0", 0);
+    setenv("PS3_VERBOSE", "0", 0);
 #if defined(__linux__)
     /* KZ2_ALLOW_PTRACE=1: let any process of this user attach (eu-stack, gdb -p)
      * under yama ptrace_scope=1, so a stalled run can be inspected without

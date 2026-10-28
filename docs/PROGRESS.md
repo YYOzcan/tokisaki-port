@@ -2273,3 +2273,14 @@ stop.
 Frame rate: 26.56 / 26.24 against 25.69 / 27.66 -- no change (the modules are
 mostly the always-running background job, off the frame's critical path); the
 lane they occupied has ~40% of a core back.
+
+## 85. The task pool and quiet per-event logs as Killzone 2 defaults: ~30 frames/s
+
+With section 83's stop fixed, both things that had exposed it are safe again:
+no lane stop in six runs with them, and the task pool's lane spinning at 100%
+(section 82) was the same bug (now `spu_run_with_halt` 0.2%, no thread above
+71%). Two alternating runs each on this build: default 28.91 / 28.76,
+`PS3_LOG_EVENTS=0 PS3_VERBOSE=0` 28.03 / 29.02, those plus `SPU_ASYNC_POOL=1`
+29.48 / 30.50 frames/s. `src/boot_main.cpp` now sets the three unless the
+environment already does (the log of a 160 s run drops from 57 MB to a few).
+Against the previous play build: 30.39 against 26.81 (one pair).
