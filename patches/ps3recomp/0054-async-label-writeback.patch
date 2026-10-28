@@ -1,0 +1,508 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 4e372e0d..0ca83b87 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1976,9 +1976,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                               fprintf(stderr, "[labelwatch] NV406E m=0x%02X v=0x%08X at get=0x%08X\n", m, v, s_fifo_getoff); } }
+                     if (m == 0x64u)      s_sema_offset = v;
+                     else if (m == 0x6Cu) {
+-                        extern void rsx_draw_engine_flush_main_targets(void);
+-                        rsx_draw_engine_flush_main_targets();
+-                        vm_write32(la, v);
++                        extern void rsx_draw_engine_label_release(u32 ea, u32 val);
++                        rsx_draw_engine_label_release(la, v);
+                     }
+                     else if (m == 0x68u && vm_read32(la) != v) {
+             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index 93a15567..c75dbbb5 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -359,10 +359,6 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+             static int n = 0; if (n++ < 64)
+                 fprintf(stderr, "[labelwatch] NV4097 m=0x%04X v=0x%08X\n", method, data); } }
+       if (method == 0x1D6C) { s_sem_off = data; return 0; }
+-      if (method == 0x1D70 || method == 0x1D74) {
+-        extern void rsx_draw_engine_flush_main_targets(void);
+-        rsx_draw_engine_flush_main_targets();
+-      }
+       if (method == 0x1D70) {
+         extern void vm_write32(uint32_t a, uint32_t v);
+         /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
+@@ -373,7 +369,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+          * 0x00010000 != 1 and spun forever (gcm/cube sample hang after init).
+          * Apply the same swap the hardware does so the pre-swap cancels out. */
+         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+-        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
++        /* the main-memory targets first, then the label (in order, maybe later) */
++        extern void rsx_draw_engine_label_release(u32 ea, u32 val);
++        rsx_draw_engine_label_release(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+         { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
+         return 0;
+       }
+@@ -383,8 +381,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+        * fences its streaming VRAM ring with it (label 0x48); dropping it
+        * froze the label and the allocator waited forever for free blocks. */
+       if (method == 0x1D74) {
+-        extern void vm_write32(uint32_t a, uint32_t v);
+-        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
++        extern void rsx_draw_engine_label_release(u32 ea, u32 val);
++        rsx_draw_engine_label_release(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
+         { static int _l=0; if(_l++<4) fprintf(stderr,"[RSX] texture-read label write @0x%08X = 0x%08X\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), data); }
+         return 0;
+       }
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index ab65cc21..75629053 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -710,6 +710,8 @@ static u32 s_coherence_cap;
+ /* RSX_ENGINE_COHERENCE_LOG=<n>: log the first n transfers the engine syncs,
+  * with how many non-zero pixels moved -- the question when a composite comes
+  * out black is whether the GPU surface had anything in it. */
++static u32 s_pend_n;            /* the asynchronous writeback queue (below) */
++static void eng_pend_guard(u32 location, u32 offset, u32 bytes);
+ static int eng_coherence_log(void)
+ {
+     static int left = -1;
+@@ -738,6 +740,7 @@ static u8* eng_coherence_buffer(u32 bytes)
+ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
+ {
+     if (!g.ready || !g.be->readback || !pitch || !w || !h) return;
++    if (s_pend_n) eng_pend_guard(location, offset, pitch * h);
+     u32 x = 0, y = 0;
+     const u32 slot = eng_surface_at(location, offset, pitch, &x, &y);
+     if (slot == ENG_INVALID) {
+@@ -772,6 +775,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
+ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
+ {
+     if (!g.ready || !g.be->color_target_write || !pitch || !w || !h) return;
++    if (s_pend_n) eng_pend_guard(location, offset, pitch * h);
+     u32 x = 0, y = 0;
+     const u32 slot = eng_surface_at(location, offset, pitch, &x, &y);
+     if (slot == ENG_INVALID) {
+@@ -1078,6 +1082,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
+     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+     if (!span) return 0;
++    if (s_pend_n) eng_pend_guard(location, offset, span);
+ 
+     for (u32 i = 0; i < g.n_textures; i++) {
+         eng_texture* e = &g.textures[i];
+@@ -1229,6 +1234,7 @@ void rsx_draw_engine_flush_main_targets(void)
+ void rsx_draw_engine_idle_flush(void)
+ {
+     if (!g.ready) return;
++    rsx_draw_engine_async_poll(1);
+     eng_zdepth_flush_owed();
+ }
+ 
+@@ -1267,6 +1273,7 @@ static int eng_zdepth_to_guest(u32 slot)
+ {
+     eng_zdepth* z = &g.zdepths[slot];
+     if (!z->guest_dirty) return 1;
++    if (s_pend_n) eng_pend_guard(z->location, z->offset, z->pitch * z->h);
+     if (!g.be->depth_readback || !z->handle) return 0;
+     const u32 bpp = (z->zfmt == 1u) ? 2u : 4u;      /* SURFACE_FORMAT Z16 = 1 */
+     const u32 w = z->used_w < z->w ? z->used_w : z->w;
+@@ -1390,6 +1397,197 @@ static void eng_surface_writeback(u32 slot)
+     eng_textures_touch(s->location, s->offset, s->pitch * s->h);
+ }
+ 
++/* ---- main-target writebacks without a GPU wait (RSX_ASYNC_WB=1) ---------
++ * Every label release stored the main-memory targets first (section above),
++ * a GPU wait each: three a frame in Killzone 2's level, ~13 ms of the FIFO
++ * thread. Here the copies go to the GPU like any other operation and the
++ * label waits behind them in a queue, written in order once they have landed
++ * -- what the RSX does, which writes a label when its pipeline gets there.
++ * The FIFO meanwhile goes on recording. The queue is landed as far as it can
++ * at each release and each draw, all of it (waiting) when the FIFO stops,
++ * before a guest-memory texture or a coherence read over a queued target. */
++extern void vm_write32(uint32_t a, uint32_t v);
++enum { ENG_PEND_COLOR = 1, ENG_PEND_DEPTH, ENG_PEND_LABEL };
++typedef struct {
++    u8  kind;
++    u64 ticket;
++    u32 location, offset, pitch, w, h;
++    u32 bpp, elem;          /* colour: bytes per pixel, byte-swap unit (0: ARGB8) */
++    u32 zbpp;               /* depth: 2 (Z16) or 4 (Z24S8) */
++    u32 ea, val;            /* label */
++} eng_pend;
++#define ENG_PEND_N 64u
++static eng_pend s_pend[ENG_PEND_N];
++static u32 s_pend_head, s_pend_n;
++
++static int eng_async_wb(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_ASYNC_WB"); on = e && e[0] == '1'; }
++    return on && g.be && g.be->readback_async && g.be->readback_result && g.be->readback_release;
++}
++
++static void eng_pend_store(const eng_pend* p, const u8* src)
++{
++    if (p->kind == ENG_PEND_COLOR) {
++        const int rgba = rsx_texture_argb_is_rgba();
++        for (u32 r = 0; r < p->h; r++) {
++            u8* dst = (u8*)eng_guest_ptr(NULL, p->location, p->offset + r * p->pitch, p->w * p->bpp);
++            if (!dst) break;
++            const u8* q = src + (size_t)r * p->w * p->bpp;
++            if (!p->elem) {
++                for (u32 c = 0; c < p->w; c++, q += 4, dst += 4) {
++                    if (rgba) { dst[0] = q[0]; dst[1] = q[1]; dst[2] = q[2]; dst[3] = q[3]; }
++                    else      { dst[0] = q[3]; dst[1] = q[0]; dst[2] = q[1]; dst[3] = q[2]; }
++                }
++            } else if (p->elem == 4) {
++                for (u32 b = 0; b < p->w * p->bpp; b += 4) {
++                    dst[b] = q[b + 3]; dst[b + 1] = q[b + 2]; dst[b + 2] = q[b + 1]; dst[b + 3] = q[b];
++                }
++            } else {
++                for (u32 b = 0; b < p->w * p->bpp; b += 2) { dst[b] = q[b + 1]; dst[b + 1] = q[b]; }
++            }
++        }
++    } else {
++        const float* rows = (const float*)src;
++        for (u32 r = 0; r < p->h; r++) {
++            u8* dst = (u8*)eng_guest_ptr(NULL, p->location, p->offset + r * p->pitch, p->w * p->zbpp);
++            if (!dst) break;
++            const float* q = rows + (size_t)r * p->w;
++            for (u32 c = 0; c < p->w; c++) {
++                float d = q[c];
++                if (!(d > 0.0f)) d = 0.0f;
++                if (d > 1.0f) d = 1.0f;
++                if (p->zbpp == 2u) {
++                    const u32 v = (u32)(d * 65535.0f + 0.5f);
++                    dst[0] = (u8)(v >> 8); dst[1] = (u8)v;
++                } else {
++                    const u32 v = (u32)((double)d * 16777215.0 + 0.5);
++                    dst[0] = (u8)(v >> 16); dst[1] = (u8)(v >> 8); dst[2] = (u8)v; dst[3] = 0;
++                }
++                dst += p->zbpp;
++            }
++        }
++    }
++    eng_textures_touch(p->location, p->offset, p->pitch * p->h);
++}
++
++void rsx_draw_engine_async_poll(int wait)
++{
++    while (s_pend_n) {
++        eng_pend* p = &s_pend[s_pend_head];
++        if (p->kind == ENG_PEND_LABEL) {
++            __atomic_thread_fence(__ATOMIC_RELEASE);     /* the stored targets before their label */
++            vm_write32(p->ea, p->val);
++        } else {
++            const void* rows = g.be->readback_result(g.be->user, p->ticket, wait);
++            if (!rows) return;
++            eng_pend_store(p, (const u8*)rows);
++            g.be->readback_release(g.be->user, p->ticket);
++        }
++        s_pend_head = (s_pend_head + 1u) % ENG_PEND_N;
++        s_pend_n--;
++    }
++}
++
++static eng_pend* eng_pend_push(void)
++{
++    if (s_pend_n == ENG_PEND_N) rsx_draw_engine_async_poll(1);
++    eng_pend* p = &s_pend[(s_pend_head + s_pend_n) % ENG_PEND_N];
++    memset(p, 0, sizeof *p);
++    s_pend_n++;
++    return p;
++}
++
++/* A queued copy overlaps [offset, offset + bytes) at `location`: land the
++ * queue before anything reads those guest bytes. */
++static void eng_pend_guard(u32 location, u32 offset, u32 bytes)
++{
++    for (u32 k = 0; k < s_pend_n; k++) {
++        const eng_pend* p = &s_pend[(s_pend_head + k) % ENG_PEND_N];
++        if (p->kind == ENG_PEND_LABEL || p->location != location) continue;
++        const u32 end = p->offset + p->pitch * p->h;
++        if (offset < end && offset + bytes > p->offset) { rsx_draw_engine_async_poll(1); return; }
++    }
++}
++
++/* Queue one dirty main target; 0 when the backend cannot (the caller stores
++ * it the waiting way). */
++static int eng_surface_writeback_async(u32 slot)
++{
++    eng_surface* s = &g.surfaces[slot];
++    u32 bpp = 4, elem = 0;
++    switch (s->fmt) {
++    case RSX_BE_FMT_R8G8B8A8:      bpp = 4;  elem = 0; break;
++    case RSX_BE_FMT_R32F:          bpp = 4;  elem = 4; break;
++    case RSX_BE_FMT_R16G16F:       bpp = 4;  elem = 2; break;
++    case RSX_BE_FMT_R16G16B16A16F: bpp = 8;  elem = 2; break;
++    case RSX_BE_FMT_R32G32B32A32F: bpp = 16; elem = 4; break;
++    default: return 0;
++    }
++    if (s->pitch < s->w * bpp) return 0;
++    const u64 t = g.be->readback_async(g.be->user, s->handle, 0, 0, 0, s->w, s->h);
++    if (!t) return 0;
++    eng_pend* p = eng_pend_push();
++    p->kind = ENG_PEND_COLOR; p->ticket = t;
++    p->location = s->location; p->offset = s->offset; p->pitch = s->pitch;
++    p->w = s->w; p->h = s->h; p->bpp = bpp; p->elem = elem;
++    s->guest_dirty = 0;
++    return 1;
++}
++
++static int eng_zdepth_writeback_async(u32 slot)
++{
++    eng_zdepth* z = &g.zdepths[slot];
++    if (!z->handle) return 0;
++    const u32 bpp = (z->zfmt == 1u) ? 2u : 4u;
++    const u32 w = z->used_w < z->w ? z->used_w : z->w;
++    const u32 h = z->used_h < z->h ? z->used_h : z->h;
++    if (!w || !h || z->pitch < w * bpp) return 0;
++    const u64 t = g.be->readback_async(g.be->user, z->handle, 1, 0, 0, w, h);
++    if (!t) return 0;
++    eng_pend* p = eng_pend_push();
++    p->kind = ENG_PEND_DEPTH; p->ticket = t;
++    p->location = z->location; p->offset = z->offset; p->pitch = z->pitch;
++    p->w = w; p->h = h; p->zbpp = bpp;
++    z->guest_dirty = 0;
++    return 1;
++}
++
++void rsx_draw_engine_label_release(u32 ea, u32 val)
++{
++    if (!g.ready || !eng_async_wb()) {
++        rsx_draw_engine_flush_main_targets();
++        vm_write32(ea, val);
++        return;
++    }
++    rsx_draw_engine_async_poll(0);
++    static int en = -1;
++    if (en < 0) { const char* e = getenv("RSX_MAIN_TARGET_WB"); en = e ? atoi(e) : 1; }
++    if (en) {
++        for (u32 i = 0; i < g.n_surfaces; i++) {
++            const eng_surface* s = &g.surfaces[i];
++            if (!s->handle || s->location != 1 || !s->guest_dirty) continue;
++            if (!eng_surface_writeback_async(i)) {     /* in order: land the queue, then wait */
++                rsx_draw_engine_async_poll(1);
++                eng_surface_writeback(i);
++            }
++        }
++    }
++    for (u32 i = 0; i < g.n_zdepths; i++) {
++        eng_zdepth* z = &g.zdepths[i];
++        if (!z->wb_pending) continue;
++        if (z->guest_dirty && !eng_zdepth_writeback_async(i)) {
++            rsx_draw_engine_async_poll(1);
++            eng_zdepth_to_guest(i);
++        }
++        z->wb_pending = 0;
++    }
++    if (!s_pend_n) { vm_write32(ea, val); return; }
++    eng_pend* p = eng_pend_push();
++    p->kind = ENG_PEND_LABEL; p->ea = ea; p->val = val;
++}
++
+ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
+ {
+     const u64 serial = ++g.write_serial;
+@@ -2537,14 +2735,34 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+         /* The depth at this address, when it was written after any colour
+          * there: a depth-only pass names its zeta as a colour target too. */
+         int zsrc = -1;
++        /* Several zeta slots can share an address (Killzone 2's 640x360 soft
++         * particle depth and its shadow maps): the one written last is what
++         * the guest bytes there hold. RSX_ZSRC_FIRST=1 takes the first slot
++         * found, as before. */
++        static int zfirst = -1;
++        if (zfirst < 0) { const char* e = getenv("RSX_ZSRC_FIRST"); zfirst = e && e[0] == '1'; }
++        u64 zbest = 0;
+         for (u32 i = 0; i < g.n_zdepths; i++) {
+             const eng_zdepth* z = &g.zdepths[i];
+             if (z->location != t.location || z->offset != t.offset || !z->depth_serial)
+                 continue;
+-            if (surface_at < 0 || z->depth_serial > g.surfaces[surface_at].color_serial)
+-                zsrc = (int)i;
+-            break;
++            if (zfirst) {
++                if (surface_at < 0 || z->depth_serial > g.surfaces[surface_at].color_serial)
++                    zsrc = (int)i;
++                break;
++            }
++            if (z->depth_serial > zbest) { zbest = z->depth_serial; zsrc = (int)i; }
+         }
++        if (!zfirst && zsrc >= 0 && surface_at >= 0 &&
++            g.zdepths[zsrc].depth_serial <= g.surfaces[surface_at].color_serial)
++            zsrc = -1;
++        { static int tw = -2; static u32 tw_off; if (tw == -2) { const char* e = getenv("RSX_TEX_WATCH");
++            tw = e ? 400 : 0; tw_off = e ? (u32)strtoul(e, 0, 16) : 0; }
++          if (tw > 0 && t.offset == tw_off) { tw--;
++            u32 same = 0; for (u32 i = 0; i < g.n_zdepths; i++) same += g.zdepths[i].location == t.location && g.zdepths[i].offset == t.offset;
++            fprintf(stderr, "[tex-watch] unit %u fmt %02X %ux%u pitch %u loc %u: surface %d own %d, zsrc %d of %u (current zeta %d)%s\n",
++                    u, base_fmt, t.width, t.height, t.pitch, t.location, surface_at, own, zsrc, same, (int)current_zslot,
++                    zsrc >= 0 ? (g.zdepths[zsrc].guest_dirty ? " dirty" : " stored") : ""); } }
+         if (zsrc >= 0) {
+             /* DEPTH24_D8 keeps the backend's own snapshot when it has one;
+              * anything else goes through guest memory. */
+@@ -3122,6 +3340,7 @@ static void pd_present(u32 presented)
+ static void sink_end(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
++    if (s_pend_n) rsx_draw_engine_async_poll(0);
+     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
+     /* Mixed geometry sources have no defined concatenation here. Reject the
+      * whole group instead of drawing partial/misordered geometry. */
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index 4b38c87b..c78969a3 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -252,6 +252,16 @@ typedef struct rsx_draw_backend {
+      * engine need not submit_and_wait first (that was a second GPU round
+      * trip per readback). */
+     int readback_ordered;
++    /* Optional: a readback that does not wait. readback_async records a copy
++     * of a colour target (depth == 0) or of a depth target as float32
++     * (depth != 0), ordered after everything recorded before it, submits it
++     * and returns a ticket, or 0 when it cannot (the engine then reads back
++     * the waiting way). readback_result returns the tight rows once the GPU
++     * has written them -- waiting for that when `wait` is set -- and NULL
++     * while it has not; readback_release frees the ticket. */
++    u64 (*readback_async)(void* user, u32 target, int depth, u32 x, u32 y, u32 w, u32 h);
++    const void* (*readback_result)(void* user, u64 ticket, int wait);
++    void (*readback_release)(void* user, u64 ticket);
+ } rsx_draw_backend;
+ 
+ #define RSX_BE_XFORM_DEPTH24_ARGB8  1u   /* D24S8 depth as A8R8G8B8       */
+@@ -323,6 +333,16 @@ void rsx_draw_engine_flush_main_targets(void);
+ /* The FIFO walker stopped (empty or parked): store what the engine still owes
+  * guest memory, since no later label may come to trigger it. */
+ void rsx_draw_engine_idle_flush(void);
++/* A label or semaphore release the FIFO reached (back-end, texture-read or
++ * NV406E): the main-memory targets the guest is about to read are stored,
++ * then the label word at guest address `ea`. With RSX_ASYNC_WB=1 the copies
++ * go to the GPU without a wait and the label waits behind them in order,
++ * written once they have landed (rsx_draw_engine_async_poll; the FIFO
++ * stopping waits for them). */
++void rsx_draw_engine_label_release(u32 ea, u32 val);
++/* Land the queued copies and labels whose GPU work is done (all of them,
++ * waiting, when `wait` is set). */
++void rsx_draw_engine_async_poll(int wait);
+ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+ 
+ /* --- test hooks ---------------------------------------------------------- */
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 07609c94..1daf72df 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -86,7 +86,7 @@
+     X(vkInvalidateMappedMemoryRanges) \
+     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) \
+     X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) \
+-    X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) \
++    X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkGetFenceStatus) X(vkResetFences) X(vkQueueSubmit) \
+     X(vkCreateRenderPass) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) \
+     X(vkCreateShaderModule) X(vkDestroyShaderModule) \
+     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) \
+@@ -628,6 +628,7 @@ typedef struct {
+     VkDescriptorPool dpool;
+     u32              dsets;
+     int              busy;        /* submitted, not yet retired */
++    u32              subs;        /* submissions so far (readback_async tickets) */
+     vk_image*    gimg;  u32 gimg_n,  gimg_cap;
+     VkFramebuffer* gfb; u32 gfb_n,   gfb_cap;
+     VkPipeline*  gpipe; u32 gpipe_n, gpipe_cap;
+@@ -816,6 +817,7 @@ static void vk_batch_retire(void)
+ static void vk_batch_advance(void)
+ {
+     s_b.sl[s_b.cur].dsets = s_b.dsets;
++    s_b.sl[s_b.cur].subs++;
+     s_b.sl[s_b.cur].busy = 1;
+     s_b.open = 0;
+     s_b.ops = 0;
+@@ -2944,6 +2946,80 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+     }
+ }
+ 
++/* Readbacks that do not wait (rsx_draw_backend.readback_async): the copy is
++ * recorded like vk_eng_readback's into a buffer of its own and the batch is
++ * submitted with its slot's fence; the ticket names the slot and its
++ * submission count, so readback_result knows the copy has landed when that
++ * fence has signalled or the slot has been retired or reused since.
++ * PS3RECOMP_VK_ASYNC_READBACK=0 refuses (the engine waits as before). */
++#define VK_ARB_N 16u
++static struct { vk_buffer buf; u32 slot, subs; int used; } s_arb[VK_ARB_N];
++
++static u64 vk_eng_readback_async(void* user, u32 target, int depth, u32 x, u32 y, u32 w, u32 h)
++{
++    (void)user;
++    static int off = -1;
++    if (off < 0) { const char* e = getenv("PS3RECOMP_VK_ASYNC_READBACK"); off = e && e[0] == '0'; }
++    if (off || s_b.nslots < 2 || !w || !h) return 0;
++    vk_eng_obj* o = vk_eng_get(target, depth ? VK_ENG_DEPTH : VK_ENG_COLOR);
++    if (!o || x + w > o->w || y + h > o->h) return 0;
++    if (depth && s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&
++        s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) return 0;
++    const VkDeviceSize bytes = (VkDeviceSize)w * h * (depth ? 4u : o->bpp);
++    u32 i = 0;
++    while (i < VK_ARB_N && s_arb[i].used) i++;
++    if (i == VK_ARB_N) return 0;
++    vk_buffer* b = &s_arb[i].buf;
++    if (b->buf && b->size < bytes) { vk_destroy_buffer(b); memset(b, 0, sizeof *b); }
++    if (!b->buf && vk_create_host_buffer(b, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
++        vk_destroy_buffer(b); memset(b, 0, sizeof *b); return 0;
++    }
++    if (vk_begin()) return 0;
++    vk_barrier_image(o->im.img, depth ? s_vk.depth_aspect : VK_IMAGE_ASPECT_COLOR_BIT,
++                     VK_IMAGE_LAYOUT_GENERAL);
++    VkBufferImageCopy region = {
++        .imageSubresource = { depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .imageOffset = { (int32_t)x, (int32_t)y, 0 }, .imageExtent = { w, h, 1 },
++    };
++    pvkCmdCopyImageToBuffer(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, b->buf, 1, &region);
++    VkBufferMemoryBarrier hb = {
++        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .buffer = b->buf, .offset = 0, .size = VK_WHOLE_SIZE,
++    };
++    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
++                          0, 0, NULL, 1, &hb, 0, NULL);
++    const u32 slot = s_b.cur;
++    if (vk_submit_async()) return 0;
++    s_arb[i].used = 1;
++    s_arb[i].slot = slot;
++    s_arb[i].subs = s_b.sl[slot].subs;
++    return (u64)i + 1u;
++}
++
++static const void* vk_eng_readback_result(void* user, u64 ticket, int wait)
++{
++    (void)user;
++    const u32 i = (u32)ticket - 1u;
++    if (i >= VK_ARB_N || !s_arb[i].used) return NULL;
++    vk_slot* S = &s_b.sl[s_arb[i].slot];
++    if (S->busy && S->subs == s_arb[i].subs) {
++        if (pvkGetFenceStatus(s_vk.device, S->fence) == VK_SUCCESS) vk_slot_retire(S);
++        else if (wait) vk_slot_wait(s_arb[i].slot);
++        else return NULL;
++    }
++    vk_invalidate(&s_arb[i].buf);
++    return s_arb[i].buf.ptr;
++}
++
++static void vk_eng_readback_release(void* user, u64 ticket)
++{
++    (void)user;
++    const u32 i = (u32)ticket - 1u;
++    if (i < VK_ARB_N) s_arb[i].used = 0;
++}
++
+ /* ---- E3: textures ---------------------------------------------------------
+  * The engine decodes every level to host rows (rsx_texture_decode) and hands
+  * them over one upload each; the crossbar is a property of the view, so it
+@@ -4285,6 +4361,9 @@ static const rsx_draw_backend s_vk_engine_backend = {
+     .draw                 = vk_eng_draw,
+     .draw_cached          = vk_eng_draw_cached,
+     .readback_ordered     = 1,
++    .readback_async       = vk_eng_readback_async,
++    .readback_result      = vk_eng_readback_result,
++    .readback_release     = vk_eng_readback_release,
+     .clear_color          = vk_eng_clear_color,
+     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
+     .present              = vk_eng_present,

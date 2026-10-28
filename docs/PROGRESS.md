@@ -2091,3 +2091,32 @@ the application menu (`KZ2_ENTRY=play` for the game alone).
 
 `SPURS_PM_SELECT_CURRENT=1` (section 77) measured: 21.31 / 22.04 against
 21.93 / 21.31 -- no change, left off.
+
+## 79. What the frame waits on now: GPU readbacks (work in progress)
+
+Off-CPU samples (a sampler that starts the game itself, so it may read the
+game's stack under Yama scope 1) and `PS3RECOMP_VK_SUBMIT_STATS`: the FIFO
+thread waits for the GPU ~30% of its time, ~4 waits a frame, ~13 ms. Three are
+the main-memory targets stored before a label (0x0169C200 640x360 RGBA8,
+0x01977600 320x180 RGBA8, 0x019E7E00 320x180 R32F; the SPU post-processing
+jobs 226/229/204 and 216/207/227 read them -- the two blur modules read and
+write the 640x360 one even with their kernels skipped), one the soft
+particles' Z16 read through guest memory. Upper bound with none of them
+(`RSX_MAIN_TARGET_WB=0 RSX_Z16_GPU_FEEDBACK=1`, wrong picture): 25.71 against
+21.90 frames/s; either one alone gains little (the remaining wait absorbs the
+whole GPU backlog, 12.9 ms each).
+
+Patch 0054 (opt-in, not yet measured): `RSX_ASYNC_WB=1` queues those copies on
+the GPU (`readback_async`, Vulkan: own buffer, slot fence, no wait) and the
+label behind them, written in order once they land
+(`rsx_draw_engine_label_release`, `rsx_draw_engine_async_poll`; all of it when
+the FIFO stops; guest-memory texture and coherence reads over a queued range
+land it first). The zeta slot a texture reads is now the one written last
+(`RSX_ZSRC_FIRST=1`: the first found). Next: A/B, frames of the soft particles
+with `RSX_Z16_GPU_FEEDBACK=1 RSX_Z16_GUEST_STORE=1` on top (the white blocks of
+section 70 come back without the guest copy and go away with it).
+
+Tried, not kept: the inFAMOUS port's PPU register cache (`ppu_regcache.py`,
+1366/1990 functions of a chunk transformed with this lifter's helpers added):
+20.46 / 20.20 against 22.29 -- slower here (part of it the PGO profile no
+longer matching). `SPURS_PM_SELECT_CURRENT=1`: no change.
