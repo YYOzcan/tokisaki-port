@@ -2002,3 +2002,31 @@ inlined, `spu_pchist_tick` is an inline gate on a global set once from
 `SPU_PCHIST` with the histogram out of line, and `spu_irq_regs_maybe_restore`
 is called only while a register file is saved. No measurable change on its
 own (19.51 / 20.78).
+
+## 76. Reservation holders found by a slot scan, not a list walk; the register cache once more
+
+**Notifying holders** (patch 0052). A PPU store to a marked line takes the
+lock and calls `spu_coh_notify_write`, which walked the list of every
+context that ever reserved a line -- 55 in the level (`SPU_COH_LOG=1`) --
+reading each one's reservation; ~300,000 such stores a second, all under the
+lock the SPU atomics wait for. Now each registered context has a slot in a
+256-entry array holding the line it last reserved (`| 1`), written before
+its reservation becomes valid in both GETLLAR paths; the notifiers scan the
+array (four cache lines for the 55) and look only at the contexts whose slot
+names the line. A stale slot costs a look at a context that no longer holds
+the line; with more than 256 contexts they walk the list as before. Three
+runs each, same commit otherwise: 21.36 / 21.69 / 22.59 against
+20.52 / 18.96 / 20.76.
+
+**The register cache, with a profile of its own** (section 62, 72): the
+regcache sources lifted again, an instrumented SPU build, a profile over
+frames 10000-10700 (`pgo/spu-rc.profdata`), then three runs each against
+the uncached build: 17.69 / 18.79 / 19.07 against 19.85 / 20.04 / 20.08.
+Loading every register a function uses at its entry and spilling around each
+channel access costs more than the loads it saves. Not used.
+
+Where the main thread is now (30 gdb samples, plain build): 6 in
+`sys_timer_usleep(1)` under `func_004D3D00` (the job counter wait), 4 in
+`sys_cond_wait` under `func_00803590`, 1 in the SPU progress spin, 19 in its
+own code -- ~30 ms of PPU work a frame, a ceiling near 32 frames/s until the
+lifted PPU code itself is faster.
