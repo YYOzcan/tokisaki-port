@@ -2479,3 +2479,6 @@ work taken off any of them shows as a fraction of itself.
 The play build against this morning's backup (`stable-2026-10-29a`), three
 alternating rounds: 33.08 / 34.38 / 33.81 against 32.54 / 32.44 / 32.39 --
 +1.3 frames/s.
+- **The SPURS workers at a lower priority** (an experiment, not kept): every
+  worker at nice 3, so the FIFO and main threads would win shared cores:
+  34.65 / 33.31 against 33.92 / 34.46.
