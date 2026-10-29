@@ -2407,3 +2407,12 @@ At ~32.5 frames/s, per frame:
   time, not the delivery.
 - `SPURS_KERNEL_POLL_US=150` shortened thread 15's event waits (366 -> 249 ms
   per 5 s) but cost more than it gave: 31.67 against 33.24.
+- **-0 -> +0 as an add of zero** (`spu__rz_pos0`, `runtime/spu/spu_helpers.h`):
+  every fa/fm/fma result in the SPU float mode had its sign of zero fixed with
+  three integer operations on its data path; `r + 0.0f` does the same in one
+  (only round-toward-negative makes -0 + +0 = -0; r is never a denormal there,
+  FTZ, nor exponent 255). `runtime/spu/tests/test_spu_float_rz.c` (new, x86):
+  8 M random cases, bit-identical to the scalar references with and without
+  `SPU_FP_RZ_ASSUMED`; a pos0 that does nothing fails 1.16 M of them. With
+  the float-mode assumption the skinning loop is 5,637 instructions (11,396
+  before). 33.89 / 32.61 against 33.51 / 32.40.

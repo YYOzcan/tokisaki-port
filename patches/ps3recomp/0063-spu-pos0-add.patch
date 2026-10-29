@@ -1,0 +1,102 @@
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index bce68492..fbcf0999 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -1051,9 +1051,13 @@ SPU__XV_INLINE __m128i spu__rz_bad(__m128i a, __m128i b, __m128i r) {
+     (void)a; (void)b;
+     return _mm_cmpgt_epi32(_mm_and_si128(r, _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(0x7F7FFFFE));
+ }
++/* -0 -> +0, the rest unchanged: r + 0.0f. Only round-toward-negative makes
++ * -0 + +0 = -0, adding zero to anything else is exact, and r is never a
++ * denormal here (FTZ) nor exponent 255 (spu__rz_bad sent those elsewhere):
++ * one instruction where the integer form was three, on the path of every
++ * result (test_spu_float_rz.c). */
+ SPU__XV_INLINE __m128i spu__rz_pos0(__m128i r) {
+-    const __m128i sb = _mm_set1_epi32((int)0x80000000u);
+-    return _mm_andnot_si128(_mm_and_si128(_mm_cmpeq_epi32(r, sb), sb), r);
++    return _mm_castps_si128(_mm_add_ps(_mm_castsi128_ps(r), _mm_setzero_ps()));
+ }
+ 
+ /* The common case first: every operand an ordinary single, a zero or a
+diff --git a/runtime/spu/tests/test_spu_float_rz.c b/runtime/spu/tests/test_spu_float_rz.c
+new file mode 100644
+index 00000000..0a3b663a
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_float_rz.c
+@@ -0,0 +1,76 @@
++/* The x86 fast path of spu_fa/fs/fm/fma/fms/fnms in the SPU float mode
++ * (MXCSR round toward zero, DAZ, FTZ; spu_fp_enter in spu_channels.c) must be
++ * bit-identical to the scalar references (spu_*_ref) for every input: random
++ * words, ordinary floats, the normal/extended-range boundaries, zeros and
++ * denormals, mixed per lane, and operands that cancel. Build on x86-64:
++ *   cc -O2 -mavx2 -mfma -I.. -I../.. -I../../.. test_spu_float_rz.c -o t && ./t
++ * (add -DSPU_FP_RZ_ASSUMED for the lifted images' build of it). */
++#include "../spu_helpers.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static uint64_t s_rng = 0x9E3779B97F4A7C15ull;
++static uint32_t rnd32(void)
++{
++    s_rng ^= s_rng << 13; s_rng ^= s_rng >> 7; s_rng ^= s_rng << 17;
++    return (uint32_t)(s_rng >> 16);
++}
++
++static uint32_t rnd_float(void)
++{
++    uint32_t sign = (rnd32() & 1u) << 31, man = rnd32() & 0x7FFFFFu, e;
++    switch (rnd32() % 10) {
++    case 0: e = 0; break;                              /* zero / denormal */
++    case 1: e = 1 + rnd32() % 4; break;                /* bottom of normal range */
++    case 2: e = 248 + rnd32() % 8; break;              /* top, into extended range */
++    case 3: return rnd32();                            /* anything */
++    case 4: return sign;                               /* +-0 */
++    default: e = 110 + rnd32() % 36; break;            /* ordinary */
++    }
++    return sign | (e << 23) | man;
++}
++
++int main(void)
++{
++#if !(defined(__AVX2__) && defined(__FMA__))
++    puts("test_spu_float_rz: no AVX2/FMA, nothing to compare");
++    return 0;
++#else
++    const unsigned m = _mm_getcsr();                   /* as spu_fp_enter */
++    g_spu_fp_saved = m;
++    _mm_setcsr((m & ~0x6000u) | 0x6000u | 0x0040u | 0x8000u);
++    g_spu_fp_rz = 1;
++    long bad = 0;
++    const long N = 8000000;
++    for (long it = 0; it < N; it++) {
++        u128 a, b, c, got, ref;
++        for (int i = 0; i < 4; i++) { a._u32[i] = rnd_float(); b._u32[i] = rnd_float(); c._u32[i] = rnd_float(); }
++        /* close magnitudes stress cancellation in fa/fs and fma */
++        if (it % 7 == 0) for (int i = 0; i < 4; i++) b._u32[i] = (a._u32[i] ^ 0x80000000u) + (rnd32() & 0xFF);
++        if (it % 11 == 0) for (int i = 0; i < 4; i++) c._u32[i] = (rnd32() & 1u) ? 0x80000000u : 0u;
++        const int op = (int)(it % 6);
++        switch (op) {
++        case 0: got = spu_fa(a, b);      ref = spu_fa_ref(a, b); break;
++        case 1: got = spu_fs(a, b);      ref = spu_fs_ref(a, b); break;
++        case 2: got = spu_fm(a, b);      ref = spu_fm_ref(a, b); break;
++        case 3: got = spu_fma(a, b, c);  ref = spu_fma_ref(a, b, c); break;
++        case 4: got = spu_fms(a, b, c);  ref = spu_fms_ref(a, b, c); break;
++        default: got = spu_fnms(a, b, c); ref = spu_fnms_ref(a, b, c); break;
++        }
++        if (memcmp(&got, &ref, 16)) {
++            if (bad++ < 10)
++                printf("MISMATCH op=%d a=%08X %08X %08X %08X b=%08X %08X %08X %08X c=%08X %08X %08X %08X\n"
++                       "  got=%08X %08X %08X %08X ref=%08X %08X %08X %08X\n", op,
++                       a._u32[0], a._u32[1], a._u32[2], a._u32[3], b._u32[0], b._u32[1], b._u32[2], b._u32[3],
++                       c._u32[0], c._u32[1], c._u32[2], c._u32[3],
++                       got._u32[0], got._u32[1], got._u32[2], got._u32[3],
++                       ref._u32[0], ref._u32[1], ref._u32[2], ref._u32[3]);
++        }
++    }
++    _mm_setcsr(m);
++    if (bad) { printf("test_spu_float_rz: %ld mismatches in %ld cases\n", bad, N); return 1; }
++    printf("test_spu_float_rz: ok (%ld random cases)\n", N);
++    return 0;
++#endif
++}
