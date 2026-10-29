@@ -2359,3 +2359,24 @@ Where the five SPURS lanes go now: job code 61%, DMA and atomics 11.5%
 (`mfc_do_transfer` 4%), dispatch 9.3% (`spu_indirect_branch` 3.7%,
 `spu_drain_call` 2.3%, `spu_lookup` 2.1%), libc 5.8%, the job manager 4.9%,
 channels 3%.
+- **The skinning loop's registers in locals** (an experiment, not kept):
+  `9935c8f700db`'s `spu_func_000054C0` -- 12% of all SPURS lane time, one
+  loop of register and local-store operations -- rewritten alone by
+  `tools/spu_regcache.py`'s transformation. Its context accesses fell from 851
+  to 25 and the per-iteration shuffle-mask tests left the loop (82 -> 11
+  `vpmovmskb`), but its stack spills doubled (2,454 -> 5,022 `%rsp` operands:
+  the loop keeps ~80 SPU registers live). 31.36 / 31.06 against 31.09 / 31.57.
+
+## 88. A fresh profile, and the SPU float mode assumed: ~32.5
+
+Both profiles were a day old and predated the merges, the job-module lifts at
+a second base and everything since. An instrumented build of both the PPU and
+the SPU code (`build-pgo/`, `KZ2_PPU_PGO=gen KZ2_SPU_PGO=gen`, with
+`KZ2_SPU_FP_RZ_ASSUMED=ON`) played Corinth River at ~25 frames/s; one profile
+over frames 16200-17200 (`KZ2_PGO=16200,17200`,
+`LLVM_PROFILE_FILE=pgo/raw-1029/kz2-%p.profraw`, 73 MB) merged into one
+`.profdata` serves both (`pgo/ppu.profdata` and `pgo/spu.profdata` are now
+that file; the previous ones are kept in `pgo/old-1028/`, none of it in git).
+The optimised build with it and with the lifted SPU code assuming its float
+mode: 32.51 / 32.79 against 30.94 / 31.57 frames/s for the build before it,
+no lane stop in four runs -- ~+4.5%.
