@@ -1,0 +1,227 @@
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 7e91c010..472e9d3d 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3383,6 +3383,30 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+                     (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
+                     (unsigned)ctx->lr);
+             fflush(stderr); } }
++        /* PS3_SCTID=<guest thread id>: every 5 s, that thread's syscalls by
++         * number -- calls and time inside them, in microseconds -- to see what a
++         * thread another one waits for is itself waiting on. */
++        { static long s_tid = -2;
++          if (s_tid == -2) { const char* e = getenv("PS3_SCTID"); s_tid = e ? atol(e) : -1; }
++          if (s_tid >= 0 && (long)ctx->thread_id == s_tid) {
++            static uint64_t acc[1024], cnt[1024], win;
++            struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
++            const uint32_t _a3 = (uint32_t)ctx->gpr[3], _a4 = (uint32_t)ctx->gpr[4], _a5 = (uint32_t)ctx->gpr[5];
++            const int ok = lv2_try_syscall(ctx);
++            clock_gettime(CLOCK_MONOTONIC, &b);
++            const uint64_t t1 = (uint64_t)b.tv_sec * 1000000u + (uint64_t)b.tv_nsec / 1000u;
++            const uint64_t t0 = (uint64_t)a.tv_sec * 1000000u + (uint64_t)a.tv_nsec / 1000u;
++            if (num < 1024) { acc[num] += t1 - t0; cnt[num]++; }
++            if (!win) win = t0;
++            if (t1 - win >= 5000000u) {
++                fprintf(stderr, "--- syscalls of guest thread %ld (last 5 s) ---\n", s_tid);
++                for (int n = 0; n < 1024; n++) if (cnt[n])
++                    fprintf(stderr, "  syscall %4d: %7llu calls %7llu us\n", n,
++                            (unsigned long long)cnt[n], (unsigned long long)acc[n]);
++                memset(acc, 0, sizeof acc); memset(cnt, 0, sizeof cnt); win = t1;
++            }
++            if (ok) { sc_trace(num, ctx, _a3, _a4, _a5, 0); return; }
++          } }
+         static int s_sbp = -1; if (s_sbp < 0) s_sbp = getenv("PS3_SCBLOCK_PROF") ? 1 : 0;
+         if (s_sbp) {
+             static ULONGLONG s_acc[1024]={0}; static uint32_t s_cnt[1024]={0}; static ULONGLONG s_win=0;
+diff --git a/runtime/syscalls/sys_cond.c b/runtime/syscalls/sys_cond.c
+index 45235ea6..499584b9 100644
+--- a/runtime/syscalls/sys_cond.c
++++ b/runtime/syscalls/sys_cond.c
+@@ -10,6 +10,7 @@
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdio.h>
++#include <time.h>
+ 
+ struct sys_cond_waiter {
+     struct sys_cond_waiter* next;
+@@ -118,11 +119,52 @@ int64_t sys_cond_destroy(ppu_context* ctx)
+     return result;
+ }
+ 
++/* PS3_COND_WHO=1: every 5 s, the conditions waited on longest -- waits, time
++ * waited, the waiting threads, and which thread (and lr) signalled them -- so
++ * a wait can be traced to the thread that ends it. */
++#define COND_WHO_N 64
++static struct { uint64_t waits, wait_us; uint32_t waiter, sig_tid, sig_lr, sigs; } s_who[COND_WHO_N];
++static int cond_who_on(void)
++{
++    static int on = -1;
++    if (on < 0) on = getenv("PS3_COND_WHO") ? 1 : 0;
++    return on;
++}
++static uint64_t cond_now_us(void)
++{
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
++}
++static void cond_who_report(void)
++{
++    static uint64_t last;
++    const uint64_t now = cond_now_us();
++    if (!last) { last = now; return; }
++    if (now - last < 5000000u) return;
++    last = now;
++    fprintf(stderr, "--- cond waits (last 5 s) ---\n");
++    for (int k = 0; k < 6; k++) {
++        int b = -1;
++        for (int i = 0; i < COND_WHO_N; i++)
++            if (s_who[i].wait_us && (b < 0 || s_who[i].wait_us > s_who[b].wait_us)) b = i;
++        if (b < 0) break;
++        fprintf(stderr, "  cond %2d: %6llu waits %6llu ms (waiter tid %u) signalled %u x, last by tid %u lr=0x%08X\n",
++                b + 1, (unsigned long long)s_who[b].waits, (unsigned long long)(s_who[b].wait_us / 1000),
++                s_who[b].waiter, s_who[b].sigs, s_who[b].sig_tid, s_who[b].sig_lr);
++        s_who[b].wait_us = 0;
++    }
++    memset(s_who, 0, sizeof s_who);
++}
++
+ int64_t sys_cond_wait(ppu_context* ctx)
+ {
+     uint64_t timeout = LV2_ARG_U64(ctx, 1);
++    const int who = cond_who_on();
++    const uint32_t who_id = LV2_ARG_U32(ctx, 0);
++    const uint64_t who_t0 = who ? cond_now_us() : 0;
+     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
+-    const char* peek = getenv("PS3_COND_PEEK");
++    static const char* peek = (const char*)-1;
++    if (peek == (const char*)-1) peek = getenv("PS3_COND_PEEK");
+     if (peek) {
+         uint32_t ea = (uint32_t)strtoul(peek, NULL, 16);
+         if (ea) {
+@@ -198,6 +240,12 @@ int64_t sys_cond_wait(ppu_context* ctx)
+     for (int i = 0; i < depth; ++i) guest_lock(m);
+     m->owner_tid = ctx->thread_id;
+     m->lock_count = depth;
++    if (who && who_id && who_id <= COND_WHO_N) {
++        s_who[who_id - 1].waits++;
++        s_who[who_id - 1].wait_us += cond_now_us() - who_t0;
++        s_who[who_id - 1].waiter = (uint32_t)ctx->thread_id;
++        cond_who_report();
++    }
+     return result;
+ }
+ 
+@@ -219,8 +267,16 @@ static int64_t signal_cond(uint32_t id, int all)
+     return CELL_OK;
+ }
+ 
+-int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
+-int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
++static void cond_who_signal(ppu_context* ctx)
++{
++    const uint32_t id = LV2_ARG_U32(ctx, 0);
++    if (!cond_who_on() || !id || id > COND_WHO_N) return;
++    s_who[id - 1].sigs++;
++    s_who[id - 1].sig_tid = (uint32_t)ctx->thread_id;
++    s_who[id - 1].sig_lr = (uint32_t)ctx->lr;
++}
++int64_t sys_cond_signal(ppu_context* ctx) { cond_who_signal(ctx); return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
++int64_t sys_cond_signal_all(ppu_context* ctx) { cond_who_signal(ctx); return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+ 
+ /* Preserve upstream's current broadcast fallback for signal_to. */
+ int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
+index 4240edf2..267e9973 100644
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -283,14 +283,18 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
+             queue_id);
+ }
+ 
+-/* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
+-static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
+-
++/* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
++static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
++
+ int64_t sys_event_queue_receive(ppu_context* ctx)
+ {
+     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
+     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
+     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
++    static long _recv_tid = -2;     /* PS3_EVT_RECV_TID, below */
++    if (_recv_tid == -2) { const char* e = getenv("PS3_EVT_RECV_TID"); _recv_tid = e ? atol(e) : -1; }
++    struct timespec _recv_t0 = {0, 0};
++    if (_recv_tid >= 0 && (long)ctx->thread_id == _recv_tid) clock_gettime(CLOCK_MONOTONIC, &_recv_t0);
+     /* PPU_THREADGATE: the creating thread is now blocking -> workers may run
+      * (PS3 priority semantics). Their job objects are fully initialized by now. */
+     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
+@@ -301,7 +305,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+ 
+     /* PS3_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
+      * exact game function the main thread is stuck polling in the flip loop. */
+-    if ((s_ps3_waitbt < 0 ? (s_ps3_waitbt = getenv("PS3_WAITBT") ? 1 : 0) : s_ps3_waitbt)) {
++    if ((s_ps3_waitbt < 0 ? (s_ps3_waitbt = getenv("PS3_WAITBT") ? 1 : 0) : s_ps3_waitbt)) {
+         static unsigned char seen[8][8] = {{0}};
+         unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
+         if (!seen[t][qk]) {
+@@ -365,7 +369,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+      * 0x004F5F80) against the recorded SPURS context. It claims the ready task
+      * from libsre's taskset and runs the task body -- real recompiled SPU code,
+      * not a synthesized completion. Gated by YDKJ_SPUTASK; fire once. */
+-    if ((s_ydkj_sputask < 0 ? (s_ydkj_sputask = getenv("YDKJ_SPUTASK") ? 1 : 0) : s_ydkj_sputask) && timeout_us == 0 && g_ydkj_spurs_ctx_ea) {
++    if ((s_ydkj_sputask < 0 ? (s_ydkj_sputask = getenv("YDKJ_SPUTASK") ? 1 : 0) : s_ydkj_sputask) && timeout_us == 0 && g_ydkj_spurs_ctx_ea) {
+         static int s_fired = 0;
+         if (!s_fired) {
+             s_fired = 1;
+@@ -386,7 +390,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+      * returns. Synthesize a ready event so init returns -> see whether the PPU
+      * then reaches CreateTaskset and the running policy dispatches the cri task.
+      * Returns a zero-ish SPU-thread-group event; refine the format if init rejects it. */
+-    if ((s_ydkj_spurs_ready < 0 ? (s_ydkj_spurs_ready = getenv("YDKJ_SPURS_READY") ? 1 : 0) : s_ydkj_spurs_ready) && (queue_id == 1 || queue_id == 4)
++    if ((s_ydkj_spurs_ready < 0 ? (s_ydkj_spurs_ready = getenv("YDKJ_SPURS_READY") ? 1 : 0) : s_ydkj_spurs_ready) && (queue_id == 1 || queue_id == 4)
+             && timeout_us == 0 && q->count == 0) {
+         static int s_fire[8] = {0};
+         if (s_fire[queue_id] < 64) {
+@@ -412,7 +416,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+      * main thread times out after 30s and the title tears down. Synthesize a
+      * completion so the wait returns -> see whether the game then advances to
+      * asset load + menu draw (content). Returns immediately with a zero event. */
+-    if ((s_ydkj_fakecomplete < 0 ? (s_ydkj_fakecomplete = getenv("YDKJ_FAKECOMPLETE") ? 1 : 0) : s_ydkj_fakecomplete) && (queue_id == 2 || queue_id == 3) && q->count == 0) {
++    if ((s_ydkj_fakecomplete < 0 ? (s_ydkj_fakecomplete = getenv("YDKJ_FAKECOMPLETE") ? 1 : 0) : s_ydkj_fakecomplete) && (queue_id == 2 || queue_id == 3) && q->count == 0) {
+         if (event_addr != 0) {
+             uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+             out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+@@ -422,7 +426,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+     /* YDKJ_HLE_DRAW (diagnostic): also unblock the AsyncLoad q=1 wait (timeout=0,
+      * blocks forever) so the loader thread proceeds. Tests whether the game's
+      * render/draw code is reachable once the completion waits are satisfied. */
+-    if ((s_ydkj_hle_draw < 0 ? (s_ydkj_hle_draw = getenv("YDKJ_HLE_DRAW") ? 1 : 0) : s_ydkj_hle_draw) && queue_id == 1 && timeout_us == 0 && q->count == 0) {
++    if ((s_ydkj_hle_draw < 0 ? (s_ydkj_hle_draw = getenv("YDKJ_HLE_DRAW") ? 1 : 0) : s_ydkj_hle_draw) && queue_id == 1 && timeout_us == 0 && q->count == 0) {
+         static int s_n1 = 0;
+         if (s_n1 < 256) { s_n1++;
+             if (event_addr != 0) {
+@@ -569,7 +573,21 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+     ctx->gpr[5] = evt.data1;
+     ctx->gpr[6] = evt.data2;
+     ctx->gpr[7] = evt.data3;
+-    { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && _r++<60) fprintf(stderr,
++    /* PS3_EVT_RECV_TID=<guest tid>: that thread's receives 3000..3200, with
++     * the time it waited for each -- what a waiting thread is waiting for. */
++    { if (_recv_tid >= 0 && (long)ctx->thread_id == _recv_tid) {
++          static unsigned long _n; _n++;
++          struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
++          if (_n >= 3000 && _n < 3200)
++              fprintf(stderr, "[recv-tid] t=%lld.%06ld waited %lld us q=%u source=0x%llX data1=0x%llX data2=0x%llX data3=0x%llX lr=0x%08X\n",
++                      (long long)_ts.tv_sec, _ts.tv_nsec / 1000,
++                      (long long)((_ts.tv_sec - _recv_t0.tv_sec) * 1000000LL + (_ts.tv_nsec - _recv_t0.tv_nsec) / 1000),
++                      queue_id,
++                      (unsigned long long)evt.source, (unsigned long long)evt.data1,
++                      (unsigned long long)evt.data2, (unsigned long long)evt.data3, (uint32_t)ctx->lr);
++      } }
++    { static int _r=0; static int _rt = -1; if (_rt < 0) _rt = getenv("PS3_EVT_RECV_TRACE") ? 1 : 0;
++      if (_rt && _r++<60) fprintf(stderr,
+         "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
+         (unsigned long long)evt.source, (unsigned long long)evt.data1,
+         (unsigned long long)evt.data2); }

@@ -2380,3 +2380,30 @@ that file; the previous ones are kept in `pgo/old-1028/`, none of it in git).
 The optimised build with it and with the lifted SPU code assuming its float
 mode: 32.51 / 32.79 against 30.94 / 31.57 frames/s for the build before it,
 no lane stop in four runs -- ~+4.5%.
+- **The main and FIFO threads on cores of their own** (an experiment, not
+  kept): pinned to CPUs 0 and 1 with every other thread kept off them and
+  their SMT siblings, 26.35 frames/s -- four cores are too few for the rest;
+  with the siblings left to the rest, 32.48 against 32.51.
+
+## 89. What the main thread waits for, by name
+
+Three opt-in reports (default off) to follow a wait to the thread that ends it:
+`PS3_COND_WHO=1` (every 5 s, the conditions waited on longest, by whom, and
+who signalled them, `runtime/syscalls/sys_cond.c`), `PS3_SCTID=<guest tid>`
+(that thread's syscalls by number, calls and microseconds,
+`runtime/ppu/ppu_loader.cpp`) and `PS3_EVT_RECV_TID=<guest tid>` (its event
+receives 3000..3200 with how long each waited, `sys_event.c`).
+
+At ~32.5 frames/s, per frame:
+- The main thread (guest tid 1) hands work to guest thread 15 once a frame
+  (condition 8, from `lr 0x004EEFE4`) and waits ~3 ms for it to answer
+  (condition 3, signalled from `0x004EC12C`): ~10% of the main thread.
+- Thread 15 spends ~1.2 ms of CPU (its own guest code and SPURS task
+  dispatch -- the dispatch's whole-image FNV, 37% of this thread before
+  section 87's fingerprint memo, is gone from its profile) and waits ~1.3 ms
+  on SPU thread events from the tasks it starts (queues 5, 6, 9, 11, source
+  `0xFFFFFFFF53505501`; the longest, queue 11, 450-790 us). The events arrive
+  tens of microseconds after one another: the wait is the tasks' own run
+  time, not the delivery.
+- `SPURS_KERNEL_POLL_US=150` shortened thread 15's event waits (366 -> 249 ms
+  per 5 s) but cost more than it gave: 31.67 against 33.24.
