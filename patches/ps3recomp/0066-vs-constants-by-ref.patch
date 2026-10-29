@@ -1,0 +1,114 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index ef39a31d..afdbb2ee 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -3841,7 +3841,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     const u32 cn = s_cn;
+     const int vp_same = s_vp_gen == g.rsx.const_gen && !memcmp(s_vp_xf, xf, sizeof xf) &&
+                         s_vp_gen != ~0u && s_vp_cn >= cn;
+-    if (!vp_same) {
++    /* By reference (bind_vs_constants_ref): the backend reads the register
++     * file itself -- it holds still until const_gen moves, and a moved
++     * const_gen is a bind before the next draw. RSX_VP_CONST_REF=0: copied. */
++    static int vp_ref = -1;
++    if (vp_ref < 0) { const char* e = getenv("RSX_VP_CONST_REF"); vp_ref = !(e && e[0] == '0'); }
++    const int by_ref = vp_ref && g.be->bind_vs_constants_ref != NULL;
++    if (!vp_same && !by_ref) {
+         memcpy(g.vp_cb, g.rsx.constants, cn * 16u);
+         memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+     }
+@@ -3898,9 +3904,14 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
+     g.be->bind_pipeline(g.be->user, pipeline);
+     if (!vp_same) {                 /* recorded only once the backend has them */
++        if (by_ref)
++            g.be->bind_vs_constants_ref(g.be->user, g.rsx.constants, cn * 16u,
++                                        xf, (u32)sizeof xf, ENG_VP_CB_BYTES);
++        else {
+         g_rsx_eng_vs_prefix = cn * 16u;
+         g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+         g_rsx_eng_vs_prefix = 0;
++        }
+         s_vp_gen = g.rsx.const_gen;
+         s_vp_cn = cn;
+         memcpy(s_vp_xf, xf, sizeof xf);
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index c78969a3..2529c9ef 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -262,6 +262,16 @@ typedef struct rsx_draw_backend {
+     u64 (*readback_async)(void* user, u32 target, int depth, u32 x, u32 y, u32 w, u32 h);
+     const void* (*readback_result)(void* user, u64 ticket, int wait);
+     void (*readback_release)(void* user, u64 ticket);
++    /* Optional, in place of bind_vs_constants: the constant block by
++     * reference. The first `prefix_bytes` of `consts` are the constants the
++     * program reads and stay valid and unchanged until the next bind (the
++     * engine passes its register file and binds again whenever a constant
++     * changes); the `tail_bytes` at `tail` (the viewport transform) are copied
++     * now and go at the end of a `total_bytes` block. The backend copies
++     * straight into what the shader reads -- the block was copied three times
++     * a draw on its way there. */
++    void (*bind_vs_constants_ref)(void* user, const void* consts, u32 prefix_bytes,
++                                  const void* tail, u32 tail_bytes, u32 total_bytes);
+ } rsx_draw_backend;
+ 
+ #define RSX_BE_XFORM_DEPTH24_ARGB8  1u   /* D24S8 depth as A8R8G8B8       */
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 2dd5862f..9c0473ec 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3735,6 +3735,8 @@ static struct {
+     u32          pipeline;
+     u32          vs_bytes, ps_bytes;
+     u32          vs_pre;      /* leading bytes of vs_data that are current (+ the 32-byte tail) */
++    const u8*    vs_ref;      /* bind_vs_constants_ref: the prefix is read from here instead */
++    u8           vs_tail[32];
+     u32          tex[RSX_BE_MAX_TEXTURES];
+     rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES];
+     u32          tex_mask;
+@@ -4137,6 +4139,21 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
+     memcpy(s_e2.vs_data + bytes - tail, d + bytes - tail, tail);
+     s_e2.vs_bytes = bytes;
+     s_e2.vs_pre = pre;
++    s_e2.vs_ref = NULL;
++    s_e2.vs_gen = 0;
++}
++static void vk_eng_bind_vs_constants_ref(void* user, const void* consts, u32 prefix_bytes,
++                                         const void* tail, u32 tail_bytes, u32 total_bytes)
++{
++    (void)user;
++    if (!s_g.on || !consts || tail_bytes != 32u || total_bytes > (u32)sizeof s_e2.vs_data ||
++        prefix_bytes + tail_bytes > total_bytes) {
++        s_e2.vs_bytes = 0; s_e2.vs_ref = NULL; return;
++    }
++    s_e2.vs_ref = (const u8*)consts;
++    memcpy(s_e2.vs_tail, tail, 32);
++    s_e2.vs_bytes = total_bytes;
++    s_e2.vs_pre = prefix_bytes;
+     s_e2.vs_gen = 0;
+ }
+ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
+@@ -4512,8 +4529,13 @@ static void vk_eng_draw_k(rsx_topology topology, u64 vkey, const void* vertices,
+         /* the slot is the full block; only its live parts are written */
+         const u32 tail = (s_e2.vs_bytes >= 32u && s_e2.vs_pre && s_e2.vs_pre + 32u <= vsb) ? 32u : 0u;
+         const u32 pre = tail ? s_e2.vs_pre : vsb;
+-        memcpy((u8*)s_b.ring.ptr + s_e2.vs_off, s_e2.vs_data, pre);
+-        if (tail) memcpy((u8*)s_b.ring.ptr + s_e2.vs_off + vsb - tail, s_e2.vs_data + vsb - tail, tail);
++        if (s_e2.vs_ref) {          /* bind_vs_constants_ref: from the engine's own copy */
++            memcpy((u8*)s_b.ring.ptr + s_e2.vs_off, s_e2.vs_ref, s_e2.vs_pre);
++            memcpy((u8*)s_b.ring.ptr + s_e2.vs_off + vsb - 32u, s_e2.vs_tail, 32u);
++        } else {
++            memcpy((u8*)s_b.ring.ptr + s_e2.vs_off, s_e2.vs_data, pre);
++            if (tail) memcpy((u8*)s_b.ring.ptr + s_e2.vs_off + vsb - tail, s_e2.vs_data + vsb - tail, tail);
++        }
+         s_e2.vs_gen = s_b.gen + 1u;
+         s_ring_vsc += pre + tail;
+     }
+@@ -4623,6 +4645,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
+     .bind_targets         = vk_eng_bind_targets,
+     .bind_pipeline        = vk_eng_bind_pipeline,
+     .bind_vs_constants    = vk_eng_bind_vs_constants,
++    .bind_vs_constants_ref = vk_eng_bind_vs_constants_ref,
+     .bind_ps_constants    = vk_eng_bind_ps_constants,
+     .bind_textures        = vk_eng_bind_textures,
+     .bind_vertex_textures = vk_eng_bind_vertex_textures,

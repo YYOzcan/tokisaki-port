@@ -2466,3 +2466,16 @@ Where the frame is now (~33.5 frames/s): the GPU is 35-43% busy
 each SPURS lane ~70%; with the NVIDIA driver's threads and the task pool
 that is ~6 busy threads on 6 cores with SMT. No one of them is the frame:
 work taken off any of them shows as a fraction of itself.
+- **Vertex constants by reference** (`bind_vs_constants_ref`, an optional
+  backend entry; `RSX_VP_CONST_REF=0` = before): the constant block was
+  copied three times a draw on its way to the shader (register file -> the
+  engine's block -> the backend's staging -> the batch ring; ~14 MB a frame
+  between them, `memcpy` by caller). The backend now reads the register file
+  itself when it fills the ring: it holds still until `const_gen` moves, and
+  a moved `const_gen` is a bind before the next draw. Frame dumps
+  (`PS3RECOMP_VK_DUMP`) of both builds look alike. FIFO thread 22.0 -> 21.8 ms
+  a frame.
+
+The play build against this morning's backup (`stable-2026-10-29a`), three
+alternating rounds: 33.08 / 34.38 / 33.81 against 32.54 / 32.44 / 32.39 --
++1.3 frames/s.
