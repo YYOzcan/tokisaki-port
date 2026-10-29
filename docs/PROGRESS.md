@@ -2517,3 +2517,13 @@ SPU job counters) and the SPURS lanes are.
   copies (waits 660 -> 167 per 5 s, the depth readback of the Z16 targets
   remains, ~2.4 ms each): 34.51 / 34.09 against 33.79 / 34.16 -- kept opt-in,
   since a picture one frame late does not show in still frames.
+- **Shared counters that wrote on every call** (found by looking for writes
+  to globals next to hot samples, `scratchpad` script over the profile):
+  `mfc_submit`'s policy-mode trace counter (`_pn`, incremented on every DMA of
+  every lane after its 96-line cap -- 14% of `mfc_channel_write`), the DSP
+  descriptor address `mfc_do_transfer` recorded on every 368-byte GET, and
+  `mfc_list_stall_ack`'s two log counters (one a locked compare-exchange on
+  every resume). Each now writes only while it is still counting; the same
+  one-line `static int n = 0; if (n++ < N)` log caps (52 of them in the SPU,
+  SPURS, GCM and event code) stop at their cap. `mfc_channel_write`
+  2.6 -> 2.2% of all samples.

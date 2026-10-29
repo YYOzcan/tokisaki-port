@@ -1,0 +1,540 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index cc088a0a..6d52181a 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1282,7 +1282,7 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
+      * (a no-context task may not block -- SPU task-lib waits then fail with
+      * ERROR_STAT). Learn the real field offsets from the bytes. */
+     { uint32_t aea = (uint32_t)(uintptr_t)attr;
+-      static int _n = 0; if (_n++ < 6) {
++      static int _n = 0; if (_n < 6 && ++_n) {
+         fprintf(stderr, "[cellSpurs] CreateTaskWithAttr attr=0x%08X raw:", aea);
+         for (int o = 0; o < 0x40; o += 4) fprintf(stderr, " %08X", vm_read32(aea + o));
+         fprintf(stderr, "\n"); } }
+@@ -2258,7 +2258,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
+     vm_write16(bits_ea, current);
+     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
+                                                        : (u16)(current & pattern);
+-    { static int _n = 0; if (_n++ < 40)
++    { static int _n = 0; if (_n < 40 && ++_n)
+         fprintf(stderr, "[cellSpurs] EventFlagWait WAKE tid=%lu flagEA=0x%08X "
+                 "pattern=0x%04X got=0x%04X (waits=%u)\n",
+                 (unsigned long)GetCurrentThreadId(), ea, pattern, current, waits); }
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 9b8cfccb..0e240289 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -220,7 +220,7 @@ static void ydkj_restore_handler_opd(u32 opd, u32 code) {
+     extern u8* vm_base; if (!vm_base) return;
+     if (vm_read32(opd) == 0) {
+         u8* p = vm_base + opd; p[0]=(u8)(code>>24); p[1]=(u8)(code>>16); p[2]=(u8)(code>>8); p[3]=(u8)code;
+-        static int _n=0; if(_n++<6) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
++        static int _n=0; if(_n < 6 && ++_n) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
+     }
+ }
+ static void gcm_update_handler_mask(void)
+@@ -1157,7 +1157,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+          * NV308A, so seeing it identifies the object bound here. */
+         if (method == 0x0300) { s_nv309e.fmt = data; s_nv309e.active = 1;
+                                 s_nv309e.subch = (int)subch;
+-            { static int _n = 0; if (_n++ < 4)
++            { static int _n = 0; if (_n < 4 && ++_n)
+                 printf("[NV309E] format=0x%08X (log2 %ux%u fmt=0x%X)%c", data,
+                        1u << ((data >> 16) & 0xFF), 1u << ((data >> 24) & 0xFF),
+                        data & 0xFFFF, 10); }
+@@ -1491,7 +1491,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
+      * by the backend as prim=0. */
+     u32 land = gcm_spu_block_for_put(put);
+     if (land == 0xFFFFFFFFu) land = put;
+-    else { static int b = 0; if (b++ < 8)
++    else { static int b = 0; if (b < 8 && ++b)
+         fprintf(stderr, "[cellGcmSys] resync landing on SPU pushbuffer "
+                 "0x%08X (put 0x%08X) instead of skipping to put\n", land, put); }
+ 
+@@ -1509,7 +1509,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
+             gcm_ref_push_at(vm_read32(dea), io);
+             rescued++;
+         }
+-        if (rescued) { static int m = 0; if (m++ < 8)
++        if (rescued) { static int m = 0; if (m < 8 && ++m)
+             fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
+                     " 0x%08X..0x%08X\n", rescued, from, land); }
+     }
+@@ -2185,7 +2185,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                         const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+                         const u64 ts = gcm_report_timestamp();
+                         const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
+-                        { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
++                        { static int rn = 0; if (rn < 6 && ++rn) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+                         if (main_mem) {
+                             /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
+                             const u32 rea = gcm_io2ea(off);
+@@ -2194,7 +2194,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                                 vm_write32(rea + 4u, (u32)ts);
+                                 vm_write32(rea + 8u, val);
+                                 vm_write32(rea + 12u, 0u);
+-                            } else { static int un = 0; if (un++ < 4) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
++                            } else { static int un = 0; if (un < 4 && ++un) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
+                         } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+                             s_report_data[idx].timestamp = ts;
+                             s_report_data[idx].value = val;
+@@ -2896,7 +2896,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
+     printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
+     vm_write32(off_ea, 0);
+     { static int _d = -1; if (_d < 0) _d = getenv("A2O_FAILDBG") ? 1 : 0;
+-      if (_d) { static int _n = 0; if (_n++ < 12)
++      if (_d) { static int _n = 0; if (_n < 12 && ++_n)
+           fprintf(stderr, "[A2O] FAILED ea=0x%08X (not in local or IO space)%c",
+                   address, 10); } }
+     return CELL_GCM_ERROR_FAILURE;
+@@ -3328,7 +3328,7 @@ u32 cellGcmGetTiledPitchSize(u32 size)
+             if (s_valid_pitches[i] >= size) { r = s_valid_pitches[i]; break; }
+         }
+     }
+-    { static int _n=0; if (_n++<4) fprintf(stderr, "[cellGcmSys] GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
++    { static int _n=0; if (_n < 4 && ++_n) fprintf(stderr, "[cellGcmSys] GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
+     return r;
+ }
+ 
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index d39b525b..dce87b2e 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -395,7 +395,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+      * the first real draw -- exactly the ones worth seeing -- were never traced. */
+     { static int _rt=-1; if(_rt<0){ const char* e=getenv("RSX_TRACE");
+         _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
+-      if(_rt){ static int _m=0; if(_m++<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
++      if(_rt){ static int _m=0; if(_m < _rt && ++_m) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
+      * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
+      * buffering). Real hardware DOES this; without it the game's frame-fence
+@@ -439,7 +439,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+       if (method == 0x1D74) {
+         extern void rsx_draw_engine_label_release(u32 ea, u32 val);
+         rsx_draw_engine_label_release(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
+-        { static int _l=0; if(_l++<4) fprintf(stderr,"[RSX] texture-read label write @0x%08X = 0x%08X\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), data); }
++        { static int _l=0; if(_l < 4 && ++_l) fprintf(stderr,"[RSX] texture-read label write @0x%08X = 0x%08X\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), data); }
+         return 0;
+       }
+       if (method == 0x1D74) {
+@@ -536,7 +536,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+         return 0;
+     }
+     if (method == NV4097_CLEAR_SURFACE) {
+-        { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
++        { static int _c=0; if (_c < 12 && ++_c) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
+         if (s_backend && s_backend->clear) {
+             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
+             u8 stencil = state->zstencil_clear_value & 0xFF;
+@@ -786,7 +786,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+     if (method == NV4097_DRAW_ARRAYS) {
+         u32 first = data & 0xFFFFFF;
+         u32 count = ((data >> 24) & 0xFF) + 1;
+-        { static int _d=0; if (_d++ < 32) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
++        { static int _d=0; if (_d < 32 && ++_d) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
+         { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && _sq++ < 500)
+             fprintf(stderr, "[SEQ] DRAW surf0=0x%X c256.x=%.4f c257.y=%.4f\n",
+                     state->surface_color_offset[0], state->vertex_constants[256][0],
+@@ -831,7 +831,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+         /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
+         u32 first = data & 0xFFFFFF;
+         u32 count = ((data >> 24) & 0xFF) + 1;
+-        { static int _d=0; if (_d++ < 8) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
++        { static int _d=0; if (_d < 8 && ++_d) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
+         ps3_ms("rsx:draw_indexed");
+         if (s_backend && s_backend->draw_indexed)
+             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index cc956170..839020cc 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -564,13 +564,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+     { static int s_at = -1;
+       if (s_at < 0) { const char* e = getenv("SPU_ATOMTRACE");
+                       int v = e ? atoi(e) : 0; s_at = e ? (v > 1 ? v : 40) : 0; }
+-      if (s_at) { static int _a=0; if (_a++ < s_at)
++      if (s_at) { static int _a=0; if (_a < s_at && ++_a)
+         fprintf(stderr, "[atom] cmd=0x%02X ea=0x%08X (img=%d)\n", cmd, ea, ctx->image_id); } }
+     /* cri task (img22) atomic on the taskset: dump the loaded bitset line so we can
+      * see if the task reads MY taskset (0x4005E000) with my READY bit, or elsewhere. */
+     { static int s_ct=-1; if(s_ct<0) s_ct=getenv("SPU_ATOMTRACE")?1:0;
+       if(s_ct && ctx->image_id==22 && cmd==0xD0 && mfc_ea_range_committed(ea,16)) {
+-        static int _c=0; if(_c++<24){
++        static int _c=0; if(_c < 24 && ++_c){
+           uint8_t* m=vm_base+ea;
+           #define BW(o) (((uint32_t)m[o]<<24)|((uint32_t)m[o+1]<<16)|((uint32_t)m[o+2]<<8)|m[o+3])
+           fprintf(stderr,"[cri-atom] GETLLAR ea=0x%08X line[0..0x30]: %08X %08X %08X %08X | %08X %08X %08X %08X | %08X %08X %08X %08X\n",
+@@ -2016,7 +2016,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+         if (img > 0 && img < SPU_OVL_SIG_IMAGES && s_ovl_sig_of[img]) {
+             if (lsa < base + 16u && lsa + size > base) {
+                 ctx->resident_code[slot].image_id = 0;
+-                static int _c = 0; if (_c++ < 8)
++                static int _c = 0; if (_c < 8 && ++_c)
+                     fprintf(stderr, "[spu-ovl] code span image %d at LS 0x%05X gone: GET 0x%05X+%u from 0x%08X\n",
+                             img, base, lsa, size, ea);
+             }
+@@ -2062,7 +2062,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+                     ctx->resident_code[slot].size = o->span;
+                     ctx->resident_code[slot].source_ea = ea;
+                     ctx->resident_code[slot].image_id = o->image_id;
+-                    { static int _s = 0; if (_s++ < 8)
++                    { static int _s = 0; if (_s < 8 && ++_s)
+                         fprintf(stderr, "[spu-ovl] img=%d code span image %d at LS 0x%05X size 0x%X (slot %u, GET %u bytes)\n",
+                                 ctx->image_id, o->image_id, lsa, o->span, slot, size); }
+                     return;
+@@ -2073,7 +2073,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+             if (o->has_sig && !o->span) spu_ovl_base_note(ctx, lsa);
+             if (ctx->resident_ovl != o->image_id) {
+                 ctx->resident_ovl = o->image_id;
+-                { static int _n = 0; if (_n++ < 32)
++                { static int _n = 0; if (_n < 32 && ++_n)
+                     fprintf(stderr, "[spu-ovl] img=%d streamed overlay src=0x%08X "
+                             "-> LS 0x%05X size=%u -> resident ovl image %d%s\n",
+                             ctx->image_id, ea, (uint32_t)(ls - ctx->ls), size,
+@@ -2132,7 +2132,7 @@ static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
+         m[0x30 + 2*s]     = (uint8_t)(bits >> 8);
+         m[0x30 + 2*s + 1] = (uint8_t)bits;
+     }
+-    { static int _n = 0; if (_n++ < 8)
++    { static int _n = 0; if (_n < 8 && ++_n)
+         fprintf(stderr, "[spu] delivered owed bits=0x%04X to object 0x%08X \n",
+                 (unsigned)bits, wobj); }
+ }
+@@ -2154,7 +2154,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+      * (see func_00026DE0 / func_000272AC in image 22). Logging r4 shows caller
+      * leftovers and hides what the task actually asked for. */
+     { static int s_sa = -1; if (s_sa < 0) s_sa = getenv("YDKJ_SYSCALL_ARG") ? 1 : 0;
+-      if (s_sa) { static int _n = 0; if (_n++ < 40) {
++      if (s_sa) { static int _n = 0; if (_n < 40 && ++_n) {
+         const uint8_t* a = &ctx->ls[0x2FD0];
+         fprintf(stderr, "[spu] syscall num=%u LS[0x2FD0]=%02X%02X%02X%02X %02X%02X%02X%02X"
+                         " %02X%02X%02X%02X %02X%02X%02X%02X img=%d\n",
+@@ -2178,7 +2178,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+     static _Thread_local int s_exit_seen = 0;
+     if (num == 0 && ctx->image_id == 22 && !getenv("YDKJ_CRI_EXIT_HALT")) {
+         if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
+-        { static int _n = 0; if (_n++ < 8)
++        { static int _n = 0; if (_n < 8 && ++_n)
+             fprintf(stderr, "[spu] cri task EXIT #%d -- halting (was spinning)\n",
+                     s_exit_seen); }
+         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+@@ -2481,7 +2481,7 @@ static int spu_smc_microstep(spu_context* ctx)
+         }
+         return result ? 1 : 0;
+     }
+-    { static int _n = 0; if (_n++ < 4)
++    { static int _n = 0; if (_n < 4 && ++_n)
+         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
+                 ctx->image_id, ctx->pc & SPU_LS_MASK); }
+     return 0;
+@@ -2626,7 +2626,7 @@ void spu_indirect_branch(spu_context* ctx)
+             uint32_t ts = g_ydkj_real_taskset_ea ? g_ydkj_real_taskset_ea : 0x0F000000u;
+             ctx->ls[0x27B8]=0x00; ctx->ls[0x27B9]=0x00; ctx->ls[0x27BA]=0x00; ctx->ls[0x27BB]=0x00;
+             ctx->ls[0x27BC]=(uint8_t)(ts>>24); ctx->ls[0x27BD]=(uint8_t)(ts>>16); ctx->ls[0x27BE]=(uint8_t)(ts>>8); ctx->ls[0x27BF]=(uint8_t)ts;
+-            if (ctx->pc == 0xA00u) { static int _n=0; if (_n++ < 4)
++            if (ctx->pc == 0xA00u) { static int _n=0; if (_n < 4 && ++_n)
+                 fprintf(stderr, "[cri-r4] policy entry pc=0xA00: forced ctxt->taskset LS[0x27B8]=0x0F000000\n"); }
+         }
+     }
+@@ -2659,7 +2659,7 @@ void spu_indirect_branch(spu_context* ctx)
+      * wrong branch is taken. Env YDKJ_POLTRACE. */
+     if (ctx->pc == 0xA00u) {
+         static int64_t pt=-2; if (pt==-2){ const char* e=getenv("YDKJ_POLTRACE"); pt=e?1:0; }
+-        if (pt) { static int _p=0; if (_p++ < 8) {
++        if (pt) { static int _p=0; if (_p < 8 && ++_p) {
+             /* re-lifted policy entry uses r80 (kernel-set context base): r44=LS[r80+0xC0] */
+             uint32_t r80=ctx->gpr[80]._u32[0] & SPU_LS_MASK;
+             const uint8_t* q = ctx->ls + ((r80+0xC0)&SPU_LS_MASK);
+@@ -2872,7 +2872,7 @@ void spu_indirect_branch(spu_context* ctx)
+             if (img) {
+                 if (ctx->resident_ovl != img) {
+                     ctx->resident_ovl = img;
+-                    static int _n = 0; if (_n++ < 32)
++                    static int _n = 0; if (_n < 32 && ++_n)
+                         fprintf(stderr, "[spu-ovl] WWS job module resident: codeBase=0x%05X "
+                                 "pc=0x%05X -> overlay image %d\n", codeBase, ctx->pc & SPU_LS_MASK, img);
+                 }
+@@ -3014,7 +3014,7 @@ void spu_indirect_branch(spu_context* ctx)
+     if (fn && ctx->pc >= 0x4000 && ctx->resident_ovl >= 200) {
+         static int s_je = -1;
+         if (s_je < 0) { const char* e = getenv("SPU_JOBEXEC"); s_je = e ? 1 : 0; }
+-        if (s_je) { static int _n = 0; if (_n++ < 24)
++        if (s_je) { static int _n = 0; if (_n < 24 && ++_n)
+             fprintf(stderr, "[jobexec] DISPATCH job code pc=0x%05X overlay=%d "
+                     "runJobNum=0x%02X%02X%02X%02X\n",
+                     ctx->pc & SPU_LS_MASK, ctx->resident_ovl,
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 85ea6652..a844e307 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -518,7 +518,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+         uint32_t e32 = (uint32_t)ea;
+         if ((e32 & 0xFF000000u) == 0xD0000000u ||   /* DMA targeting the PPU stack */
+             (e32 & 0xFFFF0000u) == 0x470A0000u) {   /* ...or the completion-word POOL */
+-            static int _n = 0; if (_n++ < 60) {
++            static int _n = 0; if (_n < 60 && ++_n) {
+                 uint32_t v0 = mfc_is_put(cmd) && size>=4 ?
+                     ((ls_ptr[0]<<24)|(ls_ptr[1]<<16)|(ls_ptr[2]<<8)|ls_ptr[3]) : 0;
+                 fprintf(stderr, "[stackea] %s ea=0x%08X lsa=0x%05X size=%u img=%d pc=0x%05X"
+@@ -545,7 +545,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                 fprintf(stderr, "[dmatrace] %s lsa=0x%05X ea=0x%08X size=%u img=%d pc=0x%05X\n",
+                         mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size, spu->image_id,
+                         (uint32_t)spu->pc);
+-        } else { static int _n = 0; if (_n++ < 300)
++        } else { static int _n = 0; if (_n < 300 && ++_n)
+             fprintf(stderr, "[dmatrace] %s lsa=0x%05X ea=0x%08X size=%u img=%d pc=0x%05X\n",
+                     mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size, spu->image_id,
+                     (uint32_t)spu->pc); }
+@@ -597,11 +597,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+     /* The DSP descriptor arrives as a 368-byte GET shortly before the section
+      * load; remember where it came from so the substitution below can name it.
+      * That guest address is what a write-watch needs to find its producer. */
++    static int s_di = -1;
++    if (__builtin_expect(s_di < 0, 0)) s_di = getenv("SPU_DSP_IMAGE_EA") ? 1 : 0;
++    /* (recorded only when the substitution is on: every lane's 368-byte GETs
++     * wrote this one word, moving its line from core to core) */
+     static uint32_t s_desc_ea = 0;
+-    if (mfc_is_get(cmd) && size == 368) s_desc_ea = (uint32_t)ea;
+-    if (mfc_is_get(cmd) && !(uint32_t)ea && size) {
+-        static int s_di = -1;
+-        if (s_di < 0) s_di = getenv("SPU_DSP_IMAGE_EA") ? 1 : 0;
++    if (s_di && mfc_is_get(cmd) && size == 368) s_desc_ea = (uint32_t)ea;
++    if (s_di && mfc_is_get(cmd) && !(uint32_t)ea && size) {
+         extern uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
+         if (s_di && g_spu_image_src_ea) {
+             static int _n = 0;
+@@ -624,7 +626,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+     if (mfc_is_get(cmd) && (uint32_t)ea < 0x10000u) {
+         static int s_skip = -1; if (s_skip < 0) s_skip = getenv("LBP_SKIP_NULL_DMA") ? 1 : 0;
+         if (s_skip) {
+-            static int _n = 0; if (_n++ < 20)
++            static int _n = 0; if (_n < 20 && ++_n)
+                 fprintf(stderr, "[nulldma] img%u GET ea=0x%08X size=%u -> ZEROED (skipped)\n",
+                         spu->image_id, (uint32_t)ea, size);
+             memset(ls_ptr, 0, size);
+@@ -912,7 +914,7 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
+               unsigned d = spu_sn_defer_ticks();
+               if (d) { g_sn_defer_ctx = (void*)spu; g_sn_defer = d; } }
+             spu_ch_wake(spu);
+-            { static int _n = 0; if (_n++ < 16)
++            { static int _n = 0; if (_n < 16 && ++_n)
+                 fprintf(stderr, "[mfc-list] STALL img=%d tag=%u elem@0x%05X "
+                         "left=%u dest=0x%05X (SN raised, parked mask=0x%X) "
+                         "loadJobState@12A0=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+@@ -942,7 +944,7 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
+         return 0;
+     }
+     spu->list_stall_mask &= ~(1u << t);          /* clears; re-set if it re-parks */
+-    { static int _n = 0; if (_n++ < 16)
++    { static int _n = 0; if (_n < 16 && ++_n)     /* no write once saturated: every lane runs this */
+         fprintf(stderr, "[mfc-list] RESUME img=%d tag=%u elem@0x%05X left=%u\n",
+                 spu->image_id, t, spu->list_stall_elem_lsa[t],
+                 spu->list_stall_remaining[t]); }
+@@ -953,7 +955,7 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
+     { /* First 16 dumps per header call site, shared safely by its workers.
+        * Saturate instead of wrapping the counter back into logging. */
+       static volatile LONG _n = 0;
+-      LONG _seen = InterlockedCompareExchange(&_n, 0, 0);
++      LONG _seen = _n;          /* a plain read: the locked one wrote the line on every resume */
+       int _emit = 0;
+       while (_seen < 16) {
+           LONG _previous = InterlockedCompareExchange(&_n, _seen + 1, _seen);
+@@ -1410,7 +1412,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+              * SpursTasksetContext (LS 0x2700..0x27E0) so we can see which field
+              * fed the bad EA. taskset@0x27B8, kernelMgmt@0x27C0, syscall@0x27C4. */
+             if (spu->image_id==23 && lsa==0x2780u && ((ea>>32)&0xFFFF)) {
+-                static int _d=0; if (_d++ < 3) {
++                static int _d=0; if (_d < 3 && ++_d) {
+                     fprintf(stderr, "[cri-r4] BAD-DMA ea=0x%09llX; SpursTasksetContext LS[0x2700..0x27E0]:\n",
+                             (unsigned long long)ea);
+                     for (uint32_t o=0x2700; o<0x27E0; o+=16)
+@@ -1422,7 +1424,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+             /* kernel bootstrap DMA: dump LS[0x1C0] (=r17, the packed instance EA via
+              * the entry's cdd/cwd/shufb) to check if the EA got byte-mangled. */
+             if (cmd==0x40 && lsa==0x3FFE0) {
+-                static int _k=0; if (_k++ < 3) {
++                static int _k=0; if (_k < 3 && ++_k) {
+                     const uint8_t* p=&spu->ls[0x1C0];
+                     fprintf(stderr, "[DMA] LS[0x1C0] (r17, packed instance) = %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                         p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
+@@ -1536,7 +1538,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+                     cmd, lsa, (unsigned long long)ea, size, tag);
+         } else if (_pn == 96)
+             fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
+-        _pn++;
++        /* Counted only up to the cap: every policy-mode DMA of every lane wrote
++         * this one word, and the line went from core to core with it (14% of
++         * mfc_channel_write in Killzone 2). */
++        if (_pn <= 96) _pn++;
+     }
+ 
+     /* Execute the transfer.
+@@ -1549,7 +1554,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+          * they are easy to miss entirely while diagnosing a pipeline that
+          * never fills. Always report the issue: the DESTINATION lsa is the
+          * value the whole transfer hangs on. */
+-        { static int _l = 0; if (_l++ < 32)
++        { static int _l = 0; if (_l < 32 && ++_l)
+             fprintf(stderr, "[mfc-list] ISSUE img=%d cmd=0x%02X dest_lsa=0x%05X "
+                     "list\n0x%05X size=0x%X (%u elems) tag=%u\n",
+                     spu->image_id, cmd, lsa, (uint32_t)ea & SPU_LS_MASK,
+@@ -1583,7 +1588,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+          * Answers lifter-vs-builder: are shareable-output UseBuffer + kRunJob +
+          * store commands PRESENT in the list the PPU built? */
+         { static int s_cd = -1; if (s_cd < 0) s_cd = getenv("SPU_CMDDUMP") ? 1 : 0;
+-          if (s_cd) { static int _c = 0; if (_c++ < 6) {
++          if (s_cd) { static int _c = 0; if (_c < 6 && ++_c) {
+             static const char* NM[8] = {"kNop","kReserveBufSet","kUseBuffer",
+                 "kUnreserveBufSets","kReqDepDec","kRunJob","kEndCommand","kInvalid"};
+             const uint8_t* p = spu->ls + 0xC00;
+@@ -1604,7 +1609,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+     {
+         static int64_t dt2=-2; if (dt2==-2){ const char* e=getenv("SPU_DMATRACE_ALL"); dt2=e?1:0; }
+         if (dt2 && spu->image_id==22 && cmd==0x40 /*GET*/ && size<=0x80) {
+-            static int _g=0; if (_g++ < 6) {
++            static int _g=0; if (_g < 6 && ++_g) {
+                 const uint8_t* p = spu->ls + (lsa & 0x3FFFF);
+                 fprintf(stderr, "[DMA] GET data @LS0x%05X (from ea=0x%09llX):", lsa, (unsigned long long)ea);
+                 for (uint32_t i=0;i<size && i<0x40;i+=4)
+@@ -1705,7 +1710,7 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
+          * really is reported complete. Env SPU_TAGPROBE=1. */
+         { static int s_tp = -1;
+           if (s_tp < 0) { const char* e = getenv("SPU_TAGPROBE"); s_tp = e ? 1 : 0; }
+-          if (s_tp && spu->image_id == 2) { static int _n = 0; if (_n++ < 40)
++          if (s_tp && spu->image_id == 2) { static int _n = 0; if (_n < 40 && ++_n)
+               fprintf(stderr, "[tagprobe] img=%d upd=%u mask=0x%X completed=0x%X -> RdTagStat=0x%X%s\n",
+                       spu->image_id, value, spu->mfc_tag_mask, mfc->tag_completed,
+                       spu->mfc_tag_status,
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 8e4511db..43158e21 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -533,7 +533,7 @@ static void spu_async_run(spu_async_job* j)
+ #endif
+         if (!ts_slot->ls) ts_slot->ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+         ls = ts_slot->ls;
+-        { static int _n = 0; if (_n++ < 24)
++        { static int _n = 0; if (_n < 24 && ++_n)
+             fprintf(stderr, "[persist-ls] taskset=0x%08X task=%u image=%d %s\n",
+                     j->taskset_ea, j->taskid, j->image_id,
+                     ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
+@@ -1162,7 +1162,7 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
+     pthread_cond_broadcast(&s_sig_cv);
+     pthread_mutex_unlock(&s_sig_lock);
+ #endif
+-    { static int _n = 0; if (_n++ < 24)
++    { static int _n = 0; if (_n < 24 && ++_n)
+         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
+                 taskId, taskset_ea); fflush(stderr); }
+     /* SPU_SIG_STATS=1: signals per second per (taskset, task, caller). */
+@@ -1296,7 +1296,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+                     }
+                 }
+             }
+-            { static int _a = 0; if (_a++ < 8)
++            { static int _a = 0; if (_a < 8 && ++_a)
+                 fprintf(stderr, "[sync-ack] lanes advanced to tickets (sync=0x%08X)\n", b); }
+         }
+     }
+@@ -1342,7 +1342,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+     if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
+     pthread_mutex_unlock(&s_sig_lock);
+ #endif
+-    if (drained) { static int _d = 0; if (_d++ < 24)
++    if (drained) { static int _d = 0; if (_d < 24 && ++_d)
+         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
+                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
+     spu_serial_acquire();       /* resume: re-take the serial lock */
+@@ -1444,7 +1444,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
+         (unsigned long long)fp, args_ea, image_id);
+     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
+-        static int _d=0; if (_d++ < 1) {
++        static int _d=0; if (_d < 1 && ++_d) {
+             /* Dump a larger window of the task context buffer + scan for any word
+              * that looks like the LS[0xBEC0] target (i.e. a small LS-range value),
+              * to see if the kernel-restored LS data lives here (real game data). */
+diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
+index 267e9973..c230a22f 100644
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -441,7 +441,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+      * function + the value it waits on. Fires a few times. YDKJ_Q23STACK. */
+     if ((queue_id == 2 || queue_id == 3) && getenv("YDKJ_Q23STACK")) {
+ #ifdef _WIN32
+-        static int _gs23 = 0; if (_gs23++ < 4) {
++        static int _gs23 = 0; if (_gs23 < 4 && ++_gs23) {
+             void* fr[48]; unsigned short n=RtlCaptureStackBackTrace(0,48,fr,0);
+             char* base=(char*)GetModuleHandleA(0);
+             char ln[1000]; int p=snprintf(ln,sizeof ln,"[Q23STACK q=%u] host RVAs:",queue_id);
+@@ -1143,7 +1143,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
+     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
+     { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
+     uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
+-    { static int _w=0; if (_w++ < 40) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
++    { static int _w=0; if (_w < 40 && ++_w) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
+     /* SPU-completion shim (targeted): the main thread spins in func_003319D0 until
+      * *(r29+0x24) (a completion counter the SPU would increment) reaches the target
+      * *(r29). Since we don't yet run the SPU workload, satisfy that counter so the
+@@ -1156,7 +1156,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
+         uint32_t obj = (uint32_t)ctx->gpr[29];
+         uint8_t* tgt = (uint8_t*)vm_to_host(obj);
+         uint8_t* cur = (uint8_t*)vm_to_host(obj + 0x24);
+-        static int _n=0; if (_n++ < 12)
++        static int _n=0; if (_n < 12 && ++_n)
+             fprintf(stderr, "[evt] SPU-completion shim: flag=%u r29=0x%08X target=%02X%02X%02X%02X cur=%02X%02X%02X%02X -> satisfied\n",
+                     flag_id, obj, tgt[0],tgt[1],tgt[2],tgt[3], cur[0],cur[1],cur[2],cur[3]);
+         cur[0]=tgt[0]; cur[1]=tgt[1]; cur[2]=tgt[2]; cur[3]=tgt[3];
+@@ -1164,7 +1164,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
+     }
+ 
+     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX) {
+-        { static int _e=0; if(_e++<8) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
++        { static int _e=0; if(_e < 8 && ++_e) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
+         return (int64_t)(int32_t)CELL_ESRCH;
+     }
+ 
+@@ -1175,13 +1175,13 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
+      * real render code. Diagnostic only; identifies whether the spin is the gate. */
+     { static int s_f = -1; if (s_f < 0) s_f = getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0;
+       if (s_f && !g_sys_event_flags[flag_id-1].active) {
+-        static int _n=0; if(_n++<4) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
++        static int _n=0; if(_n < 4 && ++_n) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
+         if (result_addr != 0) { write_be32(result_addr, (uint32_t)(bitpat>>32)); write_be32(result_addr+4, (uint32_t)bitpat); }
+         return CELL_OK;
+       } }
+     sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
+     if (!f->active) {
+-        { static int _e=0; if(_e++<8) {
++        { static int _e=0; if(_e < 8 && ++_e) {
+             uint32_t r29=(uint32_t)ctx->gpr[29], r30=(uint32_t)ctx->gpr[30], r31=(uint32_t)ctx->gpr[31], r3g=(uint32_t)ctx->gpr[3];
+             fprintf(stderr,"[evt] flag_wait flag=%u NOT ACTIVE -> ESRCH; r3=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n", flag_id, r3g, r29, r30, r31);
+             /* dump the loop's likely counter object (r29-relative, like the flag=1000 shim's *(r29)/*(r29+0x24)) */
+@@ -1202,7 +1202,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
+ #endif
+         return (int64_t)(int32_t)CELL_ESRCH;
+     }
+-    { static int _a=0; if(_a++<8) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
++    { static int _a=0; if(_a < 8 && ++_a) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
+ 
+     if (bitpat == 0)
+         return (int64_t)(int32_t)CELL_EINVAL;
+@@ -1214,7 +1214,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
+      * identifies the gate. */
+     { static int s_fe = -1; if (s_fe < 0) s_fe = getenv("PS3_EVF_FORCE") ? 1 : 0;
+       if (s_fe && f->active && !flag_check(f->pattern, bitpat, mode)) {
+-        static int _n = 0; if (_n++ < 20)
++        static int _n = 0; if (_n < 20 && ++_n)
+             fprintf(stderr, "[evt] PS3_EVF_FORCE: force-satisfy flag=%u bits=0x%llX mode=%u\n",
+                     flag_id, (unsigned long long)bitpat, mode);
+ #ifdef _WIN32
+@@ -1392,7 +1392,7 @@ int64_t sys_event_flag_set(ppu_context* ctx)
+     uint32_t flag_id = LV2_ARG_U32(ctx, 0);
+     uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
+ 
+-    { static int _n=0; if(_n++<200) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
++    { static int _n=0; if(_n < 200 && ++_n) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
+         flag_id,(unsigned long long)bitpat); }
+ 
+     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
