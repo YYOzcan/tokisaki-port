@@ -2416,3 +2416,36 @@ At ~32.5 frames/s, per frame:
   `SPU_FP_RZ_ASSUMED`; a pos0 that does nothing fails 1.16 M of them. With
   the float-mode assumption the skinning loop is 5,637 instructions (11,396
   before). 33.89 / 32.61 against 33.51 / 32.40.
+
+## 90. The FIFO thread is the long pole again; what it hashes
+
+With the SPU code faster (sections 88, 89) the FIFO thread drains 88-91% of
+the time and is parked on SPU-patched jumps only 8-10% (it was 17-28%):
+`KZ2_RSX_TIMES=1`. Frame times 22-42 ms, most 26-28 (`KZ2_FRAME_HIST=1`).
+
+- **Fragment programs by content** (`s_fpm_by_content`): ~12% of program
+  lookups were a new address -- Killzone 2 copies its fragment programs into
+  a ring -- and each paid the full analysis. A new address whose instruction
+  slots match an entry (found by a hash of them, decided by comparing them)
+  takes that entry's results: 88% of new addresses
+  (`RSX_PROG_MEMO_STATS=1`); `RSX_PROG_MEMO_CHECK=1` over 6.36 M draws, 0
+  mismatches. The hit test compares runs of instruction slots, not one slot
+  at a time.
+- **The texture cache lookup** (`eng_texture_slot`) walked all 1,024 entries
+  for every unit of every draw; a hint table (checked in full) finds the
+  entry first: 4.6 -> 2.8% of the FIFO thread.
+- **What `vc_hash` reads** (counted for one run): ~21,000 calls and 20.6 MB a
+  frame, 11.9 MB of it the periodic full hash of textures larger than 16 KB,
+  5.3 MB vertex spans, 2.3 MB index data -- reads of guest memory not in the
+  cache, so bandwidth, not arithmetic. `RSX_VTX_CACHE_STATS=1` now also
+  prints the vertex MB hashed whole, sampled and converted per frame
+  (5.3 / 9.6 / ~7.3).
+- **That periodic full texture hash on a helper thread** (`eng_texhash_async`,
+  `RSX_TEXHASH_ASYNC=0` = before): it is a safety net for writes the sparse
+  samples miss, already up to 8 frames late; a difference marks the entry and
+  its next use hashes and uploads it on the FIFO thread as before. Small
+  textures, sparse differences and writes the engine saw (`force_full`) stay
+  synchronous. The sparse check itself runs four multiply lanes and
+  prefetches its blocks. Profile, same build: `vc_hash` 9.6 -> 5.8% of the
+  FIFO thread, its CPU per frame 23.2 -> 22.7 ms; frame rate 33.93 / 33.30
+  against 32.73 / 34.01 (runs vary by +-0.7, more than this moves).

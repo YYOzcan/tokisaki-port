@@ -1,0 +1,314 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index f563046a..ef39a31d 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -131,6 +131,9 @@ typedef struct {
+     u32 last_full_frame;        /* g.frames of the last full content hash */
+     u32 last_hash_frame;
+     u64 last_use_serial;
++    u32 gen;                    /* which texture this slot holds (eng_texhash_async) */
++    u8  force_full;             /* a write the engine saw: the full hash, now */
++    volatile u32 async_changed; /* gen | 0x80000000: the async full hash differed */
+ } eng_texture;
+ 
+ typedef struct {
+@@ -938,18 +941,95 @@ static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
+ {
+     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+     if (!src) { *readable = 0; return 0; }
+-    u64 hash = 1469598103934665603ull;
+-    for (u32 i = 0; i + 64 <= span; i += ENG_TEXHASH_STRIDE)
+-        for (u32 k = 0; k < 64; k += 8) {
+-            u64 word;
+-            memcpy(&word, src + i + k, sizeof(word));
+-            hash = (hash ^ word) * 1099511628211ull;
+-        }
+-    for (u32 i = span > 64 ? span - 64 : 0; i < span; i++)
+-        hash = (hash ^ src[i]) * 1099511628211ull;
++    /* Four multiply lanes (two words of each block apiece) instead of one
++     * chain through all of them, and the blocks a few strides ahead
++     * prefetched: each sampled block is its own cache miss. Compared only
++     * with its own earlier value (eng_texture.sparse_hash). */
++    const u64 K = 0x9FB21C651E98DF25ull;
++    u64 a = 1469598103934665603ull, b = ~a, c = a * K, d = a + K;
++    for (u32 i = 0; i + 64 <= span; i += ENG_TEXHASH_STRIDE) {
++        if (i + 8u * ENG_TEXHASH_STRIDE + 64u <= span)
++            __builtin_prefetch(src + i + 8u * ENG_TEXHASH_STRIDE);
++        u64 w[8];
++        memcpy(w, src + i, sizeof w);
++        a = (a ^ w[0]) * K; b = (b ^ w[1]) * K; c = (c ^ w[2]) * K; d = (d ^ w[3]) * K;
++        a = (a ^ w[4]) * K; b = (b ^ w[5]) * K; c = (c ^ w[6]) * K; d = (d ^ w[7]) * K;
++    }
++    if (span >= 64) {                   /* the last 64 bytes */
++        u64 w[8];
++        memcpy(w, src + span - 64, sizeof w);
++        for (int k = 0; k < 8; k++) a = (a ^ w[k]) * K + (a >> 29);
++    } else {
++        for (u32 i = 0; i < span; i++) a = (a ^ src[i]) * K;
++    }
+     *readable = 1;
+-    return hash;
++    return vc_mix(a ^ vc_mix(b + 1) ^ vc_mix(c + 2) ^ vc_mix(d + 3) ^ span);
++}
++
++/* The periodic full hash of a texture larger than ENG_TEXHASH_SMALL runs on
++ * a helper thread: it is a safety net for writes the sparse samples miss,
++ * already up to ENG_TEXHASH_FULL_EVERY frames late, and it was most of what
++ * the FIFO thread hashed (~12 MB a frame in Killzone 2's levels). A
++ * difference marks the entry; its next use hashes and uploads it here, as a
++ * sparse difference does. The sparse check, small textures and writes the
++ * engine saw stay on this thread. RSX_TEXHASH_ASYNC=0: all of it here. */
++#if !defined(_WIN32)
++#include <pthread.h>
++typedef struct { u32 index, gen, location, offset, span; u64 expect; } eng_texjob;
++#define ENG_TEXJOBS 512u
++static struct {
++    pthread_mutex_t m; pthread_cond_t c;
++    int state;                  /* -1 off, 0 not started, 1 running */
++    eng_texjob q[ENG_TEXJOBS];
++    u32 head, tail;             /* q[head..tail) */
++} s_th = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, {{0}}, 0, 0 };
++static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span, int* readable);
++static void* eng_texhash_main(void* arg)
++{
++    (void)arg;
++    for (;;) {
++        pthread_mutex_lock(&s_th.m);
++        while (s_th.head == s_th.tail) pthread_cond_wait(&s_th.c, &s_th.m);
++        const eng_texjob j = s_th.q[s_th.head % ENG_TEXJOBS];
++        s_th.head++;
++        pthread_mutex_unlock(&s_th.m);
++        int readable = 0;
++        const u64 h = eng_texture_content_hash(j.location, j.offset, j.span, &readable);
++        eng_texture* e = &g.textures[j.index];
++        if (readable && h != j.expect && __atomic_load_n(&e->gen, __ATOMIC_RELAXED) == j.gen)
++            __atomic_store_n(&e->async_changed, j.gen | 0x80000000u, __ATOMIC_RELEASE);
++    }
++    return NULL;
++}
++/* 1: queued (the full hash happens there); 0: do it here */
++static int eng_texhash_async(u32 index, const eng_texture* e, u32 span)
++{
++    if (s_th.state < 0) return 0;
++    if (s_th.state == 0) {
++        const char* v = getenv("RSX_TEXHASH_ASYNC");
++        pthread_t t;
++        if ((v && v[0] == '0') || pthread_create(&t, NULL, eng_texhash_main, NULL) != 0) {
++            s_th.state = -1;
++            return 0;
++        }
++        pthread_detach(t);
++        s_th.state = 1;
++    }
++    int queued = 0;
++    pthread_mutex_lock(&s_th.m);
++    if (s_th.tail - s_th.head < ENG_TEXJOBS) {
++        s_th.q[s_th.tail % ENG_TEXJOBS] = (eng_texjob){ index, e->gen, e->location, e->offset,
++                                                        span, e->content_hash };
++        s_th.tail++;
++        queued = 1;
++        pthread_cond_signal(&s_th.c);
++    }
++    pthread_mutex_unlock(&s_th.m);
++    return queued;
+ }
++#else
++static int eng_texhash_async(u32 index, const void* e, u32 span) { (void)index; (void)e; (void)span; return 0; }
++#endif
+ 
+ static int eng_texture_full_rehash(u32 span, u32 last_full_frame)
+ {
+@@ -1084,13 +1164,23 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+     if (!span) return 0;
+     if (s_pend_n) eng_pend_guard(location, offset, span);
+ 
+-    for (u32 i = 0; i < g.n_textures; i++) {
++    /* s_tex_hint: where this key was found last (an entry is only ever
++     * created when no entry has its key, so there is at most one); checked in
++     * full, so a stale hint costs the walk it saves. A draw walked all of
++     * g.textures for every unit it samples. */
++    static u32 s_tex_hint[4096];
++    const u32 hk = ((offset >> 4) * 0x9E3779B1u ^ location ^ (w << 17) ^ (h << 5) ^ fmt) & 4095u;
++    for (u32 pass = 0; pass < 2; pass++)
++    for (u32 i = pass ? 0 : s_tex_hint[hk]; i < g.n_textures; i++) {
+         eng_texture* e = &g.textures[i];
+         if (e->location != location || e->offset != offset ||
+             e->format != fmt || e->width != w || e->height != h ||
+             e->pitch != pitch || e->remap != remap ||
+-            e->cubemap != (u32)(cube != 0))
++            e->cubemap != (u32)(cube != 0)) {
++            if (!pass) break;           /* the hint missed: walk them all */
+             continue;
++        }
++        s_tex_hint[hk] = i;
+         if (e->handle && e->last_hash_frame != g.frames) {
+             /* The sparse check every frame; the full hash when it differs,
+              * when this entry's turn has come, for a small texture, or after
+@@ -1098,9 +1188,17 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+             int readable = 0;
+             u64 hash = e->content_hash;
+             const u64 sparse = eng_texture_sparse_hash(location, offset, span, &readable);
+-            if (readable && (sparse != e->sparse_hash ||
++            const int changed = __atomic_load_n(&e->async_changed, __ATOMIC_ACQUIRE) == (e->gen | 0x80000000u);
++            if (readable && (sparse != e->sparse_hash || changed || e->force_full ||
+                              eng_texture_full_rehash(span, e->last_full_frame))) {
+-                hash = eng_texture_content_hash(location, offset, span, &readable);
++                if (!changed && !e->force_full && sparse == e->sparse_hash && span > ENG_TEXHASH_SMALL &&
++                    eng_texhash_async(i, e, span)) {
++                    /* only its turn: the helper thread hashes it */
++                } else {
++                    hash = eng_texture_content_hash(location, offset, span, &readable);
++                    e->async_changed = 0;
++                    e->force_full = 0;
++                }
+                 e->last_full_frame = g.frames;
+             }
+             if (readable) e->sparse_hash = sparse;
+@@ -1136,6 +1234,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+ 
+     eng_texture e;
+     memset(&e, 0, sizeof(e));
++    { static u32 s_gen; e.gen = ++s_gen & 0x7FFFFFFFu; }
+     e.location = location; e.offset = offset; e.format = fmt;
+     e.width = w; e.height = h; e.pitch = pitch;
+     e.remap = remap; e.cubemap = (u32)(cube != 0);
+@@ -1172,6 +1271,7 @@ static void eng_textures_touch(u32 location, u32 offset, u32 bytes)
+         if (e->location == location && e->offset >= offset && e->offset - offset < bytes) {
+             e->last_hash_frame = g.frames - 1u;
+             e->last_full_frame = g.frames - ENG_TEXHASH_FULL_EVERY;   /* hash it all */
++            e->force_full = 1;                                        /* here, now */
+         }
+     }
+ }
+@@ -1737,15 +1837,29 @@ typedef struct eng_fp_memo {
+ static eng_fp_memo s_fpm[ENG_FPM_SLOTS];
+ static eng_fp_memo* s_fpm_cur;   /* the current draw's, set by eng_guest_programs */
+ 
+-/* Does the program at p still have the instructions of m? */
++/* Does the program at p still have the instructions of m? Compared a run
++ * of instruction slots at a time, between the constant slots. */
+ static int eng_fp_memo_same(const eng_fp_memo* m, const u8* p)
+ {
+-    u32 k = 0;
+-    for (u32 o = 0; o < m->size; o += 16) {
+-        if (k < m->nconst && m->const_at[k] == o) { k++; continue; }
+-        if (memcmp(p + o, m->bytes + o, 16)) return 0;
++    u32 o = 0;
++    for (u32 k = 0; k < m->nconst; k++) {
++        const u32 c = m->const_at[k];
++        if (c > o && memcmp(p + o, m->bytes + o, c - o)) return 0;
++        o = c + 16u;
+     }
+-    return 1;
++    return o >= m->size || !memcmp(p + o, m->bytes + o, m->size - o);
++}
++
++/* The same program at another address: titles copy their fragment programs
++ * into a ring (Killzone 2 ~12% of lookups are a new address). s_fpm_by_content
++ * indexes the entries by a hash of their instruction slots; a new address
++ * whose instructions match an entry takes its results instead of working
++ * them out (eng_fp_memo_same decides, the hash only finds the candidate). */
++#define ENG_FPM_CSLOTS 2048u     /* a power of two */
++static u16 s_fpm_by_content[ENG_FPM_CSLOTS];     /* entry index + 1 */
++static u64 eng_fp_content_hash(const u8* bytes, u32 size)
++{
++    return vc_hash(bytes, size, 0x46504D43ull) ^ size;  /* constant slots zeroed */
+ }
+ 
+ /* The program at (loc, off): its memo entry, refreshed when its instructions
+@@ -1760,10 +1874,19 @@ static eng_fp_memo* eng_fp_memo_get(u32 loc, u32 off, const u8** out_uc)
+         if (!e->used && !m) m = e;
+     }
+     if (!m) m = &s_fpm[h];               /* a full run: take the home slot */
++    /* RSX_PROG_MEMO_STATS=1: hits and misses every ~10 s */
++    static int stats = -1;
++    if (stats < 0) stats = getenv("RSX_PROG_MEMO_STATS") ? 1 : 0;
++    static unsigned long n_hit, n_new, n_changed, n_evict, n_shared;
++    if (stats && ((n_hit + n_new + n_changed) & 0x3FFFFu) == 0x3FFFFu)
++        fprintf(stderr, "[rsx engine] fp memo: %lu hits, %lu new addresses (%lu evicting, %lu"
++                " the same program as another), %lu changed\n",
++                n_hit, n_new, n_evict, n_shared, n_changed);
+     if (m->used && m->loc == loc && m->off == off && m->size) {
+         const u8* p = eng_guest_ptr(NULL, loc, off, m->size);
+-        if (p && eng_fp_memo_same(m, p)) { *out_uc = p; return m; }
+-    }
++        if (p && eng_fp_memo_same(m, p)) { *out_uc = p; n_hit++; return m; }
++        n_changed++;
++    } else { n_new++; if (m->used) n_evict++; }
+     /* New, or its instructions changed: work it out again. */
+     m->used = 1; m->loc = loc; m->off = off;
+     m->size = 0; m->gamma_valid = 0;
+@@ -1789,6 +1912,26 @@ static eng_fp_memo* eng_fp_memo_get(u32 loc, u32 off, const u8** out_uc)
+             o += 16;
+         }
+     }
++    const u64 ch = eng_fp_content_hash(m->bytes, size);
++    const u32 ci = (u32)(ch ^ (ch >> 31)) & (ENG_FPM_CSLOTS - 1u);
++    const u32 self = (u32)(m - s_fpm);
++    {   /* the same instructions under another address */
++        const u32 e = s_fpm_by_content[ci];
++        const eng_fp_memo* o = e ? &s_fpm[e - 1u] : NULL;
++        if (o && o != m && o->used && o->size == size && o->nconst == m->nconst &&
++            !memcmp(o->const_at, m->const_at, m->nconst * sizeof m->const_at[0]) &&
++            !memcmp(o->bytes, m->bytes, size)) {
++            m->consts_ok = o->consts_ok; m->tex_units = o->tex_units;
++            m->reads_wpos = o->reads_wpos; m->shash = o->shash;
++            m->gamma_valid = o->gamma_valid; m->gamma_units = o->gamma_units;
++            memcpy(m->gamma_in, o->gamma_in, sizeof m->gamma_in);
++            m->size = size;
++            n_shared++;
++            *out_uc = uc;
++            return m;
++        }
++    }
++    s_fpm_by_content[ci] = (u16)(self + 1u);
+     rsx_fp_constant_block cb;
+     m->consts_ok = rsx_fp_collect_constants(uc, size, &cb) >= 0 && cb.count == m->nconst;
+     m->tex_units = rsx_fp_texture_units(uc, size);
+@@ -2308,6 +2451,7 @@ static int dc_reserve_indices(u32 count)
+ typedef struct { u64 key; u8* verts; u32 n, stride, last_frame, seen; u64 full; u32 full_frame; } eng_vc_entry;
+ static eng_vc_entry s_vc[ENG_VC_SLOTS];
+ static u64 s_vc_bytes, s_vc_hits, s_vc_miss, s_vc_skip, s_vc_stale;
++static u64 s_vc_hashed_full, s_vc_hashed_sparse, s_vc_miss_bytes, s_vc_fetched;   /* RSX_VTX_CACHE_STATS */
+ static int s_vc_on = -1;
+ 
+ static u64 eng_refs_hash(const rsx_vertex_ref* refs, u32 n)
+@@ -2364,10 +2508,12 @@ static u64 eng_vc_key(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* r
+             for (size_t o = 0; o + 64 <= len; o += 2048) h = vc_hash(span[k].lo + o, 64, h);
+             h = vc_hash(span[k].hi - 64, 64, h);
+             h = vc_hash(&len, sizeof len, h);
+-            if (full_out) full = vc_hash(span[k].lo, len, full);
++            s_vc_hashed_sparse += len;
++            if (full_out) { full = vc_hash(span[k].lo, len, full); s_vc_hashed_full += len; }
+             else *sparse_used = 1;
+         } else {
+             h = vc_hash(span[k].lo, len, h);
++            s_vc_hashed_full += len;
+         }
+     }
+     if (full_out) *full_out = full;
+@@ -2409,10 +2555,14 @@ static void eng_vc_age(void)
+     static u32 last_print;
+     if (stats && g.frames - last_print >= 600u) {
+         last_print = g.frames;
+-        fprintf(stderr, "[vtx-cache] hits %llu, misses %llu, uncacheable %llu, stale by the full check %llu, %.1f MB held\n",
++        fprintf(stderr, "[vtx-cache] hits %llu, misses %llu, uncacheable %llu, stale by the full check %llu, %.1f MB held;"
++                " per frame: %.2f MB hashed whole, %.2f MB sampled, %.2f MB converted\n",
+                 (unsigned long long)s_vc_hits, (unsigned long long)s_vc_miss,
+-                (unsigned long long)s_vc_skip, (unsigned long long)s_vc_stale, s_vc_bytes / 1048576.0);
++                (unsigned long long)s_vc_skip, (unsigned long long)s_vc_stale, s_vc_bytes / 1048576.0,
++                s_vc_hashed_full / 600.0 / 1048576.0, s_vc_hashed_sparse / 600.0 / 1048576.0,
++                s_vc_fetched / 600.0 / 1048576.0);
+         s_vc_hits = s_vc_miss = s_vc_skip = s_vc_stale = 0;
++        s_vc_hashed_full = s_vc_hashed_sparse = s_vc_fetched = 0;
+     }
+ }
+ 
+@@ -2687,6 +2837,7 @@ have_refs:
+         dc.fetch_ok = 0;
+         return;
+     }
++    s_vc_fetched += (u64)dc.n_refs * layout->stride;
+     dc.n_verts = dc.n_refs;
+     dc.vptr = dc.verts;
+     if (ce && !ce->verts) {
