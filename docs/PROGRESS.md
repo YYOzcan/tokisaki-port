@@ -2482,3 +2482,26 @@ alternating rounds: 33.08 / 34.38 / 33.81 against 32.54 / 32.44 / 32.39 --
 - **The SPURS workers at a lower priority** (an experiment, not kept): every
   worker at nice 3, so the FIFO and main threads would win shared cores:
   34.65 / 33.31 against 33.92 / 34.46.
+
+## 91. 220 new textures a frame; the FIFO thread at 20 ms
+
+`PS3RECOMP_VK_SUBMIT_STATS=1` counted ~40,000 texture creations and uploads
+per 5 s window. The texture cache was full (1,024) and took ~250 new entries a
+frame, each evicting one; at 4,096 entries it still took ~155, so not a
+working set that did not fit. Sampled over three frames, every new entry was
+an 8x8 ARGB8 texture (256 bytes, main memory) at a new address -- ~220 a
+frame, 165 different contents among 669 -- data the SPU jobs write each frame.
+
+- **Small textures by content** (`eng_smalltex_get`, `RSX_SMALLTEX_CACHE=0`
+  = before): a texture of at most 4 KB is looked up by its bytes -- a hash
+  finds the candidate among 1,024 entries, a copy of the bytes decides -- and
+  never enters the address-keyed cache; an entry used in the current frame is
+  never evicted (a draw may still hold it). Texture creations per window
+  ~40,000 -> 2, uploads -> ~500; frame dumps look as before. The backend's
+  object table is 4,096 now. FIFO thread 21.97 -> 20.21 ms a frame (NVIDIA
+  driver 12.8 -> 9.6% of it); frame rate 34.33 / 33.90 / 33.99 against
+  33.41 / 34.09 / 34.56.
+
+With the FIFO thread at ~20 ms of a ~29.6 ms frame, it is no longer what the
+frame waits on: the main thread (57% busy, waits on its worker thread and the
+SPU job counters) and the SPURS lanes are.
