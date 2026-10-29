@@ -2449,3 +2449,20 @@ the time and is parked on SPU-patched jumps only 8-10% (it was 17-28%):
   prefetches its blocks. Profile, same build: `vc_hash` 9.6 -> 5.8% of the
   FIFO thread, its CPU per frame 23.2 -> 22.7 ms; frame rate 33.93 / 33.30
   against 32.73 / 34.01 (runs vary by +-0.7, more than this moves).
+- **Uploads past the general path** (`rsx_process_upload_method`,
+  `libs/video/rsx_commands.c`; the walker in `cellGcmSys.c`): a method
+  histogram of a run (by 256-byte method block) has vertex program words
+  (0x0B80..0x0BFC) at 35% of all methods and transform constants
+  (0x1F00..0x1F7C) at 28%. Each went through the walker's per-method watches
+  and routes and `rsx_process_method`'s chain of range tests; now they go
+  straight to the draw engine and to the two handlers, the same calls in the
+  same order (`RSX_FIFO_UPLOAD_FAST=0` = before; off by itself while
+  `GCM_VAL_WATCH`, `RSX_TRACE` or the live engine is on). Profile, same
+  build: `rsx_process_method` 7.0 -> 3.6% of the FIFO thread, its CPU per
+  frame 22.99 -> 21.38 ms.
+
+Where the frame is now (~33.5 frames/s): the GPU is 35-43% busy
+(`nvidia-smi`), the FIFO thread ~72% (21 ms a frame), the main thread ~53%,
+each SPURS lane ~70%; with the NVIDIA driver's threads and the task pool
+that is ~6 busy threads on 6 cores with SMT. No one of them is the frame:
+work taken off any of them shows as a fraction of itself.

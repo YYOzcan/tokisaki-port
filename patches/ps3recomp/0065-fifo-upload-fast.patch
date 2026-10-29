@@ -1,0 +1,174 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 7be8d995..9b8cfccb 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2024,10 +2024,30 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 s_fifo_getoff += 4 + count * 4;
+                 continue;
+             }
++            /* Vertex program and transform constant uploads (0x0B80..0x0BFC,
++             * 0x1F00..0x1F7C) are 63% of Killzone 2's methods and concern none
++             * of the per-method watches, routes and special cases below: they
++             * go straight to the two state machines. Off when one of the
++             * watches that sees every method is on; RSX_FIFO_UPLOAD_FAST=0
++             * sends them the general way. */
++            static int upload_fast = -1, upload_eng = 0;
++            if (upload_fast < 0) {
++                const char* e = getenv("RSX_FIFO_UPLOAD_FAST");
++                upload_fast = !(e && e[0] == '0') && !getenv("GCM_VAL_WATCH") &&
++                              !getenv("RSX_TRACE") && !rsx_live_draw_enabled();
++                upload_eng = rsx_draw_engine_enabled();
++            }
+             for (u32 i = 0; i < count; i++) {
+                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                 if (!dea) break;
+                 u32 m = (type == 0) ? method + i * 4 : method;
++                if (upload_fast && subch == 0 &&
++                    ((m >= 0x0B80u && m < 0x0C00u) || (m >= 0x1F00u && m < 0x1F80u))) {
++                    const u32 v = vm_read32(dea);
++                    if (upload_eng) rsx_draw_engine_method(m, v);
++                    rsx_process_upload_method(&s_state, m, v);
++                    continue;
++                }
+                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
+                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
+                  * in the 2D engine path and being dropped as unrecognised. It
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index c75dbbb5..d39b525b 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -332,6 +332,62 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
+  * Main method dispatch
+  * -----------------------------------------------------------------------*/
+ 
++/* NV4097_SET_TRANSFORM_PROGRAM[0..31] (0x0B80..0x0BFC) and
++ * NV4097_SET_TRANSFORM_CONSTANT[0..31] (0x1F00..0x1F7C), the methods titles
++ * send most (63% of Killzone 2's): rsx_process_method's handling of them,
++ * callable on its own so the FIFO walker can skip the general path for them
++ * (cellGcmSys.c). Any other method: -1, nothing done. */
++int rsx_process_upload_method(rsx_state* state, u32 method, u32 data)
++{
++    /* NV4097_SET_TRANSFORM_PROGRAM[0..31] -- a run of 32-bit vertex-program
++     * microcode words appended at the current write cursor. Capture them so the
++     * backend can decompile the real VP (4 words = one NV40 instruction). */
++    if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
++        method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
++        u32 w = state->vp_ucode_write;
++        if (w + 4 <= sizeof(state->vp_ucode)) {
++            /* data is host-endian already; store as little-endian bytes. */
++            state->vp_ucode[w+0] = (u8)(data);
++            state->vp_ucode[w+1] = (u8)(data >> 8);
++            state->vp_ucode[w+2] = (u8)(data >> 16);
++            state->vp_ucode[w+3] = (u8)(data >> 24);
++            state->vp_ucode_write = w + 4;
++            if (w + 4 > state->vp_ucode_bytes) state->vp_ucode_bytes = w + 4;
++            state->vp_dirty = 1;
++        }
++        return 0;
++    }
++    if (!(method >= NV4097_SET_TRANSFORM_CONSTANT &&
++          method <  NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4))
++        return -1;
++    {
++        u32 reg_offset = (method - NV4097_SET_TRANSFORM_CONSTANT) / 4;
++        u32 slot = state->transform_constant_load + (reg_offset >> 2);
++        u32 lane = reg_offset & 3;
++        if (slot < RSX_MAX_VERTEX_CONSTANTS) {
++            float f;
++            memcpy(&f, &data, 4);
++            { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
++              static int _n=0;
++              static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
++              int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
++              if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
++            state->vertex_constants[slot][lane] = f;
++            { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && _sq++ < 500)
++                fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
++            if (!state->vertex_constants_dirty) {
++                state->vertex_constants_lo = slot;
++                state->vertex_constants_hi = slot;
++                state->vertex_constants_dirty = 1;
++            } else {
++                if (slot < state->vertex_constants_lo) state->vertex_constants_lo = slot;
++                if (slot > state->vertex_constants_hi) state->vertex_constants_hi = slot;
++            }
++        }
++        return 0;
++    }
++}
++
+ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+ {
+     /* RSX_TRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
+@@ -612,20 +668,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+      * microcode words appended at the current write cursor. Capture them so the
+      * backend can decompile the real VP (4 words = one NV40 instruction). */
+     if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
+-        method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
+-        u32 w = state->vp_ucode_write;
+-        if (w + 4 <= sizeof(state->vp_ucode)) {
+-            /* data is host-endian already; store as little-endian bytes. */
+-            state->vp_ucode[w+0] = (u8)(data);
+-            state->vp_ucode[w+1] = (u8)(data >> 8);
+-            state->vp_ucode[w+2] = (u8)(data >> 16);
+-            state->vp_ucode[w+3] = (u8)(data >> 24);
+-            state->vp_ucode_write = w + 4;
+-            if (w + 4 > state->vp_ucode_bytes) state->vp_ucode_bytes = w + 4;
+-            state->vp_dirty = 1;
+-        }
+-        return 0;
+-    }
++        method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4)
++        return rsx_process_upload_method(state, method, data);
+     if (method == NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK) {
+         state->vertex_attrib_output_mask = data;
+         return 0;
+@@ -683,32 +727,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+      * does NOT auto-advance LOAD between commands — games re-issue
+      * SET_TRANSFORM_CONSTANT_LOAD before each block. */
+     if (method >= NV4097_SET_TRANSFORM_CONSTANT &&
+-        method <  NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4) {
+-        u32 reg_offset = (method - NV4097_SET_TRANSFORM_CONSTANT) / 4;
+-        u32 slot = state->transform_constant_load + (reg_offset >> 2);
+-        u32 lane = reg_offset & 3;
+-        if (slot < RSX_MAX_VERTEX_CONSTANTS) {
+-            float f;
+-            memcpy(&f, &data, 4);
+-            { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
+-              static int _n=0;
+-              static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
+-              int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
+-              if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
+-            state->vertex_constants[slot][lane] = f;
+-            { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && _sq++ < 500)
+-                fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
+-            if (!state->vertex_constants_dirty) {
+-                state->vertex_constants_lo = slot;
+-                state->vertex_constants_hi = slot;
+-                state->vertex_constants_dirty = 1;
+-            } else {
+-                if (slot < state->vertex_constants_lo) state->vertex_constants_lo = slot;
+-                if (slot > state->vertex_constants_hi) state->vertex_constants_hi = slot;
+-            }
+-        }
+-        return 0;
+-    }
++        method <  NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4)
++        return rsx_process_upload_method(state, method, data);
+ 
+     /* Draw */
+     if (method == NV4097_SET_BEGIN_END) {
+diff --git a/libs/video/rsx_commands.h b/libs/video/rsx_commands.h
+index 5d4276e8..e8203407 100644
+--- a/libs/video/rsx_commands.h
++++ b/libs/video/rsx_commands.h
+@@ -392,6 +392,9 @@ void rsx_state_init(rsx_state* state);
+  * data:   32-bit value to write
+  * Returns 0 on success, -1 if method is unrecognized. */
+ int rsx_process_method(rsx_state* state, u32 method, u32 data);
++/* The vertex program and transform constant uploads alone (0x0B80..0x0BFC,
++ * 0x1F00..0x1F7C); -1 for any other method. */
++int rsx_process_upload_method(rsx_state* state, u32 method, u32 data);
+ 
+ /* Process a command buffer segment.
+  * buf:  pointer to command buffer data (host memory)
