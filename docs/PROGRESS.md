@@ -2505,3 +2505,15 @@ frame, 165 different contents among 669 -- data the SPU jobs write each frame.
 With the FIFO thread at ~20 ms of a ~29.6 ms frame, it is no longer what the
 frame waits on: the main thread (57% busy, waits on its worker thread and the
 SPU job counters) and the SPURS lanes are.
+- **A debugging scan off the DMA path** (`SPU_POISON_DMA=1` to turn it back
+  on): a "poison" detector from another title's crash hunt scanned every SPU
+  PUT's payload a word at a time for 0xC708C708 -- 42% of `mfc_do_transfer`'s
+  samples. `mfc_do_transfer` 3.2 -> 2.1% of all samples.
+- Where the main thread waits now (off-CPU sample): the SPU job counters
+  (`func_004D3D00`) ~17%, RSX labels (`func_00048208`) ~13%, its worker thread
+  ~10%. The FIFO thread waits on the GPU ~3.2 ms a frame
+  (`PS3RECOMP_VK_SUBMIT_STATS`: ~3 colour readbacks and 1 depth readback a
+  frame, ~0.83 ms each). `RSX_ASYNC_WB=1` turns the colour ones into queued
+  copies (waits 660 -> 167 per 5 s, the depth readback of the Z16 targets
+  remains, ~2.4 ms each): 34.51 / 34.09 against 33.79 / 34.16 -- kept opt-in,
+  since a picture one frame late does not show in still frames.

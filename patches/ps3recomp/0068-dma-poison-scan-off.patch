@@ -1,0 +1,17 @@
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 863913b4..85ea6652 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -829,7 +829,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
+          * memcpy bypasses vm_write32/AWATCH, so it's the prime suspect for the
+          * garbage fn-ptr fields that cause the 0xC708C708 vcall crash. */
+-        { uint32_t e = (uint32_t)ea;
++        /* SPU_POISON_DMA=1 (default off): it scanned every PUT's payload a
++         * word at a time -- 42% of this function's time in Killzone 2. */
++        static int s_poison = -1;
++        if (__builtin_expect(s_poison < 0, 0)) s_poison = getenv("SPU_POISON_DMA") ? 1 : 0;
++        if (s_poison) { uint32_t e = (uint32_t)ea;
+           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
+           int haspoison = 0;
+           for (uint32_t o = 0; o + 4 <= size; o += 4) {
