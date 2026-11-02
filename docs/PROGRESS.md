@@ -2616,6 +2616,11 @@ Tried, not kept:
   (`spu_indirect_branch_mt` for `jobmod_*`, and on top a per-site cache of
   the last target): 37.29 / 36.88 and 38.41 / 37.59 against 39.51 / 38.12 and
   38.89 / 38.52 -- but the profile shows why: the audio job modules (e0080)
-  fell into the SPU interpreter (`spu_step`, one thread 29% -> 82%). Redo for
-  the e0030 job modules on policy-mode contexts only, with a switch.
+  fell into the SPU interpreter (`spu_step`, one thread 29% -> 82%). Redone
+  for the e0030 job modules only, on policy-mode contexts with no taskset
+  task, job-area targets, misses to the full resolver (`SPU_IBC=0` switch):
+  the audio thread stays lifted (32%), the dispatch functions fall from 9.71
+  to 6.55 ms of lane CPU a frame -- and the lanes' CPU a frame does not move
+  (85.7 / 85.8 ms): the per-site checks inlined into the job code cost what
+  they save. Not kept (`scratchpad` copy).
 - `KZ2_DRAIN_US=250`: 39.03 against 38.82 (noise).
