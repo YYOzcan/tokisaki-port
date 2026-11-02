@@ -2527,3 +2527,43 @@ SPU job counters) and the SPURS lanes are.
   one-line `static int n = 0; if (n++ < N)` log caps (52 of them in the SPU,
   SPURS, GCM and event code) stop at their cap. `mfc_channel_write`
   2.6 -> 2.2% of all samples.
+
+## 92. Native SPU job kernels from Project Pyrrhus: ~35 -> ~38
+
+Project Pyrrhus (undecuple/project-pyrrhus, MIT; at 218f660) replaced the hottest
+SPU job code of this game with native host code: the Gfx.Post passes (depth
+of field, upsample, downsample, H/V blur, bloom capture and integrate,
+inverse-lens reflection, vignette, grain weight, modulate, blend, add, zero,
+depth to fuzzy), Particles.VertexJob's clear and copy, and Anim.EdgeAnim's
+bit-packed decoder and keyframe sampler -- 79 gates, 29 on by default (the
+ones it recorded bit-exact in play). It targets the 1.29 update and names its
+images by EBOOT file offset; this port lifts the 1.01 disc and names them by
+content. Every kernel checks the constant pool it was written for (an FNV-1a
+hash of an LS range); computed over this port's 36 job modules, each Gfx.Post
+and Particles image matches exactly one module (`a27e818cca34` depth of field,
+`773efc443fa7` upsample, `78f2ef397e8f` particles, ...), so the SPU job code
+did not change between the two versions. Anim.EdgeAnim has no pool: it is
+`6ac243f6bbc4`, the one module with functions at both 0x13100 and 0x12438,
+called three times each from the joint-pose decoder at 0x10D78, with the loop
+heads and instruction counts Pyrrhus's notes give.
+
+- `src/spu_native/`: Pyrrhus's `port/kz2/spu/` copied with its notice; two
+  things its runtime has and this one does not (`kz2_native_port.h/.c`: the
+  gate table, `spu_ls_dbg_armed`, its two float switches).
+- `tools/spu_native_gates.tsv` (its gate table under this port's module
+  names) and `tools/spu_native_gates.py` (its lifter step: the gate as the
+  first statement of the lifted function; after the skip of a function this
+  port's lift made skippable -- the depth-of-field blur it leaves out --
+  so that stays as it was), run by `tools/lift_spu.sh`. CMake
+  `KZ2_SPU_NATIVE=OFF` leaves the kernels out; at run time its own switches
+  (`KZ2_NATIVE_JOB_POST=0`, `KZ2_NATIVE_JOB_<NAME>=0/1`).
+- In play every enabled gate runs native (`[native] slot N calls=... fallback=0`:
+  the pools match). Frame dumps with and without (`KZ2_NATIVE_JOB_POST=0
+  KZ2_NATIVE_JOB_EDGEANIM=0 KZ2_NATIVE_JOB_VJCLEAR=0 KZ2_NATIVE_JOB_VJCOPY=0`)
+  look alike, the dark smoke puffs of the soft-particle pass in both.
+  37.04 / 39.54 / 37.34 against 35.46 / 34.59 / 35.04 frames/s.
+
+Also: `PS3_AUDIO_MUTE=1` (patch, `cellAudio.c`) hands the device silence while
+the title mixes and paces its sound as always; `tools/ab_builds.sh` and
+`tools/ab_env.sh` (the A/B runs, now in the repository) set it. cmake comes from
+`.venv` now (pip), linked into ~/.local/bin like ninja.

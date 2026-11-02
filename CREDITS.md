@@ -90,6 +90,19 @@ v0.15 series and its Vulkan/Linux runtime (no file copied; patch 0056,
   here at the v1.01 address `func_00048208` (its 1.29 address 0x48AE8; it
   had no v1.01 entry).
 
+Copied with their notice (`src/spu_native/`, its `port/kz2/spu/` at 218f660; each
+file says so at its top, the few changes for this port are marked
+`tokisaki:`): its native host versions of hot SPU job kernels -- the Gfx.Post
+passes (depth of field, upsample, downsample, the blurs, bloom capture and
+integrate, the inverse-lens reflection, vignette, grain weight, modulate,
+blend, add, zero, depth to fuzzy), Particles.VertexJob's clear and copy and
+Anim.EdgeAnim's decoder and keyframe sampler -- with their gate table, flags
+and defaults (`KZ2_NATIVE_JOB_*`, `KZ2_NATIVE_JOB_POST`, `KZ2_NATIVE_REC`,
+`KZ2_NATIVE_TOGGLE`). Its gate table (`re/spu/native_gates.tsv`) names its
+1.29 images by file offset; `tools/spu_native_gates.tsv` names the same
+modules as this port lifts them, and `tools/spu_native_gates.py` puts the gates
+into the lifted code as its `tools/spu/lift_spu.py` does.
+
 ## Killzone 3 PC port — Project Helghast
 
 **[undecuple/project-helghast](https://github.com/undecuple/project-helghast)**

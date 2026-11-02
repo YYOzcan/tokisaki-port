@@ -63,6 +63,9 @@ export JOBMOD_SKIPPABLE="${JOBMOD_SKIPPABLE-a27e818cca34:0x4A20,0x4CB0,0x5138,0x
 export JOBMOD_ALT_BASE="${JOBMOD_ALT_BASE-73d064721abc@0x8400,8e97047fac2a@0x8400,eb97616444b5@0x8400}"
 "${PY}" -I "${T}/lift_jobmods.py" --jobmods "${OUT}/jobmods" --out "${SPU}" \
     --register "${SPU}/jobmods_register.c" --symbol-prefix kz2
+# Native gates into the lifted Gfx.Post, Particles and EdgeAnim job functions
+# (tools/spu_native_gates.tsv, src/spu_native/; from Project Pyrrhus).
+"${PY}" -I "${ROOT}/tools/spu_native_gates.py" "${SPU}"
 
 # Register-cached copies (spu_recomp_rc.c, built instead of spu_recomp.c with
 # CMake's KZ2_SPU_REGCACHE=ON): KZ2_SPU_REGCACHE=1 tools/lift_spu.sh. Slower

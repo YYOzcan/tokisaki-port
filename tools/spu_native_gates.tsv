@@ -1,0 +1,87 @@
+# Native gates (from Project Pyrrhus by undecuple, re/spu/native_gates.tsv at 218f660, MIT;
+# see THIRD_PARTY_NOTICES.md): lifted SPU job functions that hand over to a native host implementation
+# (src/spu_native/). Pyrrhus names its 1.29 images by EBOOT file offset; the same modules are in the 1.01 disc and
+# are named here as this port's lift names them (jobmod_<sha1[:12]>): each Gfx.Post and Particles module by the
+# FNV-1a hash of the constant pool its kernels were written for, Anim.EdgeAnim (no pool) by its decoder at 0x10D78
+# calling 0x13100 and 0x12438 three times each. tools/spu_native_gates.py inserts each gate as the first statement
+# of the function; cont (an LS address) makes a "continue at" gate.
+# module	addr	slot	job	cont
+a27e818cca34	0x5750	0	Gfx.Post.DepthOfField	
+a27e818cca34	0x5F80	1	Gfx.Post.DepthOfField	
+a27e818cca34	0x4CB0	2	Gfx.Post.DepthOfField	
+773efc443fa7	0x56F0	3	Gfx.Post.Upsample	
+773efc443fa7	0x5A20	4	Gfx.Post.Upsample	
+8c13ef321f1b	0x4A60	5	Gfx.Post.Zero	
+e6e30773f4ba	0x5380	6	Gfx.Post.GrainWeight	
+1c57090297b6	0x4B80	7	Gfx.Post.Downsample	
+773efc443fa7	0x4C50	8	Gfx.Post.Upsample	
+4b8a80b59fa7	0x4FD0	9	Gfx.Post.Add	
+93e1a8ff98c1	0x4F70	10	Gfx.Post.Modulate	
+2204502f551e	0x4EC0	11	Gfx.Post.Blend	
+b5dd5976bcbd	0x4D60	12	Gfx.Post.HBlur	
+2d92086619cd	0x4D00	13	Gfx.Post.VBlur	
+eb9b988caeaf	0x6300	14	Gfx.Post.BloomCapture	
+0232599a74c3	0x5940	15	Gfx.Post.BloomIntegrate	
+4226a46a9315	0x6780	16	Gfx.Post.ILR	
+8c9fc06bb020	0x4C10	17	Gfx.Post.Vignette	
+e569adaf4ffe	0x4C40	18	Gfx.Post.MotionBlur	
+528db665be32	0x4C40	19	Gfx.Post.DepthToFuzzy	
+8c13ef321f1b	0x4EE8	20	Gfx.Post.Zero	
+e6e30773f4ba	0x5808	21	Gfx.Post.GrainWeight	
+1c57090297b6	0x5008	22	Gfx.Post.Downsample	
+773efc443fa7	0x50D8	23	Gfx.Post.Upsample	
+4b8a80b59fa7	0x5458	24	Gfx.Post.Add	
+93e1a8ff98c1	0x53F8	25	Gfx.Post.Modulate	
+2204502f551e	0x5348	26	Gfx.Post.Blend	
+b5dd5976bcbd	0x51E8	27	Gfx.Post.HBlur	
+2d92086619cd	0x5188	28	Gfx.Post.VBlur	
+eb9b988caeaf	0x6788	29	Gfx.Post.BloomCapture	
+0232599a74c3	0x5DC8	30	Gfx.Post.BloomIntegrate	
+4226a46a9315	0x6C08	31	Gfx.Post.ILR	
+8c9fc06bb020	0x5098	32	Gfx.Post.Vignette	
+e569adaf4ffe	0x50C8	33	Gfx.Post.MotionBlur	
+a27e818cca34	0x5138	34	Gfx.Post.DepthOfField	
+528db665be32	0x50C8	35	Gfx.Post.DepthToFuzzy	
+8c13ef321f1b	0x5208	36	Gfx.Post.Zero	
+e6e30773f4ba	0x5B28	37	Gfx.Post.GrainWeight	
+1c57090297b6	0x5328	38	Gfx.Post.Downsample	
+773efc443fa7	0x53F8	39	Gfx.Post.Upsample	
+4b8a80b59fa7	0x5778	40	Gfx.Post.Add	
+93e1a8ff98c1	0x5718	41	Gfx.Post.Modulate	
+2204502f551e	0x5668	42	Gfx.Post.Blend	
+b5dd5976bcbd	0x5508	43	Gfx.Post.HBlur	
+2d92086619cd	0x54A8	44	Gfx.Post.VBlur	
+eb9b988caeaf	0x6AA8	45	Gfx.Post.BloomCapture	
+0232599a74c3	0x60E8	46	Gfx.Post.BloomIntegrate	
+4226a46a9315	0x6F28	47	Gfx.Post.ILR	
+8c9fc06bb020	0x53B8	48	Gfx.Post.Vignette	
+e569adaf4ffe	0x53E8	49	Gfx.Post.MotionBlur	
+a27e818cca34	0x5458	50	Gfx.Post.DepthOfField	
+528db665be32	0x53E8	51	Gfx.Post.DepthToFuzzy	
+2d92086619cd	0x57A0	52	Gfx.Post.VBlur	
+2d92086619cd	0x59E0	53	Gfx.Post.VBlur	
+2d92086619cd	0x5EB0	54	Gfx.Post.VBlur	
+2d92086619cd	0x6170	55	Gfx.Post.VBlur	
+2d92086619cd	0x63B0	56	Gfx.Post.VBlur	
+2d92086619cd	0x6640	57	Gfx.Post.VBlur	
+b5dd5976bcbd	0x5800	58	Gfx.Post.HBlur	
+b5dd5976bcbd	0x5BC8	59	Gfx.Post.HBlur	
+b5dd5976bcbd	0x6028	60	Gfx.Post.HBlur	
+b5dd5976bcbd	0x64F0	61	Gfx.Post.HBlur	
+b5dd5976bcbd	0x6778	62	Gfx.Post.HBlur	
+b5dd5976bcbd	0x6A30	63	Gfx.Post.HBlur	
+eb9b988caeaf	0x4AD8	64	Gfx.Post.BloomCapture	
+e6e30773f4ba	0x4AD8	65	Gfx.Post.GrainWeight	
+93e1a8ff98c1	0x4A20	66	Gfx.Post.Modulate	
+0232599a74c3	0x4A20	67	Gfx.Post.BloomIntegrate	
+4226a46a9315	0x4E20	68	Gfx.Post.ILR	
+8c9fc06bb020	0x4A20	69	Gfx.Post.Vignette	
+528db665be32	0x4A20	70	Gfx.Post.DepthToFuzzy	
+1c57090297b6	0x5620	71	Gfx.Post.Downsample	
+1c57090297b6	0x56D0	72	Gfx.Post.Downsample	
+8c13ef321f1b	0x5698	73	Gfx.Post.Zero	
+a27e818cca34	0x4A20	74	Gfx.Post.DepthOfField	
+6ac243f6bbc4	0x13100	75	Anim.EdgeAnim	
+6ac243f6bbc4	0x12438	76	Anim.EdgeAnim	
+78f2ef397e8f	0x411C	77	Particles.VertexJob	0x407C
+78f2ef397e8f	0x7F00	78	Particles.VertexJob	

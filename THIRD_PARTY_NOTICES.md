@@ -122,7 +122,9 @@ SOFTWARE.
 
 Project Pyrrhus by undecuple. Patch 0056 and the `kz2_label_sleep` fixup
 re-implement its patches 6031 and 6019 (and its WaitLabel replacement) for this
-port (no file is copied); it is distributed under the MIT License:
+port; `src/spu_native/` copies its native SPU job kernels (`port/kz2/spu/` at
+218f660) and `tools/spu_native_gates.tsv` / `tools/spu_native_gates.py` follow its
+gate table and lifter step. It is distributed under the MIT License:
 
 ```
 MIT License

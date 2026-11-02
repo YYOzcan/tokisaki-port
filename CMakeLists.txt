@@ -131,12 +131,23 @@ file(GLOB KZ2_LIB_INC_DIRS LIST_DIRECTORIES true "${PS3RECOMP_DIR}/libs/*")
 
 option(KZ2_FTRACE "Instrument the lifted chunks for src/kz2_ftrace.cpp (diagnostics)" OFF)
 
+# Native host versions of hot SPU job kernels (src/spu_native/, from Project Pyrrhus;
+# THIRD_PARTY_NOTICES.md): the gates tools/spu_native_gates.py puts into the lifted
+# job modules call them; KZ2_NATIVE_JOB_*=0/1 per job, KZ2_NATIVE_JOB_POST=0 for all
+# the post-processing ones. KZ2_SPU_NATIVE=OFF leaves them out (the gates stay empty).
+option(KZ2_SPU_NATIVE "Link the native SPU job kernels (src/spu_native/)" ON)
+set(KZ2_SPU_NATIVE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/spu_native/kz2_native_port.c")
+if(KZ2_SPU_NATIVE)
+    file(GLOB KZ2_SPU_NATIVE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/spu_native/*.c")
+endif()
+
 add_executable(killzone2
     src/boot_main.cpp
     src/kz2_hle.cpp
     src/kz2_ftrace.cpp
     src/kz2_fiber.cpp
     src/kz2_mouse.cpp
+    ${KZ2_SPU_NATIVE_SOURCES}
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_loader.cpp"
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_hle.cpp"
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"
@@ -156,6 +167,7 @@ target_include_directories(killzone2 PRIVATE
     "${PS3RECOMP_DIR}/runtime/platform"
     ${KZ2_LIB_INC_DIRS}
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/spu_native"
     "${PS3RECOMP_DIR}/libs/font"              # stb_truetype.h (glyph outlines)
 )
 
