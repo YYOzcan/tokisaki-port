@@ -2624,3 +2624,46 @@ Tried, not kept:
   (85.7 / 85.8 ms): the per-site checks inlined into the job code cost what
   they save. Not kept (`scratchpad` copy).
 - `KZ2_DRAIN_US=250`: 39.03 against 38.82 (noise).
+
+## 94. The FIFO thread: 18.3 -> 15.8 ms a frame
+
+Three changes to the FIFO thread's own work (profiles at Corinth River,
+`build/kzprof` per-thread CPU a frame):
+
+- **Vertex fetch, one vector per element** (`rsx_vertex_fetch_all`,
+  `libs/video/rsx_vertex_compact.c`): FLOAT, HALF, UNORM8 and SNORM16
+  attributes decode with one load, a byte shuffle and (HALF) the branch-free
+  half formula or (UNORM8, SNORM16) a vector divide, the lanes past the size
+  taking the default; a read of 16 / 8 / 4 bytes is used only where it stays
+  inside the span `rsx_vertex_fetch_plan_prepare` mapped (the rest go the
+  scalar way). Prepare works out the element range once for all attributes
+  without a divider instead of once per attribute. `RSX_VTX_SIMD=0` = before.
+  `libs/video/tests/test_vtx_fetch_simd.c` (new): 200,000 random plans --
+  every type, sizes 0-4, strides, dividers, references inside and outside
+  the spans, spans ending on a PROT_NONE page -- 231 M attribute elements,
+  0 differing from `rsx_vertex_fetch_one`; a changed rebias constant is
+  caught (31,261 differ). 7.2 -> 3.1 ns an element; `rsx_vertex_fetch_all`
+  2.83 -> 1.46 ms a frame, prepare 0.90 -> 0.40.
+- **Upload bursts** (`rsx_dispatch_upload_burst`, `rsx_process_upload_burst`,
+  the walker in `cellGcmSys.c`): a header whose words all go into the
+  transform-program or transform-constant window (incrementing, one IO
+  mapping) is handed to both state machines in one call instead of an IO
+  lookup, a read and two calls per word. `RSX_FIFO_UPLOAD_BURST=0` = before.
+  `libs/video/tests/test_upload_burst.c` (new): 2 M random runs, both state
+  machines byte-identical to the word-by-word path. Method handling
+  2.95 -> 2.23 ms a frame.
+- **The fragment constant block cleared to its count**: `rsx_fp_constant_block`
+  holds 2,048 slots (32 KB) and every draw cleared it twice; every reader
+  stops at `count` (`rsx_fp_collect_constants` clears it itself). ~80 MB of
+  memset a frame gone; the thread's library time 4.97 -> 4.07 ms.
+
+All three, four alternating rounds: 39.46 / 40.54 / 41.10 / 40.31 against
+38.81 / 39.38 / 39.49 / 40.01 (the play build), 0 stops; frame dumps alike.
+The FIFO thread's CPU a frame: 18.3 -> 15.8 ms. (Alone, the bursts against
+the vector fetch alone: 39.50 against 40.22 over three rounds -- within what
+the same binary varies between sessions, 39.4-40.2.)
+
+Tried, not kept: `PS3RECOMP_VK_ASYNC_OPS` 48 and 96 (a batch submitted every
+48 / 96 operations instead of 192, so a readback waits for less): 38.39 /
+38.65 and 38.49 / 37.70 against 40.09 -- the submits cost more than the
+shorter waits give.
