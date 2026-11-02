@@ -25,16 +25,20 @@
 #define MAXT 256
 #define PAGES 64                     /* ring data pages per thread */
 
-typedef struct { uint64_t ip; uint64_t t; uint32_t tid; } sample_t;
+typedef struct { uint64_t ip; uint64_t t; uint64_t ret; uint32_t tid; } sample_t;
+/* KZPROF_CALLER=1: also record the word at the user stack pointer -- the
+ * return address while the sample is in a leaf that has not pushed anything
+ * (libc's memcpy/memset: who calls them); a fourth column in KZPROF_RAW. */
+static int s_caller;
 static sample_t* s_samp; static size_t s_n, s_cap;
 
 typedef struct { int fd; int tid; void* base; uint64_t busy; char name[32]; } th_t;
 static th_t s_th[MAXT]; static int s_nth;
 
-static void add(uint64_t ip, uint32_t tid, uint64_t t)
+static void add(uint64_t ip, uint32_t tid, uint64_t t, uint64_t ret)
 {
     if (s_n == s_cap) { s_cap = s_cap ? s_cap * 2 : 1 << 16; s_samp = realloc(s_samp, s_cap * sizeof *s_samp); }
-    s_samp[s_n].ip = ip; s_samp[s_n].t = t; s_samp[s_n++].tid = tid;
+    s_samp[s_n].ip = ip; s_samp[s_n].t = t; s_samp[s_n].ret = ret; s_samp[s_n++].tid = tid;
 }
 
 static void drain(th_t* t)
@@ -52,7 +56,9 @@ static void drain(th_t* t)
             uint64_t ip, tm; uint32_t pid, tid;
             memcpy(&ip, buf + 8, 8); memcpy(&pid, buf + 16, 4); memcpy(&tid, buf + 20, 4);
             memcpy(&tm, buf + 24, 8);
-            add(ip, tid, tm); t->busy++;
+            uint64_t ret = 0, ssz = 0;
+            if (s_caller) { memcpy(&ssz, buf + 32, 8); if (ssz >= 8) memcpy(&ret, buf + 40, 8); }
+            add(ip, tid, tm, ret); t->busy++;
         }
         tail += h.size;
     }
@@ -81,6 +87,7 @@ int main(int argc, char** argv)
     int pid = atoi(argv[1]);
     double secs = argc > 2 ? atof(argv[2]) : 10; int freq = argc > 3 ? atoi(argv[3]) : 1000;
     int top = argc > 4 ? atoi(argv[4]) : 60;
+    s_caller = getenv("KZPROF_CALLER") && getenv("KZPROF_CALLER")[0] == '1';
     char path[256]; snprintf(path, sizeof path, "/proc/%d/task", pid);
     DIR* d = opendir(path); if (!d) { perror(path); return 1; }
     struct dirent* e;
@@ -91,6 +98,9 @@ int main(int argc, char** argv)
         at.size = sizeof at; at.type = PERF_TYPE_SOFTWARE; at.config = PERF_COUNT_SW_TASK_CLOCK;
         at.freq = 1; at.sample_freq = freq; at.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
         at.exclude_kernel = 1; at.exclude_hv = 1; at.disabled = 1; at.wakeup_events = 64;
+        if (s_caller) { at.sample_type |= PERF_SAMPLE_STACK_USER; at.sample_stack_user = 8; }
+        /* sample times on CLOCK_MONOTONIC, the clock the game's own logs use (KZ2_PARK_LOG) */
+        at.use_clockid = 1; at.clockid = CLOCK_MONOTONIC;
         int fd = (int)syscall(SYS_perf_event_open, &at, tid, -1, -1, 0);
         if (fd < 0) { perror("perf_event_open"); continue; }
         void* b = mmap(0, (PAGES + 1) * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -137,7 +147,11 @@ int main(int argc, char** argv)
                     fprintf(rf, "# map %lx %lx %lx %s\n", (unsigned long)maps[j].lo, (unsigned long)maps[j].hi,
                             (unsigned long)maps[j].off, maps[j].path);
                 fprintf(rf, "# base %lx\n", (unsigned long)base);
-                for (size_t i = 0; i < s_n; i++) fprintf(rf, "%u %lx %lu\n", s_samp[i].tid, (unsigned long)(s_samp[i].ip - base), (unsigned long)s_samp[i].t);
+                for (size_t i = 0; i < s_n; i++) {
+                    fprintf(rf, "%u %lx %lu", s_samp[i].tid, (unsigned long)(s_samp[i].ip - base), (unsigned long)s_samp[i].t);
+                    if (s_caller) fprintf(rf, " %lx", (unsigned long)(s_samp[i].ret - base));
+                    fputc('\n', rf);
+                }
                 fclose(rf); } }
     char cmd[700]; snprintf(cmd, sizeof cmd, "nm --defined-only '%s' 2>/dev/null", exe);
     FILE* p = popen(cmd, "r");

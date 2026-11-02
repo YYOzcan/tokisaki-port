@@ -1,0 +1,198 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 0e240289..eeaf21c3 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -523,7 +523,15 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+       void gcm_note_spu_put(u32 ea, u32 size);       /* defined with the walker */
+       void gcm_forget_spu_blocks(void);
+       gcm_forget_spu_blocks();
+-      g_spu_put_hook = gcm_note_spu_put; }
++      g_spu_put_hook = gcm_note_spu_put;
++      /* The RSX park waits (cellGcm_park_wait) also wake on an SPU's atomic
++       * line writes: Killzone 2's particle and light-probe jobs release their
++       * parks that way, and without it every park ended at the walker's
++       * 1 ms timeout. GCM_PARK_ATOMIC_WAKE=0: DMA PUTs only, as before. */
++      extern void (*g_spu_atomic_put_hook)(uint32_t ea, uint32_t size);
++      void gcm_note_spu_atomic_put(u32 ea, u32 size);
++      const char* aw = getenv("GCM_PARK_ATOMIC_WAKE");
++      if (!(aw && aw[0] == '0')) g_spu_atomic_put_hook = gcm_note_spu_atomic_put; }
+ 
+     s_gcm_initialized = 1;
+     return CELL_OK;
+@@ -1363,11 +1371,61 @@ static u32 g_gcm_park_seq;
+ #include <sys/syscall.h>
+ #include <unistd.h>
+ #endif
++/* KZ2_PARK_WHO=1 (default off): every 5 s, how long the walker was parked and which SPU image's PUT ended each
++ * park (the lifted image id: jobmods_register.c names them), the longest first. */
++static int s_park_who = -1;
++static volatile int s_park_waker = -1;
++static void gcm_park_who_note(u32 io, int patched, unsigned long long in_ns)
++{
++    static u32 cur_io = 0xFFFFFFFFu;
++    static unsigned long long t_start, t_win, t_in, n_calls, n_timeout;
++    t_in += in_ns; n_calls++; n_timeout += !patched;
++    static struct { int img; unsigned long long ns; unsigned n; } tab[64];
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    const unsigned long long now = (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
++    if (!t_win) t_win = now;
++    if (io != cur_io) { cur_io = io; t_start = now; }
++    if (patched) {
++        const int img = s_park_waker;
++        /* KZ2_PARK_LOG=<file>: one line per park, "start_ns end_ns image" (CLOCK_MONOTONIC) */
++        static FILE* plog; static int plog_init;
++        if (!plog_init) { plog_init = 1; const char* f = getenv("KZ2_PARK_LOG"); if (f && *f) plog = fopen(f, "w"); }
++        if (plog) fprintf(plog, "%llu %llu %d\n", t_start, now, img);
++        int k = 0;
++        while (k < 63 && tab[k].n && tab[k].img != img) k++;
++        tab[k].img = img; tab[k].ns += now - t_start; tab[k].n++;
++        cur_io = 0xFFFFFFFFu;
++    }
++    if (now - t_win >= 5000000000ull) {
++        unsigned long long tot = 0;
++        for (int k = 0; k < 64 && tab[k].n; k++) tot += tab[k].ns;
++        fprintf(stderr, "[park-who] %.1f ms in park waits (%llu, %llu timed out), %.1f ms parked to a seen patch in %.1f s;"
++                        " ended by image:", t_in / 1e6, n_calls, n_timeout, tot / 1e6, (now - t_win) / 1e9);
++        t_in = n_calls = n_timeout = 0;
++        for (int r = 0; r < 8; r++) {
++            int b = -1;
++            for (int k = 0; k < 64 && tab[k].n; k++) if (tab[k].ns && (b < 0 || tab[k].ns > tab[b].ns)) b = k;
++            if (b < 0) break;
++            fprintf(stderr, " %d: %.1f ms (%u, %.0f us each)", tab[b].img, tab[b].ns / 1e6, tab[b].n,
++                    tab[b].ns / 1e3 / tab[b].n);
++            tab[b].ns = 0;
++        }
++        fprintf(stderr, "\n");
++        memset(tab, 0, sizeof tab);
++        t_win = now;
++    }
++}
+ static void gcm_park_note_put(u32 io, u32 size)
+ {
+     __atomic_thread_fence(__ATOMIC_SEQ_CST);           /* the PUT's data before the park read */
+     const u32 pk = __atomic_load_n(&g_gcm_park_io, __ATOMIC_SEQ_CST);
+     if (pk == 0xFFFFFFFFu || pk - io >= size) return;
++    /* a write that covered the park word but left it a jump to itself (an
++     * atomic line write is 128 bytes, the word 4 of them): no wake */
++    { const u32 ea = gcm_io2ea(pk);
++      if (ea) { const u32 w = __builtin_bswap32(*(volatile u32*)(vm_base + ea));
++                if ((w & 0xE0000003u) == 0x20000000u && (w & 0x1FFFFFFCu) == pk) return; } }
++    if (s_park_who > 0) { extern __thread int g_spu_put_img; s_park_waker = g_spu_put_img; }
+     __atomic_add_fetch(&g_gcm_park_seq, 1u, __ATOMIC_SEQ_CST);
+ #ifndef _WIN32
+     syscall(SYS_futex, &g_gcm_park_seq, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+@@ -1377,24 +1435,40 @@ static void gcm_park_note_put(u32 io, u32 size)
+  * Returns 1 when the word is no longer a jump to itself. */
+ int cellGcm_park_wait(u32 io, unsigned timeout_us)
+ {
+-    const u32 seq = __atomic_load_n(&g_gcm_park_seq, __ATOMIC_SEQ_CST);
+-    __atomic_store_n(&g_gcm_park_io, io, __ATOMIC_SEQ_CST);
++    /* A wake is a write that covered the park word -- an SPU's atomic line
++     * write covers the 128 bytes around it, most of them not the word -- so
++     * the word is read again after each one, and the wait goes on for the
++     * rest of the time while it is still a jump to itself. */
++    struct timespec t0;
++    clock_gettime(CLOCK_MONOTONIC, &t0);
+     const u32 ea = gcm_io2ea(io);
+     int patched = 0;
+-    if (ea) {
++    for (;;) {
++        const u32 seq = __atomic_load_n(&g_gcm_park_seq, __ATOMIC_SEQ_CST);
++        __atomic_store_n(&g_gcm_park_io, io, __ATOMIC_SEQ_CST);
++        if (!ea) break;
+         const u32 w = __builtin_bswap32(*(volatile u32*)(vm_base + ea));
+         patched = !((w & 0xE0000003u) == 0x20000000u && (w & 0x1FFFFFFCu) == io);
+-    }
+-    if (!patched) {
++        if (patched) break;
++        struct timespec t1;
++        clock_gettime(CLOCK_MONOTONIC, &t1);
++        const long long left_ns = (long long)timeout_us * 1000ll -
++            ((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
++        if (left_ns <= 0) break;
+ #ifndef _WIN32
+-        struct timespec ts = { (time_t)(timeout_us / 1000000u), (long)(timeout_us % 1000000u) * 1000L };
++        struct timespec ts = { (time_t)(left_ns / 1000000000ll), (long)(left_ns % 1000000000ll) };
+         syscall(SYS_futex, &g_gcm_park_seq, FUTEX_WAIT_PRIVATE, seq, &ts, NULL, 0);
+ #else
+         Sleep((timeout_us + 999u) / 1000u);
+ #endif
+-        patched = __atomic_load_n(&g_gcm_park_seq, __ATOMIC_SEQ_CST) != seq;
+     }
+     __atomic_store_n(&g_gcm_park_io, 0xFFFFFFFFu, __ATOMIC_SEQ_CST);
++    if (s_park_who < 0) s_park_who = getenv("KZ2_PARK_WHO") && getenv("KZ2_PARK_WHO")[0] == '1';
++    if (s_park_who) {
++        struct timespec pw1; clock_gettime(CLOCK_MONOTONIC, &pw1);
++        gcm_park_who_note(io, patched,
++            (unsigned long long)((pw1.tv_sec - t0.tv_sec) * 1000000000ll + (pw1.tv_nsec - t0.tv_nsec)));
++    }
+     return patched;
+ }
+ 
+@@ -1448,6 +1522,18 @@ void gcm_note_spu_put(u32 ea, u32 size)
+     s_spu_blk_w = (s_spu_blk_w + 1) % GCM_SPU_BLK_N;
+ }
+ 
++/* An SPU's atomic line write (PUTLLC / PUTLLUC): only the park wake looks at
++ * it -- the pushbuffer block heuristic above is for the streams SPUs DMA. */
++void gcm_note_spu_atomic_put(u32 ea, u32 size)
++{
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);           /* the line write before the park read */
++    if (__atomic_load_n(&g_gcm_park_io, __ATOMIC_RELAXED) == 0xFFFFFFFFu) return;
++    u32 room = 0;
++    const u32 io = gcm_ea2io_range(ea, &room);
++    if (io == 0xFFFFFFFFu || size > room) return;
++    gcm_park_note_put(io, size);
++}
++
+ /* The recorded block the RSX is being pointed at, or 0xFFFFFFFF.
+  *
+  * `put` sits at or just past the end of the block the title wants executed --
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 839020cc..d1f1bf03 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -137,6 +137,10 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
+  * stream is, so the only evidence is the DMA that writes it. NULL until
+  * installed, so a title with no SPU-built FIFO pays nothing. */
+ void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
++SPU_THREAD_LOCAL int g_spu_put_img;   /* spu_dma.h: the image of the PUT the hook is told about */
++/* A successful PUTLLC / PUTLLUC line write, told to the GCM layer (whose RSX
++ * park may be the word it changes); NULL when nothing listens. */
++void (*g_spu_atomic_put_hook)(uint32_t ea, uint32_t size) = 0;
+ 
+ void spu_halt(spu_context* ctx)
+ {
+@@ -832,6 +836,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+                                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); } } }
+             spu_coh_notify_write(ea);
+             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
++            if (g_spu_atomic_put_hook) { g_spu_put_img = ctx->resident_ovl ? ctx->resident_ovl : ctx->image_id;
++                                         g_spu_atomic_put_hook(ea, MFC_ATOMIC_LINE); }
+         } else {
+             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
+             /* SPU_PUTLLC_WHY=1: which of the three conditions failed.
+@@ -904,6 +910,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+         spu_coh_notify_write(ea);
+         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+         spu_lockline_unlock();
++        if (g_spu_atomic_put_hook) { g_spu_put_img = ctx->resident_ovl ? ctx->resident_ovl : ctx->image_id;
++                                     g_spu_atomic_put_hook(ea, MFC_ATOMIC_LINE); }
+         spu_taskset_line_committed(ea & ~127u);
+         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+         return 1;
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index a844e307..a255ec07 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -809,7 +809,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+          * buffer the RSX is actually bound to. The GCM layer installs this to
+          * find the pushbuffer; NULL for every title that does not. */
+         { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+-          if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
++          extern SPU_THREAD_LOCAL int g_spu_put_img;   /* the hook's PUT came from this image (KZ2_PARK_WHO) */
++          if (g_spu_put_hook) { g_spu_put_img = spu->resident_ovl ? spu->resident_ovl : spu->image_id;
++                                g_spu_put_hook((uint32_t)ea, size); } }
+         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
+          * that touch the per-SPU lane counters. */
+         { extern uint32_t g_barrier_sync_watch;

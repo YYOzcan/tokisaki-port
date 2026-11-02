@@ -39,7 +39,10 @@ static const char* const kz2_native_default_on[] = {
  * again on The New Sun's recording (800/800). The other 34 post slots were never called in a recorded run: off unless
  * their flag is 1 or KZ2_NATIVE_JOB_POST=1. EdgeAnim's kernels (75, 76) and VertexJob's .bss clear (77) and memcpy
  * (78) on the A/B route's recording (464/464 over 29 slots, twice). */
-static const int kz2_native_play_recorded[] = { 0, 1, 2, 3, 4, 8, 23, 39, 52, 53, 55, 58, 59, 61, 64, 65,
+/* tokisaki: + 54 (VBlur 0x5EB0) and 60 (HBlur 0x6028), the "cov" variants -- never called in Pyrrhus's recordings,
+ * ~3 ms of SPU time a frame lifted at this port's Corinth River checkpoint; KZ2_NATIVE_CHECK (native_common.c) ran
+ * each against the lifted function on a copy of the local store in play: 1,048,576 calls each, 0 differing. */
+static const int kz2_native_play_recorded[] = { 0, 1, 2, 3, 4, 8, 23, 39, 52, 53, 54, 55, 58, 59, 60, 61, 64, 65,
                                                 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78 };
 
 static inline int kz2_native_is_default_on(const char* flag)

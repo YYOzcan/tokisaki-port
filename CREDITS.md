@@ -103,6 +103,9 @@ and defaults (`KZ2_NATIVE_JOB_*`, `KZ2_NATIVE_JOB_POST`, `KZ2_NATIVE_REC`,
 modules as this port lifts them, and `tools/spu_native_gates.py` puts the gates
 into the lifted code as its `tools/spu/lift_spu.py` does.
 
+Its census of the 1.01 EBOOT's SPU jobs (`re/wws_jobs_v101.tsv`) gave this
+port's job modules their names (docs/PROGRESS.md 93); no file copied.
+
 ## Killzone 3 PC port — Project Helghast
 
 **[undecuple/project-helghast](https://github.com/undecuple/project-helghast)**

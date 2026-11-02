@@ -2567,3 +2567,55 @@ Also: `PS3_AUDIO_MUTE=1` (patch, `cellAudio.c`) hands the device silence while
 the title mixes and paces its sound as always; `tools/ab_builds.sh` and
 `tools/ab_env.sh` (the A/B runs, now in the repository) set it. cmake comes from
 `.venv` now (pip), linked into ~/.local/bin like ninja.
+
+## 93. What the RSX waits for: the particle and light-probe jobs
+
+**The job modules by name.** Project Pyrrhus's census of the 1.01 EBOOT
+(`re/wws_jobs_v101.tsv`, MIT) names every job by file offset; this port's
+extraction (`tools/extract_jobmods_elf.py`) prints the same offsets, so each
+module has its name: `e8a9d4ff3489` Physics.Raycast (Havok), `9935c8f700db`
+Anim.Skinning, `78f2ef397e8f` Gfx.Particles.VertexJob, `ed32af5be98e`
+Particles.UpdateJob, `eb2e6f096fdd` Gfx.LightProbes, `42b2d8393f1f`
+Gfx.Post.Unlock, `9de83b69cfa0` / `7eb6fb9f6647` Snd.NextSynth / Snd.Reverb.
+
+**Where the FIFO thread's idle time goes.** `KZ2_PARK_WHO=1` (patch 0071):
+every 5 s, the time the walker spent parked on a jump to itself and which SPU
+image's write ended each park; `KZ2_PARK_LOG=<file>` writes every park
+(start, end, image; CLOCK_MONOTONIC), and `build/kzprof` now samples on that
+clock too (and `KZPROF_CALLER=1` records the word at the user stack pointer:
+who calls libc's memcpy). At Corinth River the walker is parked 14-23% of the
+time; the parks end on `78f2ef397e8f` Particles.VertexJob (~100 per 5 s,
+3-6 ms each) and `eb2e6f096fdd` LightProbes (~140, ~1.7 ms). During the
+particle parks the five lanes are 97% busy, and the particle job gets ~23% of
+them: Havok ray casts 15%, skinning 13%, the SPU runtime 28% (dispatch ~11%,
+DMA ~12%). The FIFO thread's own GPU waits are not on that path:
+`RSX_ASYNC_WB=1` again, three rounds, 38.55 against 39.28.
+
+**Parks woken by atomic writes** (patch 0071). Both jobs release their parks
+with an atomic line write (PUTLLC / PUTLLUC), which the DMA PUT hook never
+saw: every park ended at the walker's 1 ms timeout (753 waits per 5 s, all
+timed out). The atomic writes are told to the GCM layer now
+(`g_spu_atomic_put_hook`), a write that leaves the park word a jump to itself
+wakes nobody, and the wait reads the word after each wake and goes on for the
+rest of its time. `GCM_PARK_ATOMIC_WAKE=0` = DMA PUTs only.
+
+**Two more native blur kernels** (`native_flags.h`): Gfx.Post.VBlur 0x5EB0
+and HBlur 0x6028 (slots 54 and 60, the "cov" variants) were off in Pyrrhus,
+never called in its recordings, and ~3 ms of SPU time a frame lifted here.
+`KZ2_NATIVE_CHECK=<slots>` (new, `native_common.c`) runs the lifted function
+on a copy of the context and local store next to every native call of those
+slots and compares the local stores and kept registers (a difference is
+logged and the lifted result kept): 1,048,576 calls each, 0 differing. On by
+default now.
+
+With both: 39.60 / 40.37 / 38.95 against 38.34 / 38.59 / 38.80 (the play
+build), 0 stops; frame dumps alike.
+
+Tried, not kept:
+- **The job modules' computed branches through the fast dispatcher**
+  (`spu_indirect_branch_mt` for `jobmod_*`, and on top a per-site cache of
+  the last target): 37.29 / 36.88 and 38.41 / 37.59 against 39.51 / 38.12 and
+  38.89 / 38.52 -- but the profile shows why: the audio job modules (e0080)
+  fell into the SPU interpreter (`spu_step`, one thread 29% -> 82%). Redo for
+  the e0030 job modules on policy-mode contexts only, with a switch.
+- `KZ2_DRAIN_US=250`: 39.03 against 38.82 (noise).
