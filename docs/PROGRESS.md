@@ -2786,3 +2786,11 @@ float slow path on the lanes: 2.26 -> 1.58 ms a frame (`fix2` 0.56 -> 0.00).
 With patch 0074, four rounds against the play build (stable-2026-11-03a):
 44.49 / 42.11 / 44.39 / 43.23 against 42.61 / 43.52 / 43.58 / 44.09 -- the
 same rate for less lane CPU; frame dumps alike.
+
+Patch 0077 adds fma's share: a result past 2^128 with a zero term (product or
+addend) is exact in a double and takes `spu__xv_ext` too (slow path 1.58 ->
+1.47 ms of lane CPU a frame). The test gains products on a 24-bit boundary
+less a term far below them, where a round-to-nearest sum lands back on the
+boundary; under the test's (and the game's) round-toward-zero MXCSR that
+cannot happen, so the zero-term guard is for threads that still round to
+nearest -- a mutation dropping it passes the test, as it should.

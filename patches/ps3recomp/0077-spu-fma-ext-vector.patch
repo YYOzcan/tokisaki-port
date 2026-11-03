@@ -1,0 +1,44 @@
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 9ef7ef92..38d6128b 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -1065,7 +1065,17 @@ static inline __attribute__((noinline)) __m128i spu__xv_fma_w(u128 a, u128 b, u1
+     const __m256d d = _mm256_add_pd(p, zz), bb = _mm256_sub_pd(d, p);
+     const __m256d err = _mm256_add_pd(_mm256_sub_pd(p, _mm256_sub_pd(d, bb)), _mm256_sub_pd(zz, bb));
+     __m128i ok;
+-    const __m128i r = spu__xv_trunc(d, &ok, &err);
++    __m128i r = spu__xv_trunc(d, &ok, &err);
++    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return r;
++    /* past 2^128 where d is exact whatever the rounding mode: one term zero
++     * (under the SPU mode's round toward zero any d would do, but this path
++     * also runs in threads still rounding to nearest) */
++    __m128i big;
++    const __m128i ext = spu__xv_ext(d, &big);
++    big = _mm_andnot_si128(ok, _mm_and_si128(big, _mm_or_si128(spu__xv_zero(z),
++                                                               _mm_or_si128(spu__xv_zero(x), spu__xv_zero(y)))));
++    r = _mm_blendv_epi8(r, ext, big);
++    ok = _mm_or_si128(ok, big);
+     if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return r;
+     return spu__xv_fix3(r, ok, a, b, c, negp, negc);
+ }
+diff --git a/runtime/spu/tests/test_spu_float_rz.c b/runtime/spu/tests/test_spu_float_rz.c
+index 0a3b663a..45aefc2e 100644
+--- a/runtime/spu/tests/test_spu_float_rz.c
++++ b/runtime/spu/tests/test_spu_float_rz.c
+@@ -49,6 +49,16 @@ int main(void)
+         /* close magnitudes stress cancellation in fa/fs and fma */
+         if (it % 7 == 0) for (int i = 0; i < 4; i++) b._u32[i] = (a._u32[i] ^ 0x80000000u) + (rnd32() & 0xFF);
+         if (it % 11 == 0) for (int i = 0; i < 4; i++) c._u32[i] = (rnd32() & 1u) ? 0x80000000u : 0u;
++        /* a product on a 24-bit boundary (b a power of two) less a term far
++         * below it: the exact result truncates one unit lower, the double sum
++         * rounds back onto the boundary -- also past 2^128 */
++        if (it % 13 == 0) for (int i = 0; i < 4; i++) {
++            b._u32[i] &= 0xFF800000u;
++            const int ea = (int)((a._u32[i] >> 23) & 0xFF), eb = (int)((b._u32[i] >> 23) & 0xFF);
++            int ec = ea + eb - 127 - 20 - (int)(rnd32() % 50);
++            ec = ec < 1 ? 1 : ec > 255 ? 255 : ec;
++            c._u32[i] = (~(a._u32[i] ^ b._u32[i]) & 0x80000000u) | ((uint32_t)ec << 23) | (rnd32() & 0x7FFFFFu);
++        }
+         const int op = (int)(it % 6);
+         switch (op) {
+         case 0: got = spu_fa(a, b);      ref = spu_fa_ref(a, b); break;
