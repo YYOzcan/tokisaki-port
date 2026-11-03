@@ -2763,3 +2763,26 @@ is submitted -- and runs at ~0.9-1.1 GHz in P2 (of 2.1 GHz, `nvidia-smi`,
 ~35% busy, 34 W): too little load for the driver to raise the clock. The
 user-level `nvidia-settings -a GpuPowerMizerMode=1` does not stay set under
 Wayland (it reads back 0); `nvidia-smi -lgc` needs root -- left to the user.
+
+## 97. SPU floats past 2^128, a vector at a time
+
+`SPU_FF_WHY=1` over a run: ~265 M lanes went through the per-lane exact path
+(`spu__xv_fix2` / `fix3`), ~2.6 M a second, nearly all of them "ext": fa / fm
+with an extended-range operand (biased exponent 255 -- Killzone 2's jobs use
+huge words as infinity sentinels) whose result is at or past 2^128, and fa of
+two terms 29 or more exponents apart. Both now resolve in the vector slow
+path (`spu_helpers.h`):
+- `spu__xv_ext`: where the double result is exact (fm always; fa when the
+  terms are fewer than 29 exponents apart, so 24 + 28 bits and a carry fit)
+  and |d| >= 2^128, the SPU single is the 24-bit truncation of |d| / 2^105 with
+  biased exponent 255, saturating to sign | 0x7FFFFFFF from 2^24 up --
+  spu__sf_pack's rule;
+- two nonzero terms 29 or more exponents apart: the larger word, one unit less
+  in magnitude when the signs differ (the smaller is below its last bit).
+`runtime/spu/tests/test_spu_float_rz.c`: 8 M random cases each with and
+without `SPU_FP_RZ_ASSUMED`, bit-identical to the scalar references; a wrong
+saturation constant fails 361,483 of them, dropping the unit 143,302. The
+float slow path on the lanes: 2.26 -> 1.58 ms a frame (`fix2` 0.56 -> 0.00).
+With patch 0074, four rounds against the play build (stable-2026-11-03a):
+44.49 / 42.11 / 44.39 / 43.23 against 42.61 / 43.52 / 43.58 / 44.09 -- the
+same rate for less lane CPU; frame dumps alike.

@@ -1,0 +1,77 @@
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 62081d26..9ef7ef92 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -986,6 +986,24 @@ SPU__XV_INLINE __m256d spu__xv_wide(__m128i x) {          /* x flushed */
+                                         _mm256_slli_epi64(_mm256_and_si256(v, _mm256_set1_epi64x(0x7FFFFF)), 29));
+     return _mm256_castsi256_pd(_mm256_or_si256(sign, _mm256_and_si256(nz, mag)));
+ }
++/* Lanes whose exact result d has |d| >= 2^128 -- the SPU's extended binade
++ * (biased exponent 255) or past it, where spu__sf_pack saturates to
++ * sign | 0x7FFFFFFF -- as SPU singles, a vector at a time: the 24-bit
++ * truncation of |d| / 2^105 (exact, a power of two) is the significand; 2^24
++ * or more saturates. *big marks them. Only for an exact d: the per-lane
++ * path did these one at a time, ~2.6 M lanes a second in Killzone 2 (fa / fm
++ * on "infinity" sentinels, SPU_FF_WHY's "ext"). */
++SPU__XV_INLINE __m128i spu__xv_ext(__m256d d, __m128i* big) {
++    const __m256d ad = _mm256_andnot_pd(_mm256_set1_pd(-0.0), d);
++    const __m256i b64 = _mm256_castpd_si256(_mm256_cmp_pd(ad, _mm256_set1_pd(0x1p128), _CMP_GE_OQ));
++    *big = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(b64, _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0)));
++    const __m128i m = _mm256_cvttpd_epi32(_mm256_min_pd(_mm256_mul_pd(ad, _mm256_set1_pd(0x1p-105)),
++                                                        _mm256_set1_pd(0x1p25)));
++    __m128i bits = _mm_or_si128(_mm_set1_epi32(0x7F800000), _mm_and_si128(m, _mm_set1_epi32(0x7FFFFF)));
++    bits = _mm_blendv_epi8(bits, _mm_set1_epi32(0x7FFFFFFF), _mm_cmpgt_epi32(m, _mm_set1_epi32(0xFFFFFF)));
++    const __m128i sign = _mm_and_si128(_mm_castps_si128(_mm256_cvtpd_ps(d)), _mm_set1_epi32((int)0x80000000u));
++    return _mm_or_si128(bits, sign);
++}
+ static inline __attribute__((noinline)) __m128i spu__xv_fa_w(u128 a, u128 b, uint32_t negb) {
+     const __m128i x = spu__xv_flush(spu__xv_ld(a));
+     const __m128i y = spu__xv_flush(_mm_xor_si128(spu__xv_ld(b), _mm_set1_epi32((int)negb)));
+@@ -995,16 +1013,45 @@ static inline __attribute__((noinline)) __m128i spu__xv_fa_w(u128 a, u128 b, uin
+                                      _mm_or_si128(spu__xv_zero(x), spu__xv_zero(y)));
+     const __m256d d = _mm256_add_pd(spu__xv_wide(x), spu__xv_wide(y));
+     __m128i ok;
+-    const __m128i r = spu__xv_trunc(d, &ok, NULL);
++    __m128i r = spu__xv_trunc(d, &ok, NULL);
+     ok = _mm_and_si128(ok, pre);
+     if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return r;
++    /* exact sums (gap < 29: 24 + 28 bits and a carry fit a double) past 2^128 */
++    __m128i big;
++    const __m128i ext = spu__xv_ext(d, &big);
++    big = _mm_andnot_si128(ok, _mm_and_si128(big, _mm_or_si128(_mm_cmpgt_epi32(_mm_set1_epi32(29), gap),
++                                                                 _mm_or_si128(spu__xv_zero(x), spu__xv_zero(y)))));
++    r = _mm_blendv_epi8(r, ext, big);
++    ok = _mm_or_si128(ok, big);
++    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return r;
++    /* two nonzero terms 29 or more exponents apart: the smaller is below the
++     * larger's last bit, so the truncated sum is the larger word, one unit
++     * less in magnitude when the signs differ */
++    {
++        const __m128i far = _mm_andnot_si128(_mm_or_si128(ok, _mm_or_si128(spu__xv_zero(x), spu__xv_zero(y))),
++                                             _mm_cmpgt_epi32(gap, _mm_set1_epi32(28)));
++        const __m128i xl = _mm_cmpgt_epi32(spu__xv_bexp(x), spu__xv_bexp(y));
++        const __m128i L = _mm_blendv_epi8(y, x, xl);
++        const __m128i diff = _mm_srli_epi32(_mm_xor_si128(x, y), 31);
++        const __m128i res = _mm_or_si128(_mm_and_si128(L, _mm_set1_epi32((int)0x80000000u)),
++                                         _mm_sub_epi32(_mm_and_si128(L, _mm_set1_epi32(0x7FFFFFFF)), diff));
++        r = _mm_blendv_epi8(r, res, far);
++        ok = _mm_or_si128(ok, far);
++        if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return r;
++    }
+     return spu__xv_fix2(r, ok, a, b, negb, 0);
+ }
+ static inline __attribute__((noinline)) __m128i spu__xv_fm_w(u128 a, u128 b) {
+     const __m128i x = spu__xv_flush(spu__xv_ld(a)), y = spu__xv_flush(spu__xv_ld(b));
+     const __m256d d = _mm256_mul_pd(spu__xv_wide(x), spu__xv_wide(y));     /* exact */
+     __m128i ok;
+-    const __m128i r = spu__xv_trunc(d, &ok, NULL);
++    __m128i r = spu__xv_trunc(d, &ok, NULL);
++    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return r;
++    __m128i big;                                       /* products past 2^128 (exact) */
++    const __m128i ext = spu__xv_ext(d, &big);
++    big = _mm_andnot_si128(ok, big);
++    r = _mm_blendv_epi8(r, ext, big);
++    ok = _mm_or_si128(ok, big);
+     if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) return r;
+     return spu__xv_fix2(r, ok, a, b, 0, 1);
+ }
