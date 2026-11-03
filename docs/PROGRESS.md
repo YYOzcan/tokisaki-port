@@ -2932,3 +2932,10 @@ Tried after it, not kept (the play build stays stable-2026-11-03e, ~45-47):
 - clang's `preserve_all` convention for the slow paths (so the caller need not
   keep vectors in memory around the rarely taken calls): the game stopped
   presenting frames (a drain-resume loop in image 100). Reverted at once.
+- The main thread's SPU progress wait sleeping on a futex that the SPU PUT
+  hooks (wrapped) wake when a write covers the counter block, 100 us at most
+  (`KZ2_SPIN_FUTEX=1` in the experiment): ~40% of the sleeps woke by a write,
+  the rest timed out -- and the run stopped presenting frames ~40 s into the
+  scripted run, at the same point as the `preserve_all` one (frame ~17.2 k);
+  play-build runs pass it. Reverted; that point may hold a race these timing
+  changes reach.
