@@ -2907,3 +2907,28 @@ Not kept: LightProbes 0x4178 (0.93 -> 1.01), EdgeAnim 0xFCF0 (0.27 -> 0.37),
 Raycast 0xE360 (its guard never holds: those addresses are not constant).
 Four rounds against stable-2026-11-03d: 44.16 / 45.66 / 45.20 / 46.49 against
 32.39 (a stall in that run) / 42.94 / 45.26 / 44.82.
+
+Tried after it, not kept (the play build stays stable-2026-11-03e, ~45-47):
+- `RSX_BE_THREAD=1` on this build: 46.07 / 47.75 / 45.72 / 47.43 against
+  47.68 / 46.52 / 47.28 / 47.89.
+- The float slow paths' operands as vectors (`__m128i`, passed in xmm
+  registers, instead of the u128 union, passed in two general registers):
+  the compiler had moved every fa/fm/fma operand into general registers ahead
+  of the test (vmovq + vpextrq, 163 in the skinning loop, 26 after) -- and the
+  loop took as long (7.40 ms).
+- frest/frsqest table lookups as four loads instead of `vpgatherdd` (the
+  hottest instructions in the skinning loop's samples): the same 7.47 ms --
+  sampling skid. `test_spu_helpers_x86.c` keeps a part from it (patch 0082):
+  the exhaustive frest/frsqest sweep puts four consecutive inputs in a vector,
+  which share their table index, so a lookup that mixed up lanes passed; 4 M
+  vectors of independent lanes now (a lane-swapping lookup fails 22 times).
+- How much the float tests cost there: the skinning copy with fa/fm/fma as the
+  bare SSE instruction (wrong for the extended range; measurement only) takes
+  4.52 ms instead of 7.47. Deferring the tests to one per loop iteration
+  (copy the registers the iteration reads before writing, run it with SSE
+  operations and its stores held back, rerun it exactly if any lane needed
+  the slow path; `SPU_CP_CHECK` 2.1 M calls, 0 differences) got 7.12-7.29:
+  the copies cost what the tests did.
+- clang's `preserve_all` convention for the slow paths (so the caller need not
+  keep vectors in memory around the rarely taken calls): the game stopped
+  presenting frames (a drain-resume loop in image 100). Reverted at once.

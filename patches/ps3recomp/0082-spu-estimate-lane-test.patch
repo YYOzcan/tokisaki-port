@@ -1,0 +1,17 @@
+diff --git a/runtime/spu/tests/test_spu_helpers_x86.c b/runtime/spu/tests/test_spu_helpers_x86.c
+index 2678f3c0..0bafdb58 100644
+--- a/runtime/spu/tests/test_spu_helpers_x86.c
++++ b/runtime/spu/tests/test_spu_helpers_x86.c
+@@ -67,6 +67,12 @@ int main(void)
+         C2(fcgt); C2(fceq); C2(fcmgt); C2(fcmeq);
+     }
+ #if defined(__AVX2__)
++    /* frest / frsqest, the lanes independent (below each vector holds four
++     * consecutive inputs, which share their table index) */
++    for (long it = 0; it < 4000000 && fails <= 20; it++) {
++        const u128 a = val(), b = {0};
++        C1(frest); C1(frsqest);
++    }
+     /* frest / frsqest: every 32-bit input, four lanes at a time */
+     for (uint64_t v = 0; v < (1ull << 32); v += 4) {
+         u128 a, b = {0};
