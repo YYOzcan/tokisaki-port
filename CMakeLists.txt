@@ -62,6 +62,14 @@ set(KZ2_ARCH "x86-64-v3" CACHE STRING "-march for the game and the runtime")
 if(KZ2_ARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     add_compile_options(-march=${KZ2_ARCH})
 endif()
+# Distribution compilers default to -fstack-protector-strong: a canary store
+# and check in every function with a local array -- the SPU dispatcher, the
+# DMA path and the vertex fetch among them, millions of calls a second.
+# KZ2_STACK_PROTECTOR=ON keeps the compiler's default.
+option(KZ2_STACK_PROTECTOR "Keep the compiler's default stack protector" OFF)
+if(NOT KZ2_STACK_PROTECTOR AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options(-fno-stack-protector)
+endif()
 
 if(NOT EXISTS "${PS3RECOMP_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "ps3recomp not found at ${PS3RECOMP_DIR}. "

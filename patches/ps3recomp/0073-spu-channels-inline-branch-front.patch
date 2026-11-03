@@ -1,0 +1,206 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 6d52181a..35939202 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1753,6 +1753,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+         ReleaseSRWLockExclusive(&si->lock);
+         extern unsigned long long ps3_ms_now(void);
+         const unsigned long long t_run = ps3_ms_now();
++        { extern SPU_THREAD_LOCAL int g_spurs_cur_wid; g_spurs_cur_wid = (int)slot->wid; }   /* SPURS_JOB_WID */
+         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
+                               slot->data, slot->wid, slot->ea, slot->spu_num);
+         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index d1f1bf03..1ae16881 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -938,6 +938,14 @@ static int channel_is_mfc(uint32_t ch)
+ /* ===========================================================================
+  * Channel write
+  * ===========================================================================*/
++/* spu_helpers.h's inline MFC parameter channels go through spu_wrch while a
++ * channel diagnostic watches every write. */
++int g_spu_wrch_slow;
++__attribute__((constructor)) static void spu_wrch_slow_init(void)
++{
++    g_spu_wrch_slow = getenv("SPU_CHHIST") != NULL;
++}
++
+ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+ {
+     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
+@@ -2299,6 +2307,22 @@ static int spu_smc_microstep(spu_context* ctx)
+     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+     const uint32_t entry_pc = pc;
+     for (int steps = 0; steps < 4096; steps++) {
++        /* The WWS stubs are runs of stqa / lqa, one per register (~2 M a
++         * second in Killzone 2's job lanes): those first, in a loop of their
++         * own, before the branch and other decodes below (the opcode classes
++         * are disjoint, so the order does not change what runs). */
++        for (; steps < 4096; steps++) {
++            uint32_t ws;
++            memcpy(&ws, ctx->ls + pc, 4);
++            ws = __builtin_bswap32(ws);
++            const uint32_t o9 = ws >> 23;
++            if (o9 != 0x041 && o9 != 0x061) break;
++            const uint32_t a = (((ws >> 7) & 0xFFFF) << 2) & SPU_LS_MASK & ~15u;
++            if (o9 == 0x041) spu_ls_write128(ctx, a, ctx->gpr[ws & 0x7F]);
++            else             ctx->gpr[ws & 0x7F] = spu_ls_read128(ctx, a);
++            pc = (pc + 4) & SPU_LS_MASK;
++        }
++        if (steps >= 4096) break;
+         uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
+                      ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
+         uint32_t op11 = w >> 21, op9 = w >> 23, op8 = w >> 24, op7 = w >> 25;
+@@ -2506,8 +2530,39 @@ static int spu_smc_microstep(spu_context* ctx)
+  * LS 0x4000) into the job area: the 16-byte header at the base where the
+  * resident module was seen, re-identified when it does not match.
+  * SPU_OVL_ENTRY_CHECK=0 skips it. */
++/* SPURS_JOB_WID=1 (default off): every 5 s, the job entries per (SPURS
++ * workload, job image) -- which workload runs which job module. */
++SPU_THREAD_LOCAL int g_spurs_cur_wid = -1;
++static void spu_job_wid_note(const spu_context* ctx)
++{
++    static int on = -1;
++    if (on < 0) on = getenv("SPURS_JOB_WID") ? 1 : 0;
++    if (!on) return;
++    enum { N = 128 };
++    static struct { int wid, img; unsigned long n; } t[N];
++    static unsigned long long t0;
++    static volatile long lock;
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    const unsigned long long now = (unsigned long long)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000;
++    while (__sync_lock_test_and_set(&lock, 1)) { }
++    const int img = ctx->resident_ovl, w = g_spurs_cur_wid;
++    int k = 0;
++    while (k < N - 1 && t[k].n && !(t[k].wid == w && t[k].img == img)) k++;
++    t[k].wid = w; t[k].img = img; t[k].n++;
++    if (!t0) t0 = now;
++    if (now - t0 >= 5000) {
++        t0 = now;
++        fprintf(stderr, "[job-wid]");
++        for (int i = 0; i < N && t[i].n; i++) fprintf(stderr, " w%d:img%d=%lu", t[i].wid, t[i].img, t[i].n);
++        fprintf(stderr, "\n");
++        memset(t, 0, sizeof t);
++    }
++    __sync_lock_release(&lock);
++}
++
+ void spu_overlay_check_entry(spu_context* ctx)
+ {
++    spu_job_wid_note(ctx);
+     static int on = -1;
+     if (on < 0) { const char* e = getenv("SPU_OVL_ENTRY_CHECK"); on = !(e && e[0] == '0'); }
+     if (!on) return;
+@@ -2525,7 +2580,72 @@ void spu_overlay_check_entry(spu_context* ctx)
+     if (img) ctx->resident_ovl = img;
+ }
+ 
++/* The common indirect branch, before the full resolver below sets up its
++ * frame: the full resolver answers it by calling the resident overlay's lift
++ * at the target, else the context image's (after its stack-reset check) --
++ * when none of what it checks first applies: the interrupt return (srr0 with
++ * interrupts on and registers saved), the taskset syscall address, on a SPURS
++ * policy-mode context the two kernel services (the policy module calling into
++ * the job area gets the overlay check first, as there), elsewhere the
++ * job-return address, a
++ * taskset task (none registered, none resident: below 0x3000 the full
++ * resolver only clears resident_task), a resident code span over the target,
++ * the resolver-only image. A diagnostic that wants to see every branch turns it
++ * off, as does SPU_IB_FAST=0. Its stack-reset check returns at once in policy
++ * mode. ~6.5 M branches a second in Killzone 2's jobs (Havok's ray casts call
++ * through function tables). */
++static void spu_indirect_branch_full(spu_context* ctx);
++static int s_ib_fast = -1;
++static void spu_ib_fast_init(void)
++{
++    const char* e = getenv("SPU_IB_FAST");
++    s_ib_fast = !(e && e[0] == '0') && !getenv("SPU_IBCOV") && !getenv("SPU_POLLTRACE") &&
++                !getenv("YDKJ_POLTRACE") && !getenv("LBP_HLE_JOBDONE") && !getenv("SPU_JOBEXEC") &&
++                !getenv("SPU_IRQTRACE") && !getenv("SPURS_PM_TRACE");
++}
+ void spu_indirect_branch(spu_context* ctx)
++{
++    if (__builtin_expect(s_ib_fast < 0, 0)) spu_ib_fast_init();
++    const uint32_t pc = ctx->pc & SPU_LS_MASK;
++    if (s_ib_fast && !ctx->resident_task && pc != SPURS_TASKSET_PM_SYSCALL_LS &&
++        !(ctx->irq_saved && ctx->int_enable && pc == (ctx->irq_resume_pc & SPU_LS_MASK)) &&
++        (ctx->policy_mode
++             ? pc != SPURS_PM_EXIT_TO_KERNEL_LS && pc != SPURS_PM_SELECT_WORKLOAD_LS
++             : pc != SPU_JOB_RETURN_LS) &&
++        ctx->image_id != SPU_RESOLVER_ONLY_IMAGE_ID && !s_task_entry_count && !s_task_elf_count) {
++        /* the policy module calling into the job area: its overlay check first, as below */
++        if (ctx->policy_mode && pc >= 0x4000u && pc < 0x3E000u &&
++            (ctx->gpr[0]._u32[0] & SPU_LS_MASK) < 0x4000u) {
++            ctx->pc = pc;
++            spu_overlay_check_entry(ctx);
++        }
++        int span = 0;
++        for (unsigned slot = 0; slot < 4; ++slot)
++            span |= ctx->resident_code[slot].image_id && pc >= ctx->resident_code[slot].lsa &&
++                    pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size;
++        if (!span) {
++            spu_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : NULL;
++            if (!fn) fn = spu_lookup(pc, ctx->image_id);
++            if (fn) {
++                ctx->pc = pc;
++                spu_check_stack_reset(ctx, fn);
++#if defined(__clang__)
++                __attribute__((musttail)) return fn(ctx);
++#else
++                fn(ctx);
++                return;
++#endif
++            }
++        }
++    }
++#if defined(__clang__)
++    __attribute__((musttail)) return spu_indirect_branch_full(ctx);
++#else
++    spu_indirect_branch_full(ctx);
++#endif
++}
++
++static __attribute__((noinline)) void spu_indirect_branch_full(spu_context* ctx)
+ {
+     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
+      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index fbcf0999..cc6202bd 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -2149,4 +2149,34 @@ static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
+  * redirects come last so nothing above them changes). */
+ #include "spu_helpers_x86.h"
+ 
++
++/* The MFC parameter channels, inline, for the lifted code: a DMA is eight
++ * channel writes -- LSA, EAH, EAL, Size, TagID, Cmd, WrTagMask, WrTagUpdate --
++ * and the first five and the tag mask only store a value in the context, but
++ * each went through spu_wrch's checks, an engine lookup and a switch (~3 M
++ * DMAs a second in Killzone 2's jobs). The command and the tag update still
++ * take spu_wrch, which does their work; so does every channel while a channel
++ * diagnostic (SPU_CHHIST) wants to see each write (g_spu_wrch_slow, spu_channels.c). */
++#if defined(SPU_USE_DISPATCH_MT) && !defined(SPU_WRCH_NO_INLINE)
++void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
++extern int g_spu_wrch_slow;
++static inline __attribute__((always_inline)) void spu_wrch_inl(spu_context* ctx, uint32_t channel, u128 value)
++{
++    if (__builtin_constant_p(channel) && __builtin_expect(!g_spu_wrch_slow, 1)) {
++        const uint32_t v = value._u32[0];
++        switch (channel) {
++        case MFC_LSA:       ctx->mfc_lsa = v; return;
++        case MFC_EAH:       ctx->mfc_eah = v; return;
++        case MFC_EAL:       ctx->mfc_eal = v; return;
++        case MFC_Size:      ctx->mfc_size = v; return;
++        case MFC_TagID:     ctx->mfc_tag = v & 0x1F; return;
++        case MFC_WrTagMask: ctx->mfc_tag_mask = v; return;
++        default: break;
++        }
++    }
++    spu_wrch(ctx, channel, value);
++}
++#define spu_wrch(c, ch, v) spu_wrch_inl((c), (ch), (v))
++#endif
++
+ #endif /* SPU_HELPERS_H */

@@ -2667,3 +2667,56 @@ Tried, not kept: `PS3RECOMP_VK_ASYNC_OPS` 48 and 96 (a batch submitted every
 48 / 96 operations instead of 192, so a readback waits for less): 38.39 /
 38.65 and 38.49 / 37.70 against 40.09 -- the submits cost more than the
 shorter waits give.
+
+## 95. The SPU lanes: channel writes inline, the common branch before the resolver
+
+Where the RSX waits (section 93) the five lanes are ~97% busy, and the SPU
+runtime is ~28% of that. `SPURS_JOB_WID=1` (new): every 5 s the job entries
+per (workload, job image) -- workload 3 runs Anim.Skinning,
+Particles.VertexJob, Gfx.LightProbes and Gfx.DecalUpdate, 4
+Particles.UpdateJob, 5 Havok's ray casts, 7 the post-processing passes; with
+the default `SPURS_MAXCONT` each may take six SPUs. A sixth SPURS worker for
+the five-SPU instance (an experiment, not kept) made the parks longer
+(LightProbes 1.7 -> 2.6 ms): the machine has no idle core to give it.
+
+- **The MFC parameter channels inline** (`spu_helpers.h`, the lifted code
+  only): `SPU_CHHIST` counted ~16 M channel writes a second -- ~3 M DMAs,
+  each eight writes (LSA, EAH, EAL, Size, TagID, Cmd, WrTagMask,
+  WrTagUpdate), six of which only store a value in the context. Those six are
+  stores now; the command and the tag update still go through `spu_wrch`, and
+  every write does while a channel diagnostic watches (`g_spu_wrch_slow`).
+  `spu_wrch` + `mfc_channel_write` + `mfc_for` 6.6 -> 3.0 ms of lane CPU a
+  frame. Four alternating rounds against the play build: 41.43 / 43.76 /
+  39.84 / 41.87 against 39.45 / 40.27 / 40.61 / 39.44, 0 stops.
+- **The common indirect branch before the full resolver**
+  (`spu_indirect_branch`, now a small front of `spu_indirect_branch_full`):
+  the full resolver answers most branches by calling the resident overlay's
+  lift, else the image's, after a 0x248-byte frame and a page of checks.
+  When none of what it checks first applies (the interrupt return at srr0,
+  the kernel services and the taskset syscall address, the job-return
+  address off policy mode, a taskset task, a resident code span, the
+  resolver-only image) the front does just that (the policy module calling
+  into the job area gets its overlay check first, as there). Counted
+  (`SPU_IB_FAST_STATS`, a one-off): of ~350 M branches a run ~15 M still go
+  the full way, most of them to LS 0x3FEC0 -- the WWS job manager's
+  register save/restore stub, written at run time, which the resolver
+  interprets (`spu_smc_microstep`): its runs of stqa / lqa now go through a
+  loop of their own before the other decodes. `SPU_IB_FAST=0` = before.
+  Dispatch on the lanes 4.41 -> 2.12 ms a frame.
+- **No stack protector** (CMake `KZ2_STACK_PROTECTOR=OFF`, the default now):
+  the distribution's clang adds `-fstack-protector-strong`, a canary store and
+  check in every function with a local array (the dispatcher, the DMA path,
+  the vertex fetch).
+
+The branch front, the stub loop and no stack protector, against the inline
+channels alone, four rounds: 42.59 / 44.46 / 44.94 / 43.97 against 43.72 /
+43.81 / 42.83 / 41.27, 0 stops; frame dumps alike. From the play build of
+section 94 (39.4-40.4) to ~44.
+
+Also: `tools/kzprof_thread.py` (the hottest symbols of a thread or of the
+five lanes in a kzprof dump, ms a frame). Tried, not kept: the lifted
+functions' context parameter `__restrict` (the skinning loop compiles to the
+same 5,637 instructions: its stores are register pressure, not aliasing); the
+particle module through `tools/spu_regcache.py` (6.2 -> 7.5 ms of lane CPU a
+frame: loading every register at the entry of a function called 20,000 times
+a frame).
