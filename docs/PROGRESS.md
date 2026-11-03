@@ -2819,3 +2819,18 @@ it during the wait: 46.33 / 45.29 / 44.96 / 44.81 against 45.29 / 45.46 /
 stall in four runs, unlike the earlier submit-when-idle attempt.
 `PS3RECOMP_VK_ASYNC_OPS=384` (larger batches): 45.99 / 46.13 / 43.70 against
 44.82 / 45.65 / 45.00 -- noise.
+
+## 99. Toward 60: what bounds the frame now
+
+`KZ2_RSX_TIMES=1` at ~46 frames/s: the FIFO thread is never idle for want
+of commands (fifo empty 0%); it drains 88% of the time (GPU waits 14 points of
+that) and is parked on SPU jobs ~10%. So the FIFO thread is the frame: ~16 ms
+of CPU, ~3 ms of GPU waits, ~2 ms of parks a frame against 16.7 ms for 60.
+
+Tried, not kept:
+- `RSX_ASYNC_WB=1` again: 46.34 / 44.74 / 45.34 / 45.06 against 44.74 /
+  45.34 / 45.83 / 45.97.
+- Large vertex fetches cut across helper threads (`rsx_vertex_fetch_all`):
+  helpers spinning for work kept two cores 67% busy and slowed the lanes;
+  sleeping on a futex, the wake costs what a fetch of 64 KB saves (fetch +
+  wait 1.54 -> 1.68 ms a frame at a 64 KB threshold, 1.34 at 256 KB).
