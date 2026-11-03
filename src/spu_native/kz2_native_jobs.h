@@ -87,9 +87,15 @@ int kz2_native_run(spu_context* ctx, const kz2_native_entry* e);
  * `[native] slot N calls=C fallback=F` at 1024 calls and every power of two after. */
 extern volatile long g_kz2_native_calls[KZ2_NATIVE_SLOTS], g_kz2_native_fallback[KZ2_NATIVE_SLOTS];
 void kz2_native_count_print(int slot, long calls);
+/* tokisaki: counted per thread and added to the shared count 1,024 at a time -- the shared counters sit in a few
+ * cache lines, and with the lanes calling native slots ~10^5 times a frame every call's atomic add moved one of
+ * them between cores. The print still fires as the shared count passes 1024 and every power of two after. */
 static inline void kz2_native_count(int slot)
 {
-    const long c = __atomic_add_fetch(&g_kz2_native_calls[slot], 1, __ATOMIC_RELAXED);
+    static __thread unsigned t_pending[KZ2_NATIVE_SLOTS];
+    if (__builtin_expect(++t_pending[slot] < 1024u, 1)) return;
+    t_pending[slot] = 0;
+    const long c = __atomic_add_fetch(&g_kz2_native_calls[slot], 1024, __ATOMIC_RELAXED);
     if (__builtin_expect(c >= 1024 && !(c & (c - 1)), 0)) kz2_native_count_print(slot, c);
 }
 

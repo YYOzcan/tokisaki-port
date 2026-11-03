@@ -2720,3 +2720,36 @@ same 5,637 instructions: its stores are register pressure, not aliasing); the
 particle module through `tools/spu_regcache.py` (6.2 -> 7.5 ms of lane CPU a
 frame: loading every register at the entry of a function called 20,000 times
 a frame).
+
+## 96. Small SPU runtime costs; what did not hold
+
+At ~44 frames/s the FIFO thread's frame is ~15.7 ms of CPU, ~3.2 ms of GPU
+waits (four readbacks of ~0.8 ms) and ~4.6 ms parked, the parks ended by
+Particles.VertexJob (3.4 ms each) and LightProbes (1.4 ms). The lanes:
+~80 ms of CPU a frame, 24 of it the SPU runtime.
+
+Kept (patch 0074 and `src/spu_native/kz2_native_jobs.h`; each removes work
+the profile shows, none moves the frame rate beyond the runs' spread --
+4 rounds 43.59 against 43.83):
+- native gate calls counted per thread, added to the shared count 1,024 at a
+  time (`kz2_native_run` 0.56 -> 0.12 ms of lane CPU a frame: the counters'
+  cache lines moved between the lanes on every call);
+- the SPU float slow path asks `SPU_FF_WHY` inline before calling its
+  diagnostic (0.24 ms of empty calls);
+- the branch front tests the stack-reset check's own first condition inline
+  (0.28 ms);
+- a DMA PUT asks the coherency bitmap whether any of its lines is reserved
+  in one scan (`spu_coh_span_reserved`) instead of one out-of-line call per
+  128-byte line, twice (`spu_coh_is_reserved` 0.36 -> 0.02 ms).
+
+Tried, not kept:
+- `SPURS_PRIORITY=1` with workload 3 (the render jobs the RSX waits for) at
+  priority 1: 43.04 against 43.59; priorities alone 43.95.
+- Submitting a batch whenever the GPU has finished the last one
+  (`PS3RECOMP_VK_IDLE_SUBMIT`, every 32 / 64 operations): +~0.5 frames/s, but
+  two of eight runs with it froze at the level start (FIFO stopped, no
+  error), none of the runs without -- a latent ordering bug it exposes. Removed.
+- The overlay and image lookups of a branch as one probe of a 48 KB per-thread
+  table: the same time as the two probes of spu_lookup's 16 KB one.
+- No fence before the park check of an SPU PUT when no park is published:
+  43.34 against 44.29 with it.

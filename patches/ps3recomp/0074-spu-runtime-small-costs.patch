@@ -1,0 +1,105 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 1ae16881..37c031a6 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2628,7 +2628,8 @@ void spu_indirect_branch(spu_context* ctx)
+             if (!fn) fn = spu_lookup(pc, ctx->image_id);
+             if (fn) {
+                 ctx->pc = pc;
+-                spu_check_stack_reset(ctx, fn);
++                if (!ctx->policy_mode && ctx->host_depth)   /* its own first test, inline */
++                    spu_check_stack_reset(ctx, fn);
+ #if defined(__clang__)
+                 __attribute__((musttail)) return fn(ctx);
+ #else
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index a255ec07..ea944819 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -166,6 +166,23 @@ static inline int mfc_is_fence(uint32_t cmd)
+  * Execute a single DMA transfer between local store and main memory.
+  * Returns 0 on success, -1 on error.
+  */
++/* Is any 128-byte line of [a0, a1] reserved (spu_coherency.c's bitmap, the
++ * test spu_coh_is_reserved makes for one line)? A PUT asked it line by line,
++ * an out-of-line call each, twice: up to 129 calls a 16 KiB PUT. */
++static inline int spu_coh_span_reserved(uint32_t a0, uint32_t a1)
++{
++    extern unsigned char g_spu_coh_bitmap[];
++    extern int g_spu_coh_armed;
++    if (!g_spu_coh_armed) return 0;
++    const uint32_t l0 = a0 >> 7, l1 = a1 >> 7, b0 = l0 >> 3, b1 = l1 >> 3;
++    const unsigned lo_mask = 0xFFu << (l0 & 7), hi_mask = 0xFFu >> (7 - (l1 & 7));
++    if (b0 == b1) return (g_spu_coh_bitmap[b0] & lo_mask & hi_mask) != 0;
++    if (g_spu_coh_bitmap[b0] & lo_mask) return 1;
++    for (uint32_t b = b0 + 1; b < b1; b++)
++        if (g_spu_coh_bitmap[b]) return 1;
++    return (g_spu_coh_bitmap[b1] & hi_mask) != 0;
++}
++
+ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                    uint32_t size, uint32_t cmd)
+ {
+@@ -749,11 +766,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+             spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
+             uint32_t a0 = (uint32_t)ea & ~127u;
+             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
+-            int span_reserved = 0;
+-            for (uint32_t a = a0; ; a += 128u) {
+-                if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+-                if (a == a1) break;
+-            }
++            int span_reserved = a0 <= a1 ? spu_coh_span_reserved(a0, a1) : 0;
++            if (a0 > a1)                       /* wraps the 4 GiB space: line by line */
++                for (uint32_t a = a0; ; a += 128u) {
++                    if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
++                    if (a == a1) break;
++                }
+             /* Lines the unlocked pass left for the locked one: a 16 KiB
+              * transfer spans at most 129 lines. */
+             uint64_t locked_lines[3] = {0, 0, 0};
+@@ -791,6 +809,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                 spu_lockline_unlock();
+             } else {
+                 memcpy(ea_ptr, ls_ptr, size);
++                if (a0 > a1 || spu_coh_span_reserved(a0, a1))   /* reserved since the scan */
+                 for (uint32_t a = a0; ; a += 128u) {
+                     if (spu_coh_is_reserved(a)) {
+                         spu_lockline_lock();
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index cc6202bd..62081d26 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -906,6 +906,12 @@ SPU__XV_INLINE __m128i spu__xv_trunc(__m256d d, __m128i* ok, const __m256d* err)
+ /* SPU_FF_WHY=1: why lanes leave the fast path (diagnostic, cold path only):
+  * an operand that is a denormal (0) or extended-range (1), an fa/fs exponent
+  * gap (2), a result that is zero by underflow (3) or extended (4), else (5). */
++static inline int spu__xv_why_on(void)
++{
++    static int on = -1;
++    if (__builtin_expect(on < 0, 0)) { const char* e = getenv("SPU_FF_WHY"); on = (e && e[0] == '1'); }
++    return on;
++}
+ static __attribute__((noinline, cold, unused)) void spu__xv_why(int op, uint32_t x, uint32_t y, uint32_t z, uint32_t res)
+ {
+     static int on = -1;
+@@ -945,7 +951,8 @@ static inline __attribute__((noinline, cold)) __m128i spu__xv_fix2(__m128i r, __
+         if (!m._u32[i]) {
+             out._u32[i] = mul ? spu__fm_any(a._u32[i], b._u32[i])
+                               : spu__fa_any(a._u32[i], b._u32[i] ^ negb);
+-            spu__xv_why(mul ? 1 : 0, a._u32[i], b._u32[i] ^ negb, 0, out._u32[i]);
++            if (__builtin_expect(spu__xv_why_on(), 0))   /* SPU_FF_WHY: the call only when on */
++                spu__xv_why(mul ? 1 : 0, a._u32[i], b._u32[i] ^ negb, 0, out._u32[i]);
+         }
+     return spu__xv_ld(out);
+ }
+@@ -955,7 +962,8 @@ static inline __attribute__((noinline, cold)) __m128i spu__xv_fix3(__m128i r, __
+     for (int i = 0; i < 4; i++)
+         if (!m._u32[i]) {
+             out._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], negp, negc);
+-            spu__xv_why(2, a._u32[i], b._u32[i], c._u32[i], out._u32[i]);
++            if (__builtin_expect(spu__xv_why_on(), 0))
++                spu__xv_why(2, a._u32[i], b._u32[i], c._u32[i], out._u32[i]);
+         }
+     return spu__xv_ld(out);
+ }
