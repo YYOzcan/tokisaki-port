@@ -2881,3 +2881,29 @@ the hop and calls f as a clang `musttail` call; otherwise the trampoline.
 SPU lane CPU 76.8 -> 72.5 ms a frame, `spu_drain_call` 2.65 -> 0.90 ms.
 Four rounds against stable-2026-11-03c: 45.83 / 44.02 / 45.83 / 44.53 against
 45.84 / 39.96 / 43.36 / 42.61; frame dumps alike, 0 stops.
+
+## 101. SPU loops specialised on their constant pool
+
+Anim.Skinning's main loop (`9935c8f700db` 0x54C0, the largest single SPU
+function, ~9.7 ms of lane CPU a frame) is a software-pipelined loop of 234
+instructions: 64 `shufb`, 84 float operations. Its shuffle controls and scale
+factors are loaded from the module's constant pool once, before the loop --
+into `ctx->gpr`, memory the compiler cannot see through across local-store
+stores, so every shufb recomputes its byte indices and tests for special
+selectors each iteration. `tools/spu_constpool.py` (a `tools/lift_spu.sh`
+step over `tools/spu_constpool.tsv`) makes a copy of such a function with
+its registers as C locals (`tools/spu_regpromote.py`'s rewrite) and each
+fixed-address load before its first label replaced by the quadword the
+module image holds there; the function becomes a guard that runs the copy
+when the local store holds those quadwords (compared at entry, before any is
+read) and the original otherwise. `SPU_CP_CHECK=1` (`spu_drain.c`, patch
+0081) runs both on copies for the functions that only touch registers and
+the local store, and compares registers, pc, pending branch and all 256 KB:
+2.1 M calls, 0 differences; a copy with one control byte changed differs on
+every call.
+Kept where faster (kzprof, lane ms a frame): Skinning 0x54C0 9.67 -> 7.43,
+0x5B10 0.79 -> 0.60, 0x50C0 0.45 -> 0.36, `4226a46a9315` 0x4A20 0.66 -> 0.53.
+Not kept: LightProbes 0x4178 (0.93 -> 1.01), EdgeAnim 0xFCF0 (0.27 -> 0.37),
+Raycast 0xE360 (its guard never holds: those addresses are not constant).
+Four rounds against stable-2026-11-03d: 44.16 / 45.66 / 45.20 / 46.49 against
+32.39 (a stall in that run) / 42.94 / 45.26 / 44.82.

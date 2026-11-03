@@ -1,0 +1,66 @@
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 0753c8db..5a78f28d 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -857,6 +857,14 @@ static inline __attribute__((always_inline)) void spu_hop_check(spu_context* ctx
+  * the pc 0 job end -- it calls f in place of returning to the loop (a tail
+  * call: no host stack grows), counting the hop as the loop does. Otherwise,
+  * and with SPU_TAILJ=0, the trampoline as before. */
++/* tools/spu_constpool.py's specialised copies, checked against the original (spu_drain.c) */
++extern int g_spu_cp_check;
++void spu_cp_verify(spu_context* ctx, void (*ref)(spu_context*), void (*fast)(spu_context*), const char* name);
++static inline int spu_cp_check_on(void)
++{
++    if (__builtin_expect(g_spu_cp_check < 0, 0)) { const char* e = getenv("SPU_CP_CHECK"); g_spu_cp_check = e && e[0] == '1'; }
++    return g_spu_cp_check;
++}
+ extern int g_spu_tailj_on;
+ int spu_tailj_enabled(void);
+ static inline __attribute__((always_inline)) int spu_tailj_ok(spu_context* ctx)
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 02f04d45..459685d4 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -434,6 +434,42 @@ void spu_depth_guard(spu_context* ctx)
+     { extern void spu_halt(spu_context*); spu_halt(ctx); }
+ }
+ 
++/* SPU_CP_CHECK=1 (default off): a function tools/spu_constpool.py specialised
++ * runs as the original on a copy of the context and local store and as the
++ * copy on the real ones, and the two are compared -- registers, pc, the
++ * pending branch, all 256 KB -- every call (only for functions that touch
++ * nothing else: no channels, no calls). Differences are counted and the first
++ * few logged; the original's result is kept. */
++int g_spu_cp_check = -1;
++void spu_cp_verify(spu_context* ctx, void (*ref)(spu_context*), void (*fast)(spu_context*), const char* name)
++{
++    static unsigned long long calls, differ;
++    spu_context* c2 = (spu_context*)malloc(sizeof *c2);
++    uint8_t* ls2 = (uint8_t*)malloc(SPU_LS_SIZE);
++    if (!c2 || !ls2) { free(c2); free(ls2); ref(ctx); return; }
++    memcpy(c2, ctx, sizeof *c2);
++    const int own = ctx->ls == ctx->ls_store;
++    memcpy(ls2, ctx->ls, SPU_LS_SIZE);
++    c2->ls = own ? c2->ls_store : ls2;
++    void (*tr0)(spu_context*) = g_spu_trampoline_fn;
++    fast(c2);
++    void (*tr_fast)(spu_context*) = g_spu_trampoline_fn;
++    g_spu_trampoline_fn = tr0;
++    ref(ctx);
++    const int bad = memcmp(c2->gpr, ctx->gpr, sizeof ctx->gpr) || c2->pc != ctx->pc ||
++                    tr_fast != g_spu_trampoline_fn || memcmp(c2->ls, ctx->ls, SPU_LS_SIZE);
++    calls++; differ += bad;
++    if (bad && differ <= 8) {
++        int r = 0; while (r < 128 && !memcmp(&c2->gpr[r], &ctx->gpr[r], 16)) r++;
++        int b = 0; while (b < SPU_LS_SIZE && c2->ls[b] == ctx->ls[b]) b++;
++        fprintf(stderr, "[spu-cp] %s differs: first register r%d, first LS byte 0x%05X, pc %05X/%05X\n",
++                name, r, b, c2->pc, ctx->pc);
++    }
++    if ((calls & (calls - 1)) == 0 && calls >= 1024)
++        fprintf(stderr, "[spu-cp] %llu checked calls, %llu differ\n", calls, differ);
++    free(ls2); free(c2);
++}
++
+ /* See spu_context.h (SPU_TAILJ). SPU_TAILJ=0 (default 1): every direct
+  * branch between lifted functions goes back through the trampoline. */
+ int g_spu_tailj_on = -1;

@@ -1,0 +1,8 @@
+# tools/spu_constpool.py targets: lifted SPU loop functions specialised on their
+# job module's constant pool (module, LS base of the image, function address).
+# Each entry measured (kzprof, lane ms a frame): kept only where the copy is faster.
+# module	base	function	note
+9935c8f700db_e0030	0x4000	0x54C0	Anim.Skinning main loop: 9.67 -> 7.43
+9935c8f700db_e0030	0x4000	0x5B10	Anim.Skinning: 0.79 -> 0.60
+9935c8f700db_e0030	0x4000	0x50C0	Anim.Skinning: 0.45 -> 0.36
+4226a46a9315_e0030	0x4000	0x4A20	0.66 -> 0.53
