@@ -2939,3 +2939,21 @@ Tried after it, not kept (the play build stays stable-2026-11-03e, ~45-47):
   scripted run, at the same point as the `preserve_all` one (frame ~17.2 k);
   play-build runs pass it. Reverted; that point may hold a race these timing
   changes reach.
+- The vertex cache's sampled hashing from 4 KB spans instead of 16 KB: 5.27
+  -> 3.45 MB a frame hashed whole, `vc_hash` the same 1.3 ms of the FIFO
+  thread (its time is not in the long spans).
+- With the draw engine rendering, the legacy RSX state machine
+  (`rsx_process_method`, its upload paths) fed only the label and semaphore
+  methods: the game presented 2 frames. Something still reads that state.
+
+Where the SPURS lanes' ~71 ms a frame go now (kzprof, by symbol): job code 34,
+DMA and its hooks 14 (of it memcpy 4.6: `SPU_DMA_RANGE` over everything shows
+~2.9 GB/s got and ~0.74 GB/s put, ~80 MB a frame -- the copies are the data),
+lifted dispatch 5.6, the WWS policy module 5.4, atomics 2.2, channels 1.6,
+float slow paths 1.6, native kernels 1.75. The main thread: 12 ms a frame,
+1.6 of it the SPU progress spin, the rest spread over thousands of lifted
+functions.
+- The progress spin sleeping 20 us between passes after 4,096
+  (`KZ2_SPIN_SLEEP_US=20`): 44.46 / 46.01 / 44.59 / 45.49 against 46.63 /
+  46.32 / 46.09 / 46.01. The main thread's wait is on the frame's path: how
+  soon it sees the SPU's progress matters more than the core it spins on.
