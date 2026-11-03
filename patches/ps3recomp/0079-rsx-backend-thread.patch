@@ -1,0 +1,722 @@
+diff --git a/libs/video/rsx_be_thread.c b/libs/video/rsx_be_thread.c
+new file mode 100644
+index 00000000..72ad53ad
+--- /dev/null
++++ b/libs/video/rsx_be_thread.c
+@@ -0,0 +1,666 @@
++/* The draw engine's backend on a thread of its own (RSX_BE_THREAD).
++ *
++ * The FIFO thread walks the command stream, decodes state and vertices and
++ * calls the backend for every bind and draw -- and the backend records them
++ * into Vulkan command buffers, copies vertices, indices and constants into
++ * its ring and writes descriptor sets, ~3.5 ms of the FIFO thread a frame in
++ * Killzone 2. Here those calls go into a queue that a worker thread applies to
++ * the real backend in the same order, so the FIFO thread goes on decoding.
++ *
++ * A call that returns something (a handle, a readback, a ticket) or hands the
++ * backend memory it keeps (init, shutdown) waits until the worker has applied
++ * everything queued before it, then runs on the calling thread: the backend
++ * never runs on two threads at once. Every pointer argument of a queued call is
++ * copied into the queue; bind_vs_constants_ref's block, which the backend reads
++ * until the next bind, goes into a buffer the worker owns.
++ *
++ * RSX_BE_THREAD=1 (default 0): the worker. RSX_BE_THREAD=2: every call made
++ * directly, counted. RSX_BE_THREAD_STATS=1 (with either): every 5 s, how many
++ * calls of each kind and how many waits for the worker. */
++#include "rsx_draw_engine.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#if defined(__linux__)
++#include <pthread.h>
++#include <linux/futex.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#define BE_THREAD_OK 1
++#endif
++
++enum {
++    OP_WRAP = 1, OP_TEX_UPLOAD, OP_TEX_RELEASE, OP_CT_RELEASE, OP_CT_WRITE, OP_DT_RELEASE,
++    OP_PIPE_RELEASE, OP_BIND_TARGETS, OP_BIND_PIPELINE, OP_BIND_VSC, OP_BIND_PSC, OP_BIND_TEX,
++    OP_BIND_VTEX, OP_VIEWPORT, OP_SCISSOR, OP_STENCIL_REF, OP_DEPTH_BOUNDS, OP_DRAW, OP_DRAW_CACHED,
++    OP_CLEAR_COLOR, OP_CLEAR_DS, OP_PRESENT, OP_BIND_VSC_REF, OP_DRAW_CACHED_REF, OP_VSC_DELTA,
++    /* direct calls, counted only */
++    OP_INIT, OP_SHUTDOWN, OP_SUBMIT_WAIT, OP_TEX_CREATE, OP_CT_CREATE, OP_SURFACE_VIEW, OP_DT_CREATE,
++    OP_DEPTH_SNAPSHOT, OP_PIPE_CREATE, OP_READBACK, OP_DEPTH_READBACK, OP_COLOR_SNAPSHOT,
++    OP_REINTERPRET, OP_RB_ASYNC, OP_RB_RESULT, OP_RB_RELEASE, OP_N
++};
++static const char* const s_op_name[OP_N] = {
++    [OP_TEX_UPLOAD] = "tex_upload", [OP_TEX_RELEASE] = "tex_release", [OP_CT_RELEASE] = "ct_release",
++    [OP_CT_WRITE] = "ct_write", [OP_DT_RELEASE] = "dt_release", [OP_PIPE_RELEASE] = "pipe_release",
++    [OP_BIND_TARGETS] = "bind_targets", [OP_BIND_PIPELINE] = "bind_pipeline", [OP_BIND_VSC] = "bind_vsc",
++    [OP_BIND_PSC] = "bind_psc", [OP_BIND_TEX] = "bind_tex", [OP_BIND_VTEX] = "bind_vtex",
++    [OP_VIEWPORT] = "viewport", [OP_SCISSOR] = "scissor", [OP_STENCIL_REF] = "stencil_ref",
++    [OP_DEPTH_BOUNDS] = "depth_bounds", [OP_DRAW] = "draw", [OP_DRAW_CACHED] = "draw_cached",
++    [OP_CLEAR_COLOR] = "clear_color", [OP_CLEAR_DS] = "clear_ds", [OP_PRESENT] = "present",
++    [OP_BIND_VSC_REF] = "bind_vsc_ref", [OP_DRAW_CACHED_REF] = "draw_cached_ref", [OP_VSC_DELTA] = "vsc_delta", [OP_INIT] = "init", [OP_SHUTDOWN] = "shutdown",
++    [OP_SUBMIT_WAIT] = "submit_wait", [OP_TEX_CREATE] = "tex_create", [OP_CT_CREATE] = "ct_create",
++    [OP_SURFACE_VIEW] = "surface_view", [OP_DT_CREATE] = "dt_create", [OP_DEPTH_SNAPSHOT] = "depth_snapshot",
++    [OP_PIPE_CREATE] = "pipe_create", [OP_READBACK] = "readback", [OP_DEPTH_READBACK] = "depth_readback",
++    [OP_COLOR_SNAPSHOT] = "color_snapshot", [OP_REINTERPRET] = "reinterpret", [OP_RB_ASYNC] = "rb_async",
++    [OP_RB_RESULT] = "rb_result", [OP_RB_RELEASE] = "rb_release",
++};
++
++static const rsx_draw_backend* s_in;     /* the real backend */
++static rsx_draw_backend s_proxy;
++static int s_mode;                        /* 1 worker, 2 counting */
++static int s_stats;
++static unsigned long long s_n[OP_N], s_nb[OP_N], s_bytes, s_syncs, s_sync_ns, s_t0;
++
++static unsigned long long be_now_ns(void)
++{
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
++}
++
++static void be_count(int op)
++{
++    s_n[op]++;
++    if (!s_stats) return;
++    const unsigned long long now = be_now_ns();
++    if (!s_t0) s_t0 = now;
++    if (now - s_t0 < 5000000000ull) return;
++    fprintf(stderr, "[be-thread] %.1f s: %.1f MB queued, %llu waits for the worker (%.1f ms);",
++            (now - s_t0) / 1e9, s_bytes / 1048576.0, s_syncs, s_sync_ns / 1e6);
++    for (int i = 0; i < OP_N; i++)
++        if (s_n[i]) fprintf(stderr, s_nb[i] ? " %s %llu (%.1f MB)" : " %s %llu", s_op_name[i] ? s_op_name[i] : "?", s_n[i],
++                            s_nb[i] / 1048576.0);
++    fprintf(stderr, "\n");
++    memset(s_n, 0, sizeof s_n);
++    memset(s_nb, 0, sizeof s_nb);
++    s_bytes = s_syncs = s_sync_ns = 0;
++    s_t0 = now;
++}
++
++#ifdef BE_THREAD_OK
++/* ---- the queue: one producer (the engine's thread), one consumer -------- */
++#define Q_BYTES (64u << 20)
++typedef struct { u32 op, len; } q_hdr;    /* len: the whole entry, 16-byte multiple */
++static u8* s_q;
++static u64 s_head, s_tail;                /* atomics; bytes consumed / produced */
++static u32 s_worker_sleeping, s_prod_waiting;
++static u32 s_wseq, s_pseq;                /* futex words */
++static u64 s_tail_local;                  /* the producer's unpublished end */
++
++static void q_wake_worker(void)
++{
++    __atomic_add_fetch(&s_wseq, 1u, __ATOMIC_SEQ_CST);
++    if (__atomic_load_n(&s_worker_sleeping, __ATOMIC_SEQ_CST))
++        syscall(SYS_futex, &s_wseq, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
++}
++
++/* Wait until the worker has consumed up to `pos`. */
++static void q_wake_worker(void);
++static void q_wait_consumed(u64 pos)
++{
++    if (__atomic_load_n(&s_head, __ATOMIC_ACQUIRE) < pos) q_wake_worker();
++    for (int spin = 0; __atomic_load_n(&s_head, __ATOMIC_ACQUIRE) < pos; ) {
++        if (++spin < 4000) { __builtin_ia32_pause(); continue; }
++        const u32 seq = __atomic_load_n(&s_pseq, __ATOMIC_SEQ_CST);
++        __atomic_store_n(&s_prod_waiting, 1u, __ATOMIC_SEQ_CST);
++        if (__atomic_load_n(&s_head, __ATOMIC_SEQ_CST) < pos) {
++            struct timespec ts = { 0, 1000000 };
++            syscall(SYS_futex, &s_pseq, FUTEX_WAIT_PRIVATE, seq, &ts, NULL, 0);
++        }
++        __atomic_store_n(&s_prod_waiting, 0u, __ATOMIC_SEQ_CST);
++        spin = 0;
++    }
++}
++
++/* Room for an entry of `len` bytes (header included); returns where it goes. */
++static q_hdr* q_alloc(u32 op, u32 len)
++{
++    len = (len + 15u) & ~15u;
++    u64 at = s_tail_local;
++    const u32 off = (u32)(at & (Q_BYTES - 1u));
++    if (off + len > Q_BYTES) {                     /* no room before the end: pad to it */
++        const u32 pad = Q_BYTES - off;
++        if (at + pad > Q_BYTES) q_wait_consumed(at + pad - Q_BYTES);
++        q_hdr* w = (q_hdr*)(s_q + off);
++        w->op = OP_WRAP; w->len = pad;
++        at += pad;
++    }
++    if (at + len > Q_BYTES) q_wait_consumed(at + len - Q_BYTES);   /* its bytes free */
++    q_hdr* h = (q_hdr*)(s_q + (u32)(at & (Q_BYTES - 1u)));
++    h->op = op; h->len = len;
++    s_tail_local = at + len;
++    s_bytes += len;
++    s_nb[op] += len;
++    return h;
++}
++
++/* The worker sleeps when the queue is empty and is woken every few draws
++ * (RSX_BE_THREAD_WAKE, default 4) and before a wait for it: a wake per call
++ * was a system call per bind, and a worker spinning for work slowed the SPU
++ * lanes on its core's other hardware thread. */
++static u32 s_wake_every = 4, s_since_wake;
++static void q_publish(void)
++{
++    __atomic_store_n(&s_tail, s_tail_local, __ATOMIC_RELEASE);
++}
++static void q_publish_draw(void)
++{
++    __atomic_store_n(&s_tail, s_tail_local, __ATOMIC_RELEASE);
++    if (++s_since_wake >= s_wake_every) { s_since_wake = 0; q_wake_worker(); }
++}
++
++/* Everything queued applied: the backend is the caller's until the next queued call. */
++static void q_sync(void)
++{
++    if (__atomic_load_n(&s_head, __ATOMIC_ACQUIRE) == s_tail_local) return;
++    const unsigned long long t0 = s_stats ? be_now_ns() : 0;
++    q_publish();
++    s_since_wake = 0;
++    q_wake_worker();
++    q_wait_consumed(s_tail_local);
++    s_syncs++;
++    if (s_stats) s_sync_ns += be_now_ns() - t0;
++}
++
++/* entry layouts: the header, the arguments, then any copied bytes */
++typedef struct { q_hdr h; u32 a[8]; } e_u32;
++typedef struct { q_hdr h; u32 texture, face, mip, w, h_, row_bytes, rows; } e_upload;
++typedef struct { q_hdr h; u32 surface, x, y, w, h_, row_bytes; } e_ctwrite;
++typedef struct { q_hdr h; u32 count, depth; u32 surfaces[RSX_BE_MAX_COLOR_TARGETS]; } e_targets;
++typedef struct { q_hdr h; u32 bytes; } e_bytes;
++typedef struct { q_hdr h; u32 mask, has_samplers, n; u32 tex[RSX_BE_MAX_TEXTURES];
++                 rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES]; } e_tex;
++typedef struct { q_hdr h; float f[4]; } e_f4;
++typedef struct { q_hdr h; u32 topology, vertex_count, stride, index_count, has_indices; u64 key; } e_draw;
++typedef struct { q_hdr h; u32 topology, vertex_count, stride, index_count, has_indices; u64 key; const void* vertices; } e_draw_ref;
++typedef struct { q_hdr h; u32 prefix, tail_bytes, total, n_runs; u8 tail[64]; } e_vsc_delta;   /* runs: {u32 off, len} then bytes */
++typedef struct { q_hdr h; u32 surface; float rgba[4]; } e_clear;
++typedef struct { q_hdr h; u32 depth, flags; float value; u8 stencil; } e_clear_ds;
++typedef struct { q_hdr h; u32 prefix, tail_bytes, total; u8 tail[64]; } e_vsc_ref;
++
++#define PAYLOAD(e) ((u8*)(e) + ((sizeof *(e) + 15u) & ~(size_t)15u))
++#define ENTRY(T, op, extra) ((T*)q_alloc((op), (u32)(((sizeof(T) + 15u) & ~15u) + (extra))))
++
++static u8 s_vsc_buf[64 * 1024];           /* the worker's copy of a by-reference VS block */
++
++static void be_apply(const q_hdr* h)
++{
++    const rsx_draw_backend* b = s_in;
++    void* u = b->user;
++    switch (h->op) {
++    case OP_TEX_UPLOAD: { const e_upload* e = (const e_upload*)h;
++        b->texture_upload(u, e->texture, e->face, e->mip, e->w, e->h_, PAYLOAD(e), e->row_bytes, e->rows); break; }
++    case OP_TEX_RELEASE:  b->texture_release(u, ((const e_u32*)h)->a[0]); break;
++    case OP_CT_RELEASE:   b->color_target_release(u, ((const e_u32*)h)->a[0]); break;
++    case OP_DT_RELEASE:   b->depth_target_release(u, ((const e_u32*)h)->a[0]); break;
++    case OP_PIPE_RELEASE: b->pipeline_release(u, ((const e_u32*)h)->a[0]); break;
++    case OP_CT_WRITE: { const e_ctwrite* e = (const e_ctwrite*)h;
++        b->color_target_write(u, e->surface, e->x, e->y, e->w, e->h_, PAYLOAD(e), e->row_bytes); break; }
++    case OP_BIND_TARGETS: { const e_targets* e = (const e_targets*)h;
++        b->bind_targets(u, e->surfaces, e->count, e->depth); break; }
++    case OP_BIND_PIPELINE: b->bind_pipeline(u, ((const e_u32*)h)->a[0]); break;
++    case OP_BIND_VSC: { const e_bytes* e = (const e_bytes*)h;
++        b->bind_vs_constants(u, e->bytes ? PAYLOAD(e) : NULL, e->bytes); break; }
++    case OP_BIND_PSC: { const e_bytes* e = (const e_bytes*)h;
++        b->bind_ps_constants(u, e->bytes ? PAYLOAD(e) : NULL, e->bytes); break; }
++    case OP_BIND_VSC_REF: { const e_vsc_ref* e = (const e_vsc_ref*)h;
++        memcpy(s_vsc_buf, PAYLOAD(e), e->prefix);
++        b->bind_vs_constants_ref(u, s_vsc_buf, e->prefix, e->tail, e->tail_bytes, e->total); break; }
++    case OP_BIND_TEX: case OP_BIND_VTEX: { const e_tex* e = (const e_tex*)h;
++        (h->op == OP_BIND_TEX ? b->bind_textures : b->bind_vertex_textures)
++            (u, e->tex, e->has_samplers ? e->samp : NULL, e->mask); break; }
++    case OP_VIEWPORT: { const e_f4* e = (const e_f4*)h; b->set_viewport(u, e->f[0], e->f[1], e->f[2], e->f[3]); break; }
++    case OP_SCISSOR: { const e_u32* e = (const e_u32*)h; b->set_scissor(u, e->a[0], e->a[1], e->a[2], e->a[3]); break; }
++    case OP_STENCIL_REF: b->set_stencil_ref(u, ((const e_u32*)h)->a[0]); break;
++    case OP_DEPTH_BOUNDS: { const e_f4* e = (const e_f4*)h; b->set_depth_bounds(u, e->f[0], e->f[1]); break; }
++    case OP_DRAW: case OP_DRAW_CACHED: { const e_draw* e = (const e_draw*)h;
++        const u8* v = PAYLOAD(e);
++        const u32* ix = e->has_indices ? (const u32*)(v + (((size_t)e->vertex_count * e->stride + 15u) & ~(size_t)15u)) : NULL;
++        if (h->op == OP_DRAW) b->draw(u, (rsx_topology)e->topology, v, e->vertex_count, e->stride, ix, e->index_count);
++        else b->draw_cached(u, (rsx_topology)e->topology, e->key, v, e->vertex_count, e->stride, ix, e->index_count);
++        break; }
++    case OP_DRAW_CACHED_REF: { const e_draw_ref* e = (const e_draw_ref*)h;
++        b->draw_cached(u, (rsx_topology)e->topology, e->key, e->vertices, e->vertex_count, e->stride,
++                       e->has_indices ? (const u32*)PAYLOAD(e) : NULL, e->index_count);
++        break; }
++    case OP_VSC_DELTA: { const e_vsc_delta* e = (const e_vsc_delta*)h;
++        const u8* p = PAYLOAD(e);
++        for (u32 r = 0; r < e->n_runs; r++) {
++            u32 off, len; memcpy(&off, p, 4); memcpy(&len, p + 4, 4); p += 8;
++            memcpy(s_vsc_buf + off, p, len); p += len;
++        }
++        b->bind_vs_constants_ref(u, s_vsc_buf, e->prefix, e->tail, e->tail_bytes, e->total); break; }
++    case OP_CLEAR_COLOR: { const e_clear* e = (const e_clear*)h; b->clear_color(u, e->surface, e->rgba); break; }
++    case OP_CLEAR_DS: { const e_clear_ds* e = (const e_clear_ds*)h;
++        b->clear_depth_stencil(u, e->depth, e->flags, e->value, e->stencil); break; }
++    case OP_PRESENT: b->present(u, ((const e_u32*)h)->a[0]); break;
++    default: break;
++    }
++}
++
++static void* be_worker(void* arg)
++{
++    (void)arg;
++    u64 head = 0;
++    for (;;) {
++        u64 tail;
++        for (int spin = 0; (tail = __atomic_load_n(&s_tail, __ATOMIC_ACQUIRE)) == head; ) {
++            if (++spin < 64) { __builtin_ia32_pause(); continue; }
++            const u32 seq = __atomic_load_n(&s_wseq, __ATOMIC_SEQ_CST);
++            __atomic_store_n(&s_worker_sleeping, 1u, __ATOMIC_SEQ_CST);
++            if (__atomic_load_n(&s_tail, __ATOMIC_SEQ_CST) == head)
++                syscall(SYS_futex, &s_wseq, FUTEX_WAIT_PRIVATE, seq, NULL, NULL, 0);
++            __atomic_store_n(&s_worker_sleeping, 0u, __ATOMIC_SEQ_CST);
++            spin = 0;
++        }
++        while (head < tail) {
++            const q_hdr* h = (const q_hdr*)(s_q + (u32)(head & (Q_BYTES - 1u)));
++            be_apply(h);
++            head += h->len;
++            __atomic_store_n(&s_head, head, __ATOMIC_RELEASE);
++            if (__atomic_load_n(&s_prod_waiting, __ATOMIC_SEQ_CST)) {
++                __atomic_add_fetch(&s_pseq, 1u, __ATOMIC_SEQ_CST);
++                syscall(SYS_futex, &s_pseq, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
++            }
++        }
++    }
++    return NULL;
++}
++
++#define SYNC() do { if (s_mode == 1) q_sync(); } while (0)
++#define QUEUED (s_mode == 1)
++#define Q_MAX_ENTRY (Q_BYTES / 4u)      /* larger: made directly */
++#else
++#define Q_MAX_ENTRY 0
++#define SYNC() do { } while (0)
++#define QUEUED 0
++#endif
++
++/* ---- the proxy's entry points ------------------------------------------- */
++
++static int p_init(void* u, u32 w, u32 h) { (void)u; be_count(OP_INIT); SYNC(); return s_in->init(s_in->user, w, h); }
++static void p_shutdown(void* u) { (void)u; be_count(OP_SHUTDOWN); SYNC(); s_in->shutdown(s_in->user); }
++static void p_submit_and_wait(void* u, u32 reason) { (void)u; be_count(OP_SUBMIT_WAIT); SYNC(); s_in->submit_and_wait(s_in->user, reason); }
++static u32 p_texture_create(void* u, rsx_be_format fmt, u32 w, u32 h, u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
++{ (void)u; be_count(OP_TEX_CREATE); SYNC(); return s_in->texture_create(s_in->user, fmt, w, h, mips, faces, remap, rsx_fmt); }
++static u32 p_color_target_create(void* u, rsx_be_format fmt, u32 w, u32 h, const void* seed, u32 seed_row_bytes)
++{ (void)u; be_count(OP_CT_CREATE); SYNC(); return s_in->color_target_create(s_in->user, fmt, w, h, seed, seed_row_bytes); }
++/* surface_view returns the one view the backend keeps per (surface, crossbar,
++ * format): remembered here, so asking again does not wait for the worker.
++ * Forgotten when its surface or the view itself is released. */
++#define SV_N 256u
++static struct { u32 surface, remap, fmt, view; } s_sv[SV_N];
++static u32 s_sv_next;
++static void sv_forget(u32 handle)
++{
++    for (u32 i = 0; i < SV_N; i++)
++        if (s_sv[i].view && (s_sv[i].surface == handle || s_sv[i].view == handle)) s_sv[i].view = 0;
++}
++static u32 p_surface_view(void* u, u32 surface, u32 remap, u32 rsx_format)
++{
++    (void)u; be_count(OP_SURFACE_VIEW);
++    if (s_mode == 1)
++        for (u32 i = 0; i < SV_N; i++)
++            if (s_sv[i].view && s_sv[i].surface == surface && s_sv[i].remap == remap && s_sv[i].fmt == rsx_format)
++                return s_sv[i].view;
++    SYNC();
++    const u32 v = s_in->surface_view(s_in->user, surface, remap, rsx_format);
++    if (s_mode == 1 && v) {
++        s_sv[s_sv_next].surface = surface; s_sv[s_sv_next].remap = remap;
++        s_sv[s_sv_next].fmt = rsx_format; s_sv[s_sv_next].view = v;
++        s_sv_next = (s_sv_next + 1u) % SV_N;
++    }
++    return v;
++}
++static u32 p_depth_target_create(void* u, u32 w, u32 h) { (void)u; be_count(OP_DT_CREATE); SYNC(); return s_in->depth_target_create(s_in->user, w, h); }
++static u32 p_depth_snapshot(void* u, u32 depth, u32 w, u32 h)
++{ (void)u; be_count(OP_DEPTH_SNAPSHOT); SYNC(); return s_in->depth_snapshot(s_in->user, depth, w, h); }
++static u32 p_pipeline_create(void* u, const char* vs, const char* ps, const rsx_be_render_state* rs,
++                             const rsx_vertex_layout_plan* layout, u32 stride, rsx_be_format rt_fmt, u32 rt_count)
++{ (void)u; be_count(OP_PIPE_CREATE); SYNC(); return s_in->pipeline_create(s_in->user, vs, ps, rs, layout, stride, rt_fmt, rt_count); }
++static void p_readback(void* u, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch)
++{ (void)u; be_count(OP_READBACK); SYNC(); s_in->readback(s_in->user, surface, x, y, w, h, out, out_pitch); }
++static int p_depth_readback(void* u, u32 depth, u32 x, u32 y, u32 w, u32 h, float* out, u32 out_pitch)
++{ (void)u; be_count(OP_DEPTH_READBACK); SYNC(); return s_in->depth_readback(s_in->user, depth, x, y, w, h, out, out_pitch); }
++static u32 p_color_snapshot(void* u, u32 surface) { (void)u; be_count(OP_COLOR_SNAPSHOT); SYNC(); return s_in->color_snapshot(s_in->user, surface); }
++static u32 p_reinterpret(void* u, u32 kind, u32 src, u32 w, u32 h, u32 dst, u32 remap, u32 rsx_fmt)
++{ (void)u; be_count(OP_REINTERPRET); SYNC(); return s_in->reinterpret(s_in->user, kind, src, w, h, dst, remap, rsx_fmt); }
++static u64 p_readback_async(void* u, u32 target, int depth, u32 x, u32 y, u32 w, u32 h)
++{ (void)u; be_count(OP_RB_ASYNC); SYNC(); return s_in->readback_async(s_in->user, target, depth, x, y, w, h); }
++static const void* p_readback_result(void* u, u64 ticket, int wait)
++{ (void)u; be_count(OP_RB_RESULT); SYNC(); return s_in->readback_result(s_in->user, ticket, wait); }
++static void p_readback_release(void* u, u64 ticket) { (void)u; be_count(OP_RB_RELEASE); SYNC(); s_in->readback_release(s_in->user, ticket); }
++
++static void p_texture_upload(void* u, u32 texture, u32 face, u32 mip, u32 w, u32 h, const void* src, u32 row_bytes, u32 rows)
++{
++    (void)u; be_count(OP_TEX_UPLOAD);
++    if (QUEUED && src && (size_t)row_bytes * rows <= Q_MAX_ENTRY) {
++#ifdef BE_THREAD_OK
++        const size_t n = (size_t)row_bytes * rows;
++        e_upload* e = ENTRY(e_upload, OP_TEX_UPLOAD, n);
++        e->texture = texture; e->face = face; e->mip = mip; e->w = w; e->h_ = h; e->row_bytes = row_bytes; e->rows = rows;
++        memcpy(PAYLOAD(e), src, n);
++        q_publish();
++        return;
++#endif
++    }
++    SYNC(); s_in->texture_upload(s_in->user, texture, face, mip, w, h, src, row_bytes, rows);
++}
++
++#ifdef BE_THREAD_OK
++#define Q_U32(OP, n_, ...) do { e_u32* e = ENTRY(e_u32, OP, 0); const u32 v_[] = { __VA_ARGS__ }; \
++    memcpy(e->a, v_, sizeof v_); q_publish(); } while (0)
++#else
++#define Q_U32(OP, n_, ...) do { } while (0)
++#endif
++
++static void p_texture_release(void* u, u32 t) { (void)u; be_count(OP_TEX_RELEASE); sv_forget(t); if (QUEUED) { Q_U32(OP_TEX_RELEASE, 1, t); return; } s_in->texture_release(s_in->user, t); }
++static void p_color_target_release(void* u, u32 t) { (void)u; be_count(OP_CT_RELEASE); sv_forget(t); if (QUEUED) { Q_U32(OP_CT_RELEASE, 1, t); return; } s_in->color_target_release(s_in->user, t); }
++static void p_depth_target_release(void* u, u32 t) { (void)u; be_count(OP_DT_RELEASE); sv_forget(t); if (QUEUED) { Q_U32(OP_DT_RELEASE, 1, t); return; } s_in->depth_target_release(s_in->user, t); }
++static void p_pipeline_release(void* u, u32 t) { (void)u; be_count(OP_PIPE_RELEASE); if (QUEUED) { Q_U32(OP_PIPE_RELEASE, 1, t); return; } s_in->pipeline_release(s_in->user, t); }
++static void p_bind_pipeline(void* u, u32 p) { (void)u; be_count(OP_BIND_PIPELINE); if (QUEUED) { Q_U32(OP_BIND_PIPELINE, 1, p); return; } s_in->bind_pipeline(s_in->user, p); }
++static void p_set_scissor(void* u, u32 x, u32 y, u32 w, u32 h) { (void)u; be_count(OP_SCISSOR); if (QUEUED) { Q_U32(OP_SCISSOR, 4, x, y, w, h); return; } s_in->set_scissor(s_in->user, x, y, w, h); }
++static void p_set_stencil_ref(void* u, u32 r) { (void)u; be_count(OP_STENCIL_REF); if (QUEUED) { Q_U32(OP_STENCIL_REF, 1, r); return; } s_in->set_stencil_ref(s_in->user, r); }
++static void p_present(void* u, u32 s) { (void)u; be_count(OP_PRESENT); if (QUEUED) { Q_U32(OP_PRESENT, 1, s); return; } s_in->present(s_in->user, s); }
++
++static void p_color_target_write(void* u, u32 surface, u32 x, u32 y, u32 w, u32 h, const void* rows, u32 row_bytes)
++{
++    (void)u; be_count(OP_CT_WRITE);
++    if (QUEUED && rows && (size_t)row_bytes * h <= Q_MAX_ENTRY) {
++#ifdef BE_THREAD_OK
++        const size_t n = (size_t)row_bytes * h;
++        e_ctwrite* e = ENTRY(e_ctwrite, OP_CT_WRITE, n);
++        e->surface = surface; e->x = x; e->y = y; e->w = w; e->h_ = h; e->row_bytes = row_bytes;
++        memcpy(PAYLOAD(e), rows, n);
++        q_publish();
++        return;
++#endif
++    }
++    SYNC(); s_in->color_target_write(s_in->user, surface, x, y, w, h, rows, row_bytes);
++}
++
++static void p_bind_targets(void* u, const u32* surfaces, u32 count, u32 depth)
++{
++    (void)u; be_count(OP_BIND_TARGETS);
++    if (QUEUED && count <= RSX_BE_MAX_COLOR_TARGETS) {
++#ifdef BE_THREAD_OK
++        e_targets* e = ENTRY(e_targets, OP_BIND_TARGETS, 0);
++        e->count = count; e->depth = depth;
++        if (count) memcpy(e->surfaces, surfaces, count * sizeof *surfaces);
++        q_publish();
++        return;
++#endif
++    }
++    SYNC(); s_in->bind_targets(s_in->user, surfaces, count, depth);
++}
++
++static void p_bind_consts(int op, const void* data, u32 bytes)
++{
++#ifdef BE_THREAD_OK
++    if (!data) bytes = 0;
++    e_bytes* e = ENTRY(e_bytes, op, bytes);
++    e->bytes = bytes;
++    if (bytes) memcpy(PAYLOAD(e), data, bytes);
++    q_publish();
++#else
++    (void)op; (void)data; (void)bytes;
++#endif
++}
++static void p_bind_vs_constants(void* u, const void* data, u32 bytes)
++{
++    (void)u; be_count(OP_BIND_VSC);
++    if (QUEUED && (!data || bytes <= 64u * 1024u)) { p_bind_consts(OP_BIND_VSC, data, bytes); return; }
++    SYNC(); s_in->bind_vs_constants(s_in->user, data, bytes);
++}
++static void p_bind_ps_constants(void* u, const void* data, u32 bytes)
++{
++    (void)u; be_count(OP_BIND_PSC);
++    if (QUEUED && (!data || bytes <= 64u * 1024u)) { p_bind_consts(OP_BIND_PSC, data, bytes); return; }
++    SYNC(); s_in->bind_ps_constants(s_in->user, data, bytes);
++}
++#ifdef BE_THREAD_OK
++/* What s_vsc_buf will hold once the worker has caught up: a bind sends only
++ * the 64-byte pieces of the block that differ from it (the engine binds the
++ * whole register-file prefix before every draw, a few constants changed). */
++static u8 s_vsc_shadow[sizeof s_vsc_buf];
++static int p_vsc_delta(const u8* c, u32 prefix, const void* tail, u32 tail_bytes, u32 total)
++{
++    u32 runs[2 * 256], n = 0, bytes = 0;
++    for (u32 off = 0; off < prefix; ) {
++        const u32 len = prefix - off < 64u ? prefix - off : 64u;
++        if (memcmp(c + off, s_vsc_shadow + off, len)) {
++            if (n && runs[2 * (n - 1)] + runs[2 * (n - 1) + 1] == off) runs[2 * (n - 1) + 1] += len;
++            else { if (n == 256) return 0; runs[2 * n] = off; runs[2 * n + 1] = len; n++; }
++            bytes += len;
++        }
++        off += len;
++    }
++    if (bytes > prefix / 2u) return 0;                     /* most of it: the whole block */
++    e_vsc_delta* e = ENTRY(e_vsc_delta, OP_VSC_DELTA, n * 8u + bytes);
++    e->prefix = prefix; e->tail_bytes = tail_bytes; e->total = total; e->n_runs = n;
++    memcpy(e->tail, tail, tail_bytes);
++    u8* p = PAYLOAD(e);
++    for (u32 r = 0; r < n; r++) {
++        const u32 off = runs[2 * r], len = runs[2 * r + 1];
++        memcpy(p, &off, 4); memcpy(p + 4, &len, 4); p += 8;
++        memcpy(p, c + off, len); memcpy(s_vsc_shadow + off, c + off, len); p += len;
++    }
++    q_publish();
++    return 1;
++}
++#endif
++static void p_bind_vs_constants_ref(void* u, const void* consts, u32 prefix, const void* tail, u32 tail_bytes, u32 total)
++{
++    (void)u; be_count(OP_BIND_VSC_REF);
++    if (QUEUED && consts && tail && prefix <= sizeof s_vsc_buf && tail_bytes <= 64u) {
++#ifdef BE_THREAD_OK
++        if (p_vsc_delta((const u8*)consts, prefix, tail, tail_bytes, total)) return;
++        memcpy(s_vsc_shadow, consts, prefix);
++        e_vsc_ref* e = ENTRY(e_vsc_ref, OP_BIND_VSC_REF, prefix);
++        e->prefix = prefix; e->tail_bytes = tail_bytes; e->total = total;
++        memcpy(e->tail, tail, tail_bytes);
++        memcpy(PAYLOAD(e), consts, prefix);
++        q_publish();
++        return;
++#endif
++    }
++    SYNC(); s_in->bind_vs_constants_ref(s_in->user, consts, prefix, tail, tail_bytes, total);
++}
++
++static void p_bind_tex(int op, const u32* textures, const rsx_be_sampler_desc* samplers, u32 mask, u32 n)
++{
++#ifdef BE_THREAD_OK
++    e_tex* e = ENTRY(e_tex, op, 0);
++    e->mask = mask; e->has_samplers = samplers != NULL; e->n = n;
++    memcpy(e->tex, textures, n * sizeof *textures);
++    if (samplers) memcpy(e->samp, samplers, n * sizeof *samplers);
++    q_publish();
++#else
++    (void)op; (void)textures; (void)samplers; (void)mask; (void)n;
++#endif
++}
++static void p_bind_textures(void* u, const u32* textures, const rsx_be_sampler_desc* samplers, u32 mask)
++{
++    (void)u; be_count(OP_BIND_TEX);
++    if (QUEUED && textures) { p_bind_tex(OP_BIND_TEX, textures, samplers, mask, RSX_BE_MAX_TEXTURES); return; }
++    SYNC(); s_in->bind_textures(s_in->user, textures, samplers, mask);
++}
++static void p_bind_vertex_textures(void* u, const u32* textures, const rsx_be_sampler_desc* samplers, u32 mask)
++{
++    (void)u; be_count(OP_BIND_VTEX);
++    if (QUEUED && textures && RSX_BE_MAX_VERTEX_TEXTURES <= RSX_BE_MAX_TEXTURES) {
++        p_bind_tex(OP_BIND_VTEX, textures, samplers, mask, RSX_BE_MAX_VERTEX_TEXTURES); return;
++    }
++    SYNC(); s_in->bind_vertex_textures(s_in->user, textures, samplers, mask);
++}
++
++static void p_set_viewport(void* u, float x, float y, float w, float h)
++{
++    (void)u; be_count(OP_VIEWPORT);
++#ifdef BE_THREAD_OK
++    if (QUEUED) { e_f4* e = ENTRY(e_f4, OP_VIEWPORT, 0); e->f[0] = x; e->f[1] = y; e->f[2] = w; e->f[3] = h; q_publish(); return; }
++#endif
++    s_in->set_viewport(s_in->user, x, y, w, h);
++}
++static void p_set_depth_bounds(void* u, float mn, float mx)
++{
++    (void)u; be_count(OP_DEPTH_BOUNDS);
++#ifdef BE_THREAD_OK
++    if (QUEUED) { e_f4* e = ENTRY(e_f4, OP_DEPTH_BOUNDS, 0); e->f[0] = mn; e->f[1] = mx; q_publish(); return; }
++#endif
++    s_in->set_depth_bounds(s_in->user, mn, mx);
++}
++
++static void p_draw_any(int op, rsx_topology topology, u64 key, const void* vertices, u32 vertex_count,
++                       u32 stride, const u32* indices, u32 index_count)
++{
++#ifdef BE_THREAD_OK
++    const size_t vb = vertices ? (((size_t)vertex_count * stride + 15u) & ~(size_t)15u) : 0;
++    const size_t ib = indices ? (size_t)index_count * 4u : 0;
++    e_draw* e = ENTRY(e_draw, op, vb + ib);
++    e->topology = (u32)topology; e->vertex_count = vertices ? vertex_count : 0; e->stride = stride;
++    e->index_count = index_count; e->has_indices = indices != NULL; e->key = key;
++    if (vertices) memcpy(PAYLOAD(e), vertices, (size_t)vertex_count * stride);
++    if (ib) memcpy(PAYLOAD(e) + vb, indices, ib);
++    q_publish_draw();
++#else
++    (void)op; (void)topology; (void)key; (void)vertices; (void)vertex_count; (void)stride; (void)indices; (void)index_count;
++#endif
++}
++static void p_draw(void* u, rsx_topology topology, const void* vertices, u32 vertex_count, u32 stride,
++                   const u32* indices, u32 index_count)
++{
++    (void)u; be_count(OP_DRAW);
++    if (QUEUED && vertices && (size_t)vertex_count * stride + (size_t)index_count * 4u <= Q_MAX_ENTRY) { p_draw_any(OP_DRAW, topology, 0, vertices, vertex_count, stride, indices, index_count); return; }
++    SYNC(); s_in->draw(s_in->user, topology, vertices, vertex_count, stride, indices, index_count);
++}
++static void p_draw_cached(void* u, rsx_topology topology, u64 key, const void* vertices, u32 vertex_count,
++                          u32 stride, const u32* indices, u32 index_count)
++{
++    (void)u; be_count(OP_DRAW_CACHED);
++#ifdef BE_THREAD_OK
++    /* the engine's vertex-cache copy, which it frees through rsx_be_thread_free:
++     * by reference, the indices copied */
++    if (QUEUED && vertices && (size_t)index_count * 4u <= Q_MAX_ENTRY) {
++        const size_t ib = indices ? (size_t)index_count * 4u : 0;
++        e_draw_ref* e = ENTRY(e_draw_ref, OP_DRAW_CACHED_REF, ib);
++        e->topology = (u32)topology; e->vertex_count = vertex_count; e->stride = stride;
++        e->index_count = index_count; e->has_indices = indices != NULL; e->key = key; e->vertices = vertices;
++        if (ib) memcpy(PAYLOAD(e), indices, ib);
++        q_publish_draw();
++        return;
++    }
++#endif
++    if (QUEUED && vertices && (size_t)vertex_count * stride + (size_t)index_count * 4u <= Q_MAX_ENTRY) { p_draw_any(OP_DRAW_CACHED, topology, key, vertices, vertex_count, stride, indices, index_count); return; }
++    SYNC(); s_in->draw_cached(s_in->user, topology, key, vertices, vertex_count, stride, indices, index_count);
++}
++
++static void p_clear_color(void* u, u32 surface, const float rgba[4])
++{
++    (void)u; be_count(OP_CLEAR_COLOR);
++#ifdef BE_THREAD_OK
++    if (QUEUED) { e_clear* e = ENTRY(e_clear, OP_CLEAR_COLOR, 0); e->surface = surface; memcpy(e->rgba, rgba, 16); q_publish(); return; }
++#endif
++    s_in->clear_color(s_in->user, surface, rgba);
++}
++static void p_clear_depth_stencil(void* u, u32 depth, u32 flags, float value, u8 stencil)
++{
++    (void)u; be_count(OP_CLEAR_DS);
++#ifdef BE_THREAD_OK
++    if (QUEUED) { e_clear_ds* e = ENTRY(e_clear_ds, OP_CLEAR_DS, 0); e->depth = depth; e->flags = flags; e->value = value; e->stencil = stencil; q_publish(); return; }
++#endif
++    s_in->clear_depth_stencil(s_in->user, depth, flags, value, stencil);
++}
++
++/* free() for memory a queued call may still point at (the engine's vertex
++ * cache copies, which draw_cached passes by reference): freed once the worker
++ * has gone past everything queued so far. */
++#ifdef BE_THREAD_OK
++static struct { void* p; u64 pos; }* s_dfree;
++static u32 s_dfree_n, s_dfree_cap;
++#endif
++void rsx_be_thread_free(void* p)
++{
++#ifdef BE_THREAD_OK
++    if (s_mode == 1) {
++        const u64 done = __atomic_load_n(&s_head, __ATOMIC_ACQUIRE);
++        u32 k = 0;
++        for (u32 i = 0; i < s_dfree_n; i++) {
++            if (s_dfree[i].pos <= done) free(s_dfree[i].p);
++            else s_dfree[k++] = s_dfree[i];
++        }
++        s_dfree_n = k;
++        if (!p) return;
++        if (s_tail_local <= done) { free(p); return; }
++        if (s_dfree_n == s_dfree_cap) {
++            const u32 nc = s_dfree_cap ? s_dfree_cap * 2u : 256u;
++            void* np = realloc(s_dfree, nc * sizeof *s_dfree);
++            if (!np) { q_sync(); free(p); return; }
++            s_dfree = np; s_dfree_cap = nc;
++        }
++        s_dfree[s_dfree_n].p = p; s_dfree[s_dfree_n].pos = s_tail_local; s_dfree_n++;
++        return;
++    }
++#endif
++    free(p);
++}
++
++/* Wait for the worker: for a caller outside the engine that is about to use
++ * the backend's state itself. */
++void rsx_be_thread_sync(void)
++{
++    SYNC();
++}
++
++const rsx_draw_backend* rsx_be_thread_wrap(const rsx_draw_backend* be)
++{
++    if (!be) return NULL;
++    const char* e = getenv("RSX_BE_THREAD");
++    int mode = e ? atoi(e) : 0;
++#ifndef BE_THREAD_OK
++    if (mode == 1) mode = 2;
++#endif
++    if (mode != 1 && mode != 2) return be;
++    s_stats = getenv("RSX_BE_THREAD_STATS") != NULL;
++    s_in = be;
++    s_proxy = *be;                     /* the plain fields (readback_ordered) as they are */
++    s_proxy.user = NULL;
++#define P(f) if (be->f) s_proxy.f = p_##f
++    P(init); P(shutdown); P(submit_and_wait); P(texture_create); P(texture_upload); P(texture_release);
++    P(color_target_create); P(color_target_release); P(color_target_write); P(surface_view);
++    P(depth_target_create); P(depth_target_release); P(depth_snapshot); P(pipeline_create);
++    P(pipeline_release); P(bind_targets); P(bind_pipeline); P(bind_vs_constants); P(bind_ps_constants);
++    P(bind_textures); P(bind_vertex_textures); P(set_viewport); P(set_scissor); P(set_stencil_ref);
++    P(set_depth_bounds); P(draw); P(clear_color); P(clear_depth_stencil); P(present); P(readback);
++    P(depth_readback); P(color_snapshot); P(reinterpret); P(draw_cached); P(readback_async);
++    P(readback_result); P(readback_release); P(bind_vs_constants_ref);
++#undef P
++#ifdef BE_THREAD_OK
++    if (mode == 1) {
++        s_q = (u8*)aligned_alloc(64, Q_BYTES);
++        pthread_t t;
++        if (!s_q || pthread_create(&t, NULL, be_worker, NULL)) {
++            fprintf(stderr, "[be-thread] no worker; calls stay on the engine's thread\n");
++            free(s_q); s_q = NULL;
++            mode = 2;
++        } else {
++            pthread_detach(t);
++        }
++    }
++#endif
++    s_mode = mode;
++    fprintf(stderr, "[be-thread] backend calls %s\n", mode == 1 ? "on a worker thread" : "direct, counted");
++    return &s_proxy;
++}
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 68a7db67..b452e889 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -2517,6 +2517,8 @@ static int dc_reserve_indices(u32 count)
+  * turns it off; RSX_VTX_CACHE_STATS=1 prints hits and misses every 600
+  * frames. */
+ #define ENG_VC_SLOTS 8192u
++/* a vertex-cache copy a queued draw_cached may still name (rsx_be_thread.c) */
++extern void rsx_be_thread_free(void* p);
+ #define ENG_VC_PROBE 8u
+ #define ENG_VC_AGE   120u
+ #define ENG_VC_MIN   16u           /* smaller draws: hashing costs what decoding does */
+@@ -2603,7 +2605,7 @@ static eng_vc_entry* eng_vc_find(u64 key)
+                                        (u32)(g.frames - victim->last_frame)))
+             victim = e;
+     }
+-    if (victim->verts) { s_vc_bytes -= (u64)victim->n * victim->stride; free(victim->verts); }
++    if (victim->verts) { s_vc_bytes -= (u64)victim->n * victim->stride; rsx_be_thread_free(victim->verts); }
+     memset(victim, 0, sizeof *victim);
+     victim->key = key;
+     victim->last_frame = g.frames;
+@@ -2618,7 +2620,7 @@ static void eng_vc_age(void)
+     for (u32 i = 0; i < ENG_VC_SLOTS; i++) {
+         eng_vc_entry* e = &s_vc[i];
+         if (e->key && (u32)(g.frames - e->last_frame) > ENG_VC_AGE) {
+-            if (e->verts) { s_vc_bytes -= (u64)e->n * e->stride; free(e->verts); }
++            if (e->verts) { s_vc_bytes -= (u64)e->n * e->stride; rsx_be_thread_free(e->verts); }
+             memset(e, 0, sizeof *e);
+         }
+     }
+@@ -2881,7 +2883,7 @@ have_refs:
+                 ce->full_frame = g.frames;
+                 if (full != ce->full) {
+                     s_vc_bytes -= (u64)ce->n * ce->stride;
+-                    free(ce->verts); ce->verts = NULL;
++                    rsx_be_thread_free(ce->verts); ce->verts = NULL;
+                     ce->full = full;
+                     s_vc_stale++;
+                 }
+@@ -4179,7 +4181,8 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+ 
+ void rsx_draw_engine_set_backend(const rsx_draw_backend* backend)
+ {
+-    g.be = backend;
++    extern const rsx_draw_backend* rsx_be_thread_wrap(const rsx_draw_backend* be);   /* rsx_be_thread.c */
++    g.be = rsx_be_thread_wrap(backend);
+ }
+ 
+ void rsx_draw_engine_set_default(int on)

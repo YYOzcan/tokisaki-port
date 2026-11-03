@@ -2834,3 +2834,31 @@ Tried, not kept:
   helpers spinning for work kept two cores 67% busy and slowed the lanes;
   sleeping on a futex, the wake costs what a fetch of 64 KB saves (fetch +
   wait 1.54 -> 1.68 ms a frame at a 64 KB threshold, 1.34 at 256 KB).
+
+**The draw engine's backend on a worker thread** (patch 0079, opt-in,
+`RSX_BE_THREAD=1`; `=2` counts calls only; `RSX_BE_THREAD_STATS=1` prints them,
+`libs/video/rsx_be_thread.c`). A proxy between the engine and the Vulkan
+backend queues every call that returns nothing (binds, draws, clears,
+uploads, releases, present), copying what its pointers name, and a worker
+applies them in order; a call that returns something waits for the worker
+and runs on the FIFO thread. Per frame ~1270 draws and ~107 such calls
+(surface_view 80, reinterpret 9, color snapshots 8, target creates 6,
+readbacks 4); surface_view's answers are remembered by the proxy (forgotten
+on release), cached draws pass the engine's vertex-cache copy by reference
+(the engine frees those through `rsx_be_thread_free`, after the worker has
+passed them), and the by-reference VS block goes as the 64-byte pieces that
+changed. 15 MB queued a frame.
+The FIFO thread's CPU falls (16.1 -> 14.6 ms a frame) -- and the frame does
+not: it now reaches the SPU parks earlier and waits there longer (parked
+10% -> 19-25%). Four rounds: 43.38 / 43.67 / 44.84 / 44.01 against 45.41 /
+44.90 / 45.15 / 44.04 (a worker spinning for work instead: 43.19 against
+45.11, the spin slowing the lanes on its core). **The frame is bound by the
+SPU job chain the FIFO parks on (Particles.VertexJob, LightProbes), not by the
+FIFO thread's CPU**; the worker stays off until that changes.
+
+Also tried: `tools/spu_regpromote.py` (not in the lift pipeline) rewrites a
+lifted function to keep the SPU registers it uses in C locals, stored back
+into ctx around calls and exits. Particles.VertexJob's per-particle function
+got slower (2.87 -> 4.87 ms a frame: every call copies ~90 registers in and
+out, and the union locals compile to scalar code); Anim.Skinning's loop
+function 9.3 -> 8.7 ms. Not applied.
