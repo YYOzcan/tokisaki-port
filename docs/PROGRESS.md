@@ -2811,3 +2811,9 @@ Not done: having the lifted code address `ctx->ls_store` (a fixed offset)
 instead of reloading `ctx->ls` after every store -- SPURS tasks run in place
 on their own buffers (`spu_context_init_ls`), so `ls` is not always
 `ls_store`.
+
+Tried, not kept: submitting the open GPU batch just before the FIFO thread
+waits on a park (`KZ2_PARK_SUBMIT=1` in the experiment), so the GPU would run
+it during the wait: 46.33 / 45.29 / 44.96 / 44.81 against 45.29 / 45.46 /
+45.91 / 44.61 -- no change (batches already go every 192 operations), and no
+stall in four runs, unlike the earlier submit-when-idle attempt.
