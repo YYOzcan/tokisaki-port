@@ -2957,3 +2957,17 @@ functions.
   (`KZ2_SPIN_SLEEP_US=20`): 44.46 / 46.01 / 44.59 / 45.49 against 46.63 /
   46.32 / 46.09 / 46.01. The main thread's wait is on the frame's path: how
   soon it sees the SPU's progress matters more than the core it spins on.
+- Constant-pool copies of EdgeAnim's 0xE558 / 0xECD8 / 0xFA98 and
+  `15e56deeec92` 0x44A0 (`SPU_CP_CHECK` 1 M calls, 0 differences): each slower
+  (0.20 -> 0.24, 0.09 -> 0.15, 0.09 -> 0.10, 0.11 -> 0.14 ms). The method pays
+  where shuffles with pool controls dominate (the skinning loops), not
+  elsewhere.
+
+**What the lanes do while the others wait** (kzprof's timestamps, 1 ms
+buckets): while the main thread spins on SPU progress (~1.5 s of 20), on
+average 2.1 of the 5 lanes are busy -- the post-processing chain (bloom,
+upsample, blur: the native kernels and their DMA, memcpy alone 16% of those
+lane samples) and EdgeAnim; a chain of dependent passes, not short of lanes.
+While the FIFO thread is parked or sleeping, 4.2 of 5 are busy (Raycast 18%,
+Skinning 13%, Particles.VertexJob 12%, ParticleUpdate 6%, LightProbes 4%,
+the runtime 35%).
