@@ -1,0 +1,60 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 916de672..25ecfdeb 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3185,6 +3185,33 @@ static void vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
+     vk_eng_upload_region(o->im.img, 0, 0, x, y, w, h, (size_t)w * o->bpp, h, rows, row_bytes);
+ }
+ 
++/* PS3RECOMP_VK_READBACK_STATS=1 (default off): every 5 s, the waiting
++ * readbacks by kind and size -- how many, their bytes, and the time each
++ * spent from its submit to the copy landing in host memory. */
++static void vk_rb_stat(int depth, u32 w, u32 h, u32 bpp, unsigned long long ns)
++{
++    static int on = -1;
++    if (on < 0) on = getenv("PS3RECOMP_VK_READBACK_STATS") ? 1 : 0;
++    if (!on) return;
++    static struct { int depth; u32 w, h, bpp; unsigned long long n, ns; } t[32];
++    static unsigned long long t0;
++    int k = 0;
++    while (k < 31 && t[k].n && !(t[k].depth == depth && t[k].w == w && t[k].h == h && t[k].bpp == bpp)) k++;
++    t[k].depth = depth; t[k].w = w; t[k].h = h; t[k].bpp = bpp; t[k].n++; t[k].ns += ns;
++    const unsigned long long now = vk_tns();
++    if (!t0) t0 = now;
++    if (now - t0 >= 5000000000ull) {
++        fprintf(stderr, "[vk-readback]");
++        for (int i = 0; i < 32 && t[i].n; i++)
++            fprintf(stderr, " %s %ux%u x%u: %llu (%.2f MB, %.3f ms each)", t[i].depth ? "depth" : "color",
++                    t[i].w, t[i].h, t[i].bpp, t[i].n, (double)t[i].w * t[i].h * t[i].bpp / 1048576.0,
++                    t[i].ns / 1e6 / t[i].n);
++        fprintf(stderr, "\n");
++        memset(t, 0, sizeof t);
++        t0 = now;
++    }
++}
++
+ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                             void* out, u32 out_pitch)
+ {
+@@ -3210,7 +3237,10 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+         };
+         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                               0, 0, NULL, 1, &hb, 0, NULL);
+-        if (!vk_submit_and_wait()) {
++        const unsigned long long t0 = vk_tns();
++        const int wrc = vk_submit_and_wait();
++        vk_rb_stat(0, w, h, o->bpp, vk_tns() - t0);
++        if (!wrc) {
+             vk_invalidate(&st);
+             for (u32 row = 0; row < h; row++)
+                 memcpy((u8*)out + (size_t)row * out_pitch, (const u8*)st.ptr + (size_t)row * tight, tight);
+@@ -3545,7 +3575,9 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
+         };
+         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                               0, 0, NULL, 1, &hb, 0, NULL);
++        const unsigned long long t0 = vk_tns();
+         rc = vk_submit_and_wait();
++        vk_rb_stat(1, w, h, 4u, vk_tns() - t0);
+         if (!rc) {
+             vk_invalidate(&st);
+             for (u32 row = 0; row < h; row++)

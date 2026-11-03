@@ -2753,3 +2753,13 @@ Tried, not kept:
   table: the same time as the two probes of spu_lookup's 16 KB one.
 - No fence before the park check of an SPU PUT when no park is published:
   43.34 against 44.29 with it.
+
+**What the FIFO thread's GPU waits are** (`PS3RECOMP_VK_READBACK_STATS=1`,
+patch 0075): a frame reads back a 640x360 depth target once (~2.6 ms each
+from submit to landing), a 640x360 colour target once (~0.5 ms) and two
+320x180 colour targets (~0.07 ms). The depth one is small (0.88 MB): its wait
+is the GPU finishing the frame's scene, which it starts only when the batch
+is submitted -- and runs at ~0.9-1.1 GHz in P2 (of 2.1 GHz, `nvidia-smi`,
+~35% busy, 34 W): too little load for the driver to raise the clock. The
+user-level `nvidia-settings -a GpuPowerMizerMode=1` does not stay set under
+Wayland (it reads back 0); `nvidia-smi -lgc` needs root -- left to the user.
