@@ -2794,3 +2794,20 @@ less a term far below them, where a round-to-nearest sum lands back on the
 boundary; under the test's (and the game's) round-toward-zero MXCSR that
 cannot happen, so the zero-term guard is for threads that still round to
 nearest -- a mutation dropping it passes the test, as it should.
+
+## 98. One store for a local-store quadword: ~43.4 -> ~44.9
+
+`spu_ls_write128` byte-swapped its four words with `__builtin_bswap32` and
+stored them one by one; in the lifted code that compiled to a reload of the
+register as two 64-bit halves, two shifts and four `movbe` per SPU store
+(the load side was already one `vpshufb`). With SSSE3 it is one shuffle and
+one 16-byte store now (`spu_context.h`; a million random words and addresses
+each read back as the scalar path wrote them). SPU lane CPU 82.0 -> 76.8 ms a
+frame, Particles.VertexJob's body (the job the RSX parks on) 3.39 -> 2.87 ms.
+Four rounds against stable-2026-11-03b: 43.88 / 44.87 / 45.06 / 45.96 against
+44.65 / 42.71 / 43.94 / 42.45; frame dumps alike.
+
+Not done: having the lifted code address `ctx->ls_store` (a fixed offset)
+instead of reloading `ctx->ls` after every store -- SPURS tasks run in place
+on their own buffers (`spu_context_init_ls`), so `ls` is not always
+`ls_store`.

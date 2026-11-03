@@ -1,0 +1,30 @@
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index d80e438d..c3a80c12 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -480,6 +480,9 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
+ #define SPU_BSWAP32(x) __builtin_bswap32(x)
+ #define SPU_LS_FAST 1
+ #endif
++#if defined(__SSSE3__)
++#include <tmmintrin.h>
++#endif
+ 
+ /* Debug probes of spu_ls_read128, out of line: inlined they kept every LS
+  * load a real call (~10% of GH3's FMOD mixer task). g_spu_ls_probe is -1
+@@ -642,7 +645,14 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
+         spu_ls_write_probe_pre(ctx, lsa, val);
+ #endif
+-#if SPU_LS_FAST
++#if SPU_LS_FAST && defined(__SSSE3__)
++    /* one shuffle and one store: the four byte-swapped words below compiled
++     * to a reload of the register as two 64-bit halves and four movbe */
++    __m128i x;
++    memcpy(&x, &val, 16);
++    _mm_storeu_si128((__m128i*)p, _mm_shuffle_epi8(x, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4,
++                                                                   11, 10, 9, 8, 15, 14, 13, 12)));
++#elif SPU_LS_FAST
+     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
+     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
+     memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
