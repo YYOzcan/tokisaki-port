@@ -1,0 +1,55 @@
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index c3a80c12..0753c8db 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -850,6 +850,30 @@ static inline __attribute__((always_inline)) void spu_hop_check(spu_context* ctx
+     if (ctx->steps++ && !((uint32_t)ctx->pc & SPU_LS_MASK) && !ctx->policy_mode && ctx->image_id > 0)
+         spu_job_ls0_end(ctx);
+ }
++/* A direct branch into another lifted function (tools/spu_tailjump.py rewrites
++ * the lifter's `g_spu_trampoline_fn = f; return;` into this). Inside a drained
++ * call, with nothing the drain loop would do between the two functions -- no
++ * interrupt pending, no diagnostic on, no stack-reset entry registered, not
++ * the pc 0 job end -- it calls f in place of returning to the loop (a tail
++ * call: no host stack grows), counting the hop as the loop does. Otherwise,
++ * and with SPU_TAILJ=0, the trampoline as before. */
++extern int g_spu_tailj_on;
++int spu_tailj_enabled(void);
++static inline __attribute__((always_inline)) int spu_tailj_ok(spu_context* ctx)
++{
++    return __builtin_expect(g_spu_tailj_on > 0 || (g_spu_tailj_on < 0 && spu_tailj_enabled()), 1) &&
++           ctx->host_depth && !g_yz_lockstep_on && !g_spu_hop_diag && !g_spu_stack_reset_n &&
++           ((uint32_t)ctx->pc & SPU_LS_MASK) &&
++           !(ctx->int_enable && (ctx->event_status & ctx->event_mask));
++}
++#if defined(__clang__)
++#define SPU_TAILJ(c, f) do {                                                  \
++        if (spu_tailj_ok(c)) { (c)->steps++; __attribute__((musttail)) return f(c); } \
++        g_spu_trampoline_fn = f; return;                                      \
++    } while (0)
++#else
++#define SPU_TAILJ(c, f) do { g_spu_trampoline_fn = f; return; } while (0)
++#endif
+ /* Take a pending SPU interrupt (spu_drain.c): srr0 <- ctx->pc, int_enable <- 0,
+  * decode the guest-planted branch at LS 0 into ctx->pc, and return the
+  * dispatcher to run instead of the interrupted transfer. Returns `tf`
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 74cdbdf5..02f04d45 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -434,6 +434,15 @@ void spu_depth_guard(spu_context* ctx)
+     { extern void spu_halt(spu_context*); spu_halt(ctx); }
+ }
+ 
++/* See spu_context.h (SPU_TAILJ). SPU_TAILJ=0 (default 1): every direct
++ * branch between lifted functions goes back through the trampoline. */
++int g_spu_tailj_on = -1;
++int spu_tailj_enabled(void)
++{
++    if (g_spu_tailj_on < 0) { const char* e = getenv("SPU_TAILJ"); g_spu_tailj_on = (e && e[0] == '0') ? 0 : 1; }
++    return g_spu_tailj_on;
++}
++
+ /* See spu_context.h. Env-gated: SPU_TAILRET=1. */
+ int g_spu_tailret_on = -1;
+ int spu_tailret_enabled(void)

@@ -66,6 +66,9 @@ export JOBMOD_ALT_BASE="${JOBMOD_ALT_BASE-73d064721abc@0x8400,8e97047fac2a@0x840
 # Native gates into the lifted Gfx.Post, Particles and EdgeAnim job functions
 # (tools/spu_native_gates.tsv, src/spu_native/; from Project Pyrrhus).
 "${PY}" -I "${ROOT}/tools/spu_native_gates.py" "${SPU}"
+# Direct branches between lifted functions as tail calls (SPU_TAILJ in
+# runtime/spu/spu_context.h; SPU_TAILJ=0 at run time = the trampoline).
+"${PY}" -I "${ROOT}/tools/spu_tailjump.py" "${SPU}"
 
 # Register-cached copies (spu_recomp_rc.c, built instead of spu_recomp.c with
 # CMake's KZ2_SPU_REGCACHE=ON): KZ2_SPU_REGCACHE=1 tools/lift_spu.sh. Slower

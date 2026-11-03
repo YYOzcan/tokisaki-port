@@ -2862,3 +2862,22 @@ into ctx around calls and exits. Particles.VertexJob's per-particle function
 got slower (2.87 -> 4.87 ms a frame: every call copies ~90 registers in and
 out, and the union locals compile to scalar code); Anim.Skinning's loop
 function 9.3 -> 8.7 ms. Not applied.
+
+## 100. Direct branches between lifted SPU functions as tail calls: ~43 -> ~45
+
+The lifter ends a function that branches into another with
+`g_spu_trampoline_fn = f; return;` -- 34,915 sites in Killzone 2's lifted
+SPU code -- and the drain loop calls f. Most calls that fell out of the inline
+drain into `spu_drain_call` were these (a count by image and return address,
+`SPU_DRAIN_STATS` in the experiment); its hot spot was the instruction after
+the loop's indirect call: returns the return-stack predictor gets wrong in
+the deep lifted call chains. `tools/spu_tailjump.py` (a `tools/lift_spu.sh`
+step after the native gates) rewrites them to `SPU_TAILJ(ctx, f)`
+(`spu_context.h`, patch 0080): inside a drained call, when the loop would do
+nothing else between the two functions -- no interrupt pending, no
+diagnostic, no stack-reset entry registered, not the pc 0 job end -- it counts
+the hop and calls f as a clang `musttail` call; otherwise the trampoline.
+`SPU_TAILJ=0` = the trampoline always.
+SPU lane CPU 76.8 -> 72.5 ms a frame, `spu_drain_call` 2.65 -> 0.90 ms.
+Four rounds against stable-2026-11-03c: 45.83 / 44.02 / 45.83 / 44.53 against
+45.84 / 39.96 / 43.36 / 42.61; frame dumps alike, 0 stops.
