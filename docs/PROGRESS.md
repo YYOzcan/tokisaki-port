@@ -2817,3 +2817,5 @@ waits on a park (`KZ2_PARK_SUBMIT=1` in the experiment), so the GPU would run
 it during the wait: 46.33 / 45.29 / 44.96 / 44.81 against 45.29 / 45.46 /
 45.91 / 44.61 -- no change (batches already go every 192 operations), and no
 stall in four runs, unlike the earlier submit-when-idle attempt.
+`PS3RECOMP_VK_ASYNC_OPS=384` (larger batches): 45.99 / 46.13 / 43.70 against
+44.82 / 45.65 / 45.00 -- noise.
