@@ -2971,3 +2971,29 @@ lane samples) and EdgeAnim; a chain of dependent passes, not short of lanes.
 While the FIFO thread is parked or sleeping, 4.2 of 5 are busy (Raycast 18%,
 Skinning 13%, Particles.VertexJob 12%, ParticleUpdate 6%, LightProbes 4%,
 the runtime 35%).
+
+## 102. The menu's panels: DDX and DDY
+
+The main menu showed its text and button glyphs on the bare background: no
+panels behind the lists, no red bars, no highlight on the selected item, no
+side decorations, and "MAIN MENU" black on nothing (it sits on a light panel).
+Pass dumps (`RSX_ENGINE_PASS_DUMP_AFTER=28`) put every missing draw in one
+pattern: a stencil writer (colour mask 0, ALWAYS/REPLACE with ref N, N
+counting up per widget), then the widget's draws with EQUAL N -- two-sided
+stencil, alpha test GREATER 3/255. The visible ones (text) had no alpha test.
+
+Neither was it. Back-face stencil reference and masks (0x0354, 0x0358,
+0x034C) were ignored, and are now passed on (`set_stencil_ref_back`, the back
+`VkStencilOpState`'s own masks), but the menu sets them equal to the front's;
+with the alpha test forced off the panels stayed invisible. The panels'
+fragment program (`RSX_ENGINE_SHADER_DUMP`) starts with DDX and DDY of its
+texture coordinates -- the decompiler's two "unhandled opcode" comments. The
+registers they write stayed 0, the 1/x of them was infinite, the colour NaN,
+and the NaN guard turned it into transparent black. DDX/DDY are now `ddx()` /
+`ddy()` (RPCS3's FragmentProgramDecompiler maps them to dFdx/dFdy): the
+panels, bars, highlight and decorations are back, five fragment programs of
+the menu use them, and no dumped program has an unhandled opcode left. An
+in-level frame (110 s) is unchanged.
+
+The draw dump lines now carry the alpha function and reference
+(`af .. ar .. fmt ..`) and both faces' stencil reference and masks.

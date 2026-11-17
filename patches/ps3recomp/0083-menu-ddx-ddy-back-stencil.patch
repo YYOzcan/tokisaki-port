@@ -1,0 +1,213 @@
+diff --git a/libs/video/rsx_be_thread.c b/libs/video/rsx_be_thread.c
+index 72ad53ad..f21ea0bb 100644
+--- a/libs/video/rsx_be_thread.c
++++ b/libs/video/rsx_be_thread.c
+@@ -35,7 +35,7 @@
+ enum {
+     OP_WRAP = 1, OP_TEX_UPLOAD, OP_TEX_RELEASE, OP_CT_RELEASE, OP_CT_WRITE, OP_DT_RELEASE,
+     OP_PIPE_RELEASE, OP_BIND_TARGETS, OP_BIND_PIPELINE, OP_BIND_VSC, OP_BIND_PSC, OP_BIND_TEX,
+-    OP_BIND_VTEX, OP_VIEWPORT, OP_SCISSOR, OP_STENCIL_REF, OP_DEPTH_BOUNDS, OP_DRAW, OP_DRAW_CACHED,
++    OP_BIND_VTEX, OP_VIEWPORT, OP_SCISSOR, OP_STENCIL_REF, OP_STENCIL_REF_BACK, OP_DEPTH_BOUNDS, OP_DRAW, OP_DRAW_CACHED,
+     OP_CLEAR_COLOR, OP_CLEAR_DS, OP_PRESENT, OP_BIND_VSC_REF, OP_DRAW_CACHED_REF, OP_VSC_DELTA,
+     /* direct calls, counted only */
+     OP_INIT, OP_SHUTDOWN, OP_SUBMIT_WAIT, OP_TEX_CREATE, OP_CT_CREATE, OP_SURFACE_VIEW, OP_DT_CREATE,
+@@ -47,7 +47,7 @@ static const char* const s_op_name[OP_N] = {
+     [OP_CT_WRITE] = "ct_write", [OP_DT_RELEASE] = "dt_release", [OP_PIPE_RELEASE] = "pipe_release",
+     [OP_BIND_TARGETS] = "bind_targets", [OP_BIND_PIPELINE] = "bind_pipeline", [OP_BIND_VSC] = "bind_vsc",
+     [OP_BIND_PSC] = "bind_psc", [OP_BIND_TEX] = "bind_tex", [OP_BIND_VTEX] = "bind_vtex",
+-    [OP_VIEWPORT] = "viewport", [OP_SCISSOR] = "scissor", [OP_STENCIL_REF] = "stencil_ref",
++    [OP_VIEWPORT] = "viewport", [OP_SCISSOR] = "scissor", [OP_STENCIL_REF] = "stencil_ref", [OP_STENCIL_REF_BACK] = "stencil_ref_back",
+     [OP_DEPTH_BOUNDS] = "depth_bounds", [OP_DRAW] = "draw", [OP_DRAW_CACHED] = "draw_cached",
+     [OP_CLEAR_COLOR] = "clear_color", [OP_CLEAR_DS] = "clear_ds", [OP_PRESENT] = "present",
+     [OP_BIND_VSC_REF] = "bind_vsc_ref", [OP_DRAW_CACHED_REF] = "draw_cached_ref", [OP_VSC_DELTA] = "vsc_delta", [OP_INIT] = "init", [OP_SHUTDOWN] = "shutdown",
+@@ -224,6 +224,7 @@ static void be_apply(const q_hdr* h)
+     case OP_VIEWPORT: { const e_f4* e = (const e_f4*)h; b->set_viewport(u, e->f[0], e->f[1], e->f[2], e->f[3]); break; }
+     case OP_SCISSOR: { const e_u32* e = (const e_u32*)h; b->set_scissor(u, e->a[0], e->a[1], e->a[2], e->a[3]); break; }
+     case OP_STENCIL_REF: b->set_stencil_ref(u, ((const e_u32*)h)->a[0]); break;
++    case OP_STENCIL_REF_BACK: b->set_stencil_ref_back(u, ((const e_u32*)h)->a[0]); break;
+     case OP_DEPTH_BOUNDS: { const e_f4* e = (const e_f4*)h; b->set_depth_bounds(u, e->f[0], e->f[1]); break; }
+     case OP_DRAW: case OP_DRAW_CACHED: { const e_draw* e = (const e_draw*)h;
+         const u8* v = PAYLOAD(e);
+@@ -373,6 +374,7 @@ static void p_pipeline_release(void* u, u32 t) { (void)u; be_count(OP_PIPE_RELEA
+ static void p_bind_pipeline(void* u, u32 p) { (void)u; be_count(OP_BIND_PIPELINE); if (QUEUED) { Q_U32(OP_BIND_PIPELINE, 1, p); return; } s_in->bind_pipeline(s_in->user, p); }
+ static void p_set_scissor(void* u, u32 x, u32 y, u32 w, u32 h) { (void)u; be_count(OP_SCISSOR); if (QUEUED) { Q_U32(OP_SCISSOR, 4, x, y, w, h); return; } s_in->set_scissor(s_in->user, x, y, w, h); }
+ static void p_set_stencil_ref(void* u, u32 r) { (void)u; be_count(OP_STENCIL_REF); if (QUEUED) { Q_U32(OP_STENCIL_REF, 1, r); return; } s_in->set_stencil_ref(s_in->user, r); }
++static void p_set_stencil_ref_back(void* u, u32 r) { (void)u; be_count(OP_STENCIL_REF_BACK); if (QUEUED) { Q_U32(OP_STENCIL_REF_BACK, 1, r); return; } s_in->set_stencil_ref_back(s_in->user, r); }
+ static void p_present(void* u, u32 s) { (void)u; be_count(OP_PRESENT); if (QUEUED) { Q_U32(OP_PRESENT, 1, s); return; } s_in->present(s_in->user, s); }
+ 
+ static void p_color_target_write(void* u, u32 surface, u32 x, u32 y, u32 w, u32 h, const void* rows, u32 row_bytes)
+@@ -642,7 +644,7 @@ const rsx_draw_backend* rsx_be_thread_wrap(const rsx_draw_backend* be)
+     P(color_target_create); P(color_target_release); P(color_target_write); P(surface_view);
+     P(depth_target_create); P(depth_target_release); P(depth_snapshot); P(pipeline_create);
+     P(pipeline_release); P(bind_targets); P(bind_pipeline); P(bind_vs_constants); P(bind_ps_constants);
+-    P(bind_textures); P(bind_vertex_textures); P(set_viewport); P(set_scissor); P(set_stencil_ref);
++    P(bind_textures); P(bind_vertex_textures); P(set_viewport); P(set_scissor); P(set_stencil_ref); P(set_stencil_ref_back);
+     P(set_depth_bounds); P(draw); P(clear_color); P(clear_depth_stencil); P(present); P(readback);
+     P(depth_readback); P(color_snapshot); P(reinterpret); P(draw_cached); P(readback_async);
+     P(readback_result); P(readback_release); P(bind_vs_constants_ref);
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index b452e889..1c8ab33e 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -80,7 +80,10 @@ u32 g_rsx_eng_vs_prefix;
+ #define M_STENCIL_OP_ZFAIL    0x0340
+ #define M_STENCIL_OP_ZPASS    0x0344
+ #define M_TWO_SIDED_STENCIL   0x0348
++#define M_BACK_STENCIL_MASK   0x034C
+ #define M_BACK_STENCIL_FUNC   0x0350
++#define M_BACK_STENCIL_FUNC_REF  0x0354
++#define M_BACK_STENCIL_FUNC_MASK 0x0358
+ #define M_BACK_STENCIL_OP_FAIL  0x035C
+ #define M_BACK_STENCIL_OP_ZFAIL 0x0360
+ #define M_BACK_STENCIL_OP_ZPASS 0x0364
+@@ -334,6 +337,8 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
+     rs->bs_fail      = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_FAIL);
+     rs->bs_zfail     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZFAIL);
+     rs->bs_zpass     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
++    rs->bs_func_mask  = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC_MASK) & 0xFF;
++    rs->bs_write_mask = rsx_dsp_reg(rsx, M_BACK_STENCIL_MASK) & 0xFF;
+     rs->depth_bounds_test = rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_ENABLE) & 1;
+ }
+ 
+@@ -374,6 +379,8 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
+     ENG_HASH_FIELD(bs_fail);
+     ENG_HASH_FIELD(bs_zfail);
+     ENG_HASH_FIELD(bs_zpass);
++    ENG_HASH_FIELD(bs_func_mask);
++    ENG_HASH_FIELD(bs_write_mask);
+     ENG_HASH_FIELD(depth_bounds_test);
+ #undef ENG_HASH_FIELD
+     return hash;
+@@ -3674,6 +3681,14 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+                     rs->stencil_two_sided ? "2" : "1", rs->s_func, rs->s_func_mask & 0xFFu,
+                     rs->s_write_mask & 0xFFu, rs->s_fail, rs->s_zfail, rs->s_zpass,
+                     rs->bs_func, rs->bs_fail, rs->bs_zfail, rs->bs_zpass);
++        if (rs->alpha_test_enable)
++            fprintf(s_pd.draws_log, " af %X ar %X fmt %u |", rs->alpha_func, rs->alpha_ref_raw,
++                    rs->alpha_ref_format);
++        if (rs->stencil_enable)
++            fprintf(s_pd.draws_log, " ref %X/%X fm %X/%X wm %X/%X |",
++                    rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu,
++                    rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_FUNC_REF) & 0xFFu,
++                    rs->s_func_mask & 0xFFu, rs->bs_func_mask, rs->s_write_mask & 0xFFu, rs->bs_write_mask);
+         fprintf(s_pd.draws_log, " cull %u/%X ff %X | prim %u arr %u idx %u refs %u verts %u cuts %u inl %u |",
+                 rs->cull_enable, rs->cull_face, rs->front_face, g.rsx.current_primitive,
+                 dc.n_arr, dc.n_idx, dc.n_source_refs, dc.n_verts, dc.n_cuts, dc.inl_bytes);
+@@ -4021,6 +4036,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     /* Dynamic, and deliberately outside the pipeline key. */
+     g.be->set_stencil_ref(g.be->user,
+                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
++    /* two-sided stencil has a reference of its own for back faces (the
++     * menus' text clipping and panels draw with it) */
++    if (g.be->set_stencil_ref_back)
++        g.be->set_stencil_ref_back(g.be->user,
++            rsx_dsp_reg(&g.rsx, (rsx_dsp_reg(&g.rsx, M_TWO_SIDED_STENCIL) & 1u) ? M_BACK_STENCIL_FUNC_REF
++                                                                                : M_STENCIL_FUNC_REF) & 0xFFu);
+     /* The bounds too: a deferred renderer moves them between its light and
+      * sky passes without changing anything else. Raw floats, as written. */
+     if (g.be->set_depth_bounds) {
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index b8174c1e..0d763dfc 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -84,6 +84,9 @@ typedef struct rsx_be_render_state {
+     u32 depth_bounds_test;          /* SET_DEPTH_BOUNDS_TEST_ENABLE */
+     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
+     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
++    /* two-sided: the back face's own compare and write masks (its reference
++     * is dynamic, set_stencil_ref_back) */
++    u32 bs_func_mask, bs_write_mask;
+ } rsx_be_render_state;
+ 
+ /* submit_and_wait reasons, for a backend that wants to log or count them. */
+@@ -272,6 +275,11 @@ typedef struct rsx_draw_backend {
+      * a draw on its way there. */
+     void (*bind_vs_constants_ref)(void* user, const void* consts, u32 prefix_bytes,
+                                   const void* tail, u32 tail_bytes, u32 total_bytes);
++    /* Optional: the stencil reference for back faces, called after
++     * set_stencil_ref before every draw (the front one when two-sided stencil
++     * is off). A backend that leaves it NULL uses the front reference for
++     * both, as before. */
++    void (*set_stencil_ref_back)(void* user, u32 ref);
+ } rsx_draw_backend;
+ 
+ #define RSX_BE_XFORM_DEPTH24_ARGB8  1u   /* D24S8 depth as A8R8G8B8       */
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index e047803e..b8cb9db4 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -845,6 +845,12 @@ static int rsx_fp_decompile_internal(
+         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
+         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
+         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
++        /* Screen-space derivatives (RPCS3 FragmentProgramDecompiler: DDX/DDY as
++         * dFdx/dFdy). Killzone 2's menu panels and bars feed their sizes into a
++         * 1/x and a min(): left out, the registers stayed 0, the colour went
++         * NaN, the NaN guard made it transparent black and the panels vanished. */
++        case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
++        case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
+         /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
+          * builtins): the packed word is a scalar that replicates. */
+         case OP_PK4UB: uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4ub(%s))", a); break;
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 25ecfdeb..d240f084 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3776,6 +3776,8 @@ static struct {
+     u32          sc[4];
+     int          have_vp, have_sc;
+     u32          stencil_ref;
++    u32          stencil_ref_back;    /* set_stencil_ref_back; the front one until called */
++    int          have_ref_back;
+     float        depth_bounds[2];     /* min, max for the next draw */
+     vk_buffer    indices;
+     u32          warned;
+@@ -4075,7 +4077,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
+                                                  rs->s_func_mask, rs->s_write_mask);
+     VkStencilOpState back = rs->stencil_two_sided
+         ? vk_gcm_stencil_face(rs->bs_func, rs->bs_fail, rs->bs_zfail, rs->bs_zpass,
+-                              rs->s_func_mask, rs->s_write_mask)
++                              rs->bs_func_mask, rs->bs_write_mask)
+         : front;
+     VkPipelineDepthStencilStateCreateInfo ds = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+@@ -4227,6 +4229,7 @@ static void vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
+     s_e2.sc[0] = x; s_e2.sc[1] = y; s_e2.sc[2] = w; s_e2.sc[3] = h; s_e2.have_sc = 1;
+ }
+ static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_e2.stencil_ref = ref; }
++static void vk_eng_set_stencil_ref_back(void* user, u32 ref) { (void)user; s_e2.stencil_ref_back = ref; s_e2.have_ref_back = 1; }
+ 
+ /* Vulkan wants the bounds inside [0, 1] without VK_EXT_depth_range_unrestricted;
+  * a NaN clamps to the open end so a garbage register cannot reject a draw. */
+@@ -4605,7 +4608,7 @@ static void vk_eng_draw_k(rsx_topology topology, u64 vkey, const void* vertices,
+     /* What this command buffer has bound: set only what changed (the driver
+      * calls were ~14% of the FIFO thread with everything set per draw). */
+     static struct {
+-        u32 serial; VkPipeline pipe; VkViewport vp; VkRect2D sc; u32 sref; float db[2];
++        u32 serial; VkPipeline pipe; VkViewport vp; VkRect2D sc; u32 sref, sref_back; float db[2];
+         VkDescriptorSet set; VkPipelineLayout layout; VkBuffer vb; VkDeviceSize voff; int ib;
+         u32 doff[2];
+     } bs;
+@@ -4630,9 +4633,11 @@ static void vk_eng_draw_k(rsx_topology topology, u64 vkey, const void* vertices,
+     }
+     if (memcmp(&bs.vp, &vp, sizeof vp)) { pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp); bs.vp = vp; }
+     if (memcmp(&bs.sc, &sc, sizeof sc)) { pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc); bs.sc = sc; }
+-    if (bs.sref != (s_e2.stencil_ref & 0xFFu)) {
+-        pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
+-        bs.sref = s_e2.stencil_ref & 0xFFu;
++    {   /* front and back references apart: two-sided stencil has one each */
++        const u32 fr = s_e2.stencil_ref & 0xFFu;
++        const u32 br = (s_e2.have_ref_back ? s_e2.stencil_ref_back : s_e2.stencil_ref) & 0xFFu;
++        if (bs.sref != fr) { pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_BIT, fr); bs.sref = fr; }
++        if (bs.sref_back != br) { pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_BACK_BIT, br); bs.sref_back = br; }
+     }
+     if (s_vk.depth_bounds_ok && (bs.db[0] != s_e2.depth_bounds[0] || bs.db[1] != s_e2.depth_bounds[1])) {
+         pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
+@@ -4684,6 +4689,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
+     .set_viewport         = vk_eng_set_viewport,
+     .set_scissor          = vk_eng_set_scissor,
+     .set_stencil_ref      = vk_eng_set_stencil_ref,
++    .set_stencil_ref_back = vk_eng_set_stencil_ref_back,
+     .set_depth_bounds     = vk_eng_set_depth_bounds,
+     .draw                 = vk_eng_draw,
+     .draw_cached          = vk_eng_draw_cached,
