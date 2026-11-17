@@ -3028,3 +3028,25 @@ range test for a straight run of float ops instead of one per op.
 
 The frame costs ~159 ms of CPU on 6.5 of the 12 hardware threads at ~41 fps;
 a real 60 needs it near 100 ms.
+
+## 104. Speculative float runs in the constant-pool copies
+
+The skinning copy with fa/fm/fma as the bare SSE instruction took 4.52 ms
+against 7.47 (PROGRESS 101): the range test and branch after every float op
+cost ~40% of that loop. The inFAMOUS 2 port (SamiEnazi/infamous2-port, MIT)
+removes them per straight run: the ops run without their branch, the lanes
+that need the exact path are OR-ed into one mask, one test at the end, and on
+a bad lane the run executes again in the ordinary form. Patch 0085 adds the
+branch-free forms (`spu_{fa,fs,fm,fma,fms,fnms}_spec`, RZ mode only) and
+`tools/spu_specfloat.py` rewrites the register-local copies of
+`tools/spu_constpool.py` that way: a run of plain register statements (no
+label, branch, call or LS write) with two or more float ops computes into
+fresh locals and commits them only when the mask is clear, so the run's
+inputs are untouched for the rerun. A `lift_spu.sh` step after the
+constant-pool copies (`KZ2_SPU_SPEC_FLOAT=0` skips it): 9 runs in 3
+Anim.Skinning functions and 7 in Gfx.Post.ILR.
+
+`SPU_CP_CHECK=1` (each copy against the original, every call): 2.1 M calls,
+0 differ. `tools/ab_cpu.sh`, three rounds: 160.1 / 157.8 / 158.9 CPU ms a
+frame and 41.06 / 41.32 / 41.21 fps against 159.9 / 152.1 / 155.5 ms and
+40.79 / 42.83 / 42.05 fps -- about -2% CPU, +0.7 fps.

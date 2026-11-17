@@ -1,0 +1,46 @@
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 38d6128b..5687b047 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -1220,6 +1220,41 @@ SPU__XV_INLINE u128 spu_fm(u128 a, u128 b) { return spu__xv_fm(a, b); }
+ SPU__XV_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__xv_fma(a, b, c, 0, 0); }
+ SPU__XV_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__xv_fma(a, b, c, 0, 0x80000000u); }
+ SPU__XV_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__xv_fma(a, b, c, 0x80000000u, 0); }
++#if defined(SPU_FP_RZ_ASSUMED)
++/* Speculative forms (tools/spu_specfloat.py; the idea of the inFAMOUS 2 port's
++ * SPU_LIFT_SPEC_FLOAT, SamiEnazi/infamous2-port, MIT): the RZ fast path of the
++ * forms above without its branch. The lanes that would have taken the exact
++ * path are OR-ed into *bad; a straight run of these is followed by one test,
++ * and when any lane was bad the run is executed again in the ordinary form
++ * from its untouched inputs, so the result is the ordinary form's either way.
++ * Where *bad stays clear the value is the fast path's value, bit for bit. */
++SPU__XV_INLINE u128 spu__xs_fa(u128 a, u128 b, uint32_t negb, __m128i* bad) {
++    const __m128i A = spu__xv_ld(a), B = _mm_xor_si128(spu__xv_ld(b), _mm_set1_epi32((int)negb));
++    const __m128i r = _mm_castps_si128(_mm_add_ps(_mm_castsi128_ps(A), _mm_castsi128_ps(B)));
++    *bad = _mm_or_si128(*bad, spu__rz_bad(A, B, r));
++    return spu__xv_st(spu__rz_pos0(r));
++}
++SPU__XV_INLINE u128 spu__xs_fm(u128 a, u128 b, __m128i* bad) {
++    const __m128i A = spu__xv_ld(a), B = spu__xv_ld(b);
++    const __m128i r = _mm_castps_si128(_mm_mul_ps(_mm_castsi128_ps(A), _mm_castsi128_ps(B)));
++    *bad = _mm_or_si128(*bad, spu__rz_bad(A, B, r));
++    return spu__xv_st(spu__rz_pos0(r));
++}
++SPU__XV_INLINE u128 spu__xs_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc, __m128i* bad) {
++    const __m128i A = _mm_xor_si128(spu__xv_ld(a), _mm_set1_epi32((int)negp)), B = spu__xv_ld(b);
++    const __m128i C = _mm_xor_si128(spu__xv_ld(c), _mm_set1_epi32((int)negc));
++    const __m128i r = _mm_castps_si128(_mm_fmadd_ps(_mm_castsi128_ps(A), _mm_castsi128_ps(B), _mm_castsi128_ps(C)));
++    *bad = _mm_or_si128(*bad, spu__rz_bad(A, B, r));
++    return spu__xv_st(spu__rz_pos0(r));
++}
++#define spu_fa_spec(a, b, bad)       spu__xs_fa(a, b, 0, bad)
++#define spu_fs_spec(a, b, bad)       spu__xs_fa(a, b, 0x80000000u, bad)
++#define spu_fm_spec(a, b, bad)       spu__xs_fm(a, b, bad)
++#define spu_fma_spec(a, b, c, bad)   spu__xs_fma(a, b, c, 0, 0, bad)
++#define spu_fms_spec(a, b, c, bad)   spu__xs_fma(a, b, c, 0, 0x80000000u, bad)
++#define spu_fnms_spec(a, b, c, bad)  spu__xs_fma(a, b, c, 0x80000000u, 0, bad)
++#define SPU_HAVE_SPEC_FLOAT 1
++#endif
+ #else
+ static inline u128 spu_fa(u128 a, u128 b) { return spu__fa_s(a, b); }
+ static inline u128 spu_fs(u128 a, u128 b) { return spu__fs_s(a, b); }

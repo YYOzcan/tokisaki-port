@@ -76,6 +76,14 @@ grep -v '^#' "${ROOT}/tools/spu_constpool.tsv" | while IFS=$'\t' read -r mod bas
     "${PY}" -I "${ROOT}/tools/spu_constpool.py" "${SPU}/jobmod_${mod}/spu_recomp.c" \
         "${OUT}/jobmods/jobmod_${mod}.bin" "${base}" "$(printf 'jobmod_%s_spu_func_%08X' "${mod}" "${fn}")"
 done
+# Speculative float runs in those copies (tools/spu_specfloat.py: one range test
+# per straight run of fa/fm/fma instead of one per op; SPU_CP_CHECK=1 checks them
+# too). KZ2_SPU_SPEC_FLOAT=0 (default 1) leaves the copies as they were.
+if [ "${KZ2_SPU_SPEC_FLOAT:-1}" != 0 ]; then
+    grep -v '^#' "${ROOT}/tools/spu_constpool.tsv" | cut -f1 | sort -u | while read -r mod; do
+        [ -n "${mod}" ] && "${PY}" -I "${ROOT}/tools/spu_specfloat.py" "${SPU}/jobmod_${mod}/spu_recomp.c"
+    done
+fi
 
 # Register-cached copies (spu_recomp_rc.c, built instead of spu_recomp.c with
 # CMake's KZ2_SPU_REGCACHE=ON): KZ2_SPU_REGCACHE=1 tools/lift_spu.sh. Slower
