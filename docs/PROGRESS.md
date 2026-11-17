@@ -3050,3 +3050,10 @@ Anim.Skinning functions and 7 in Gfx.Post.ILR.
 0 differ. `tools/ab_cpu.sh`, three rounds: 160.1 / 157.8 / 158.9 CPU ms a
 frame and 41.06 / 41.32 / 41.21 fps against 159.9 / 152.1 / 155.5 ms and
 40.79 / 42.83 / 42.05 fps -- about -2% CPU, +0.7 fps.
+
+How often a run is redone (a counting build, 150 s): the nine runs took the
+ordinary form 0.00-0.20% of the time (worst 673 k of 343 M). In the
+profile after it (kzprof, 20 s at 41 fps) the skinning copy is still the
+largest lane symbol, 8.5 ms a frame of the lanes' 80; then memcpy and the
+other libc copies 7.3, `mfc_do_transfer` 3.1, Particles.VertexJob 0x50F8 3.0,
+`spu_lookup` 2.6, Raycast 0x6C58 2.2, the PUT/lock-line/coherency hooks ~5.
