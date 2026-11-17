@@ -1,0 +1,52 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 5863dbdd..adeb91cc 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -2899,6 +2899,18 @@ int vk_fg_thread_start_fn(void* (*fn)(void*))
+  * frame. The queue lock is held only to acquire, submit and present; the
+  * copy into the history slot was submitted before the hand-over and the first
+  * barrier here covers everything submitted before. */
++/* The presenter's fence wait without the driver's spin: NVIDIA's
++ * vkWaitForFences polls on the CPU (~a quarter of a core here, all of it
++ * taken from the game's threads); its status read every 200 us costs nothing. */
++static void vk_fsr_wait(VkFence f)
++{
++    for (int i = 0; i < 20000; i++) {          /* 4 s at most */
++        const VkResult st = pvkGetFenceStatus(s_vk.device, f);
++        if (st != VK_NOT_READY) return;
++        struct timespec ts = { 0, 200000 };
++        nanosleep(&ts, NULL);
++    }
++}
+ static void vk_fsr_present(VkImage src, int with_fsr, u32 r, int reset, double dt_ns)
+ {
+     pvkResetCommandBuffer(s_fg.tcmd, 0);
+@@ -3010,8 +3022,7 @@ static void vk_fsr_present(VkImage src, int with_fsr, u32 r, int reset, double d
+         __atomic_add_fetch(&s_fg.t_shown, 1u, __ATOMIC_RELAXED);
+     }
+     vk_qunlock();
+-    if (sr == VK_SUCCESS)
+-        pvkWaitForFences(s_vk.device, 1, &s_fg.tfence, VK_TRUE, 1000000000ull);
++    if (sr == VK_SUCCESS) vk_fsr_wait(s_fg.tfence);
+     if (with_fsr)    /* this frame's FSR work has run: its views, descriptor sets and constants can go */
+         ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame((FfxVkFsr3_3_1_6FrameGenerationContext*)s_fg.fsr,
+                                                          s_fg.fsr_id);
+@@ -3050,7 +3061,7 @@ static void vk_fsr_dump(u32 prev, u32 cur)
+     const VkResult sr = pvkQueueSubmit(s_vk.queue, 1, &si, s_fg.tfence);
+     vk_qunlock();
+     if (sr != VK_SUCCESS) return;
+-    pvkWaitForFences(s_vk.device, 1, &s_fg.tfence, VK_TRUE, 1000000000ull);
++    vk_fsr_wait(s_fg.tfence);
+     vk_invalidate(&s_fg.fsr_rb);
+     unsigned char* rows = (unsigned char*)malloc((size_t)w * 3u * h * 3u);
+     if (!rows) return;
+@@ -3072,6 +3083,9 @@ static void* vk_fsr_thread(void* arg)
+ {
+     (void)arg;
+     u32 prev = ~0u;
++#if defined(__linux__)
++    pthread_setname_np(pthread_self(), "kz2-fsr-present");
++#endif
+     pthread_mutex_lock(&s_fg.mu);
+     for (;;) {
+         while (!s_fg.j_have) pthread_cond_wait(&s_fg.cv, &s_fg.mu);

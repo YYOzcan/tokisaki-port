@@ -1,0 +1,115 @@
+diff --git a/src/ffx_vk_fsr3_3_1_5_bridge.cpp b/src/ffx_vk_fsr3_3_1_5_bridge.cpp
+index 2ac0e2e..c2af94d 100644
+--- a/src/ffx_vk_fsr3_3_1_5_bridge.cpp
++++ b/src/ffx_vk_fsr3_3_1_5_bridge.cpp
+@@ -52,6 +52,8 @@ struct BridgeConstantBuffer {
+     VkBuffer buffer = VK_NULL_HANDLE;
+     VkDeviceMemory memory = VK_NULL_HANDLE;
+     VkDeviceSize size = 0u;
++    VkDeviceSize offset = 0u;   /* into the bridge's ring when pooled */
++    bool pooled = false;        /* a slice of the ring: nothing of its own to free */
+     uint64_t frameId = 0u;
+ };
+ 
+@@ -77,6 +79,16 @@ struct FfxVkFsr3_3_1_5Bridge {
+     std::vector<FfxGpuJobDescription> jobs;
+     std::vector<int32_t> registeredImportedResources;
+     uint64_t activeFrameId = 0u;
++    /* Constant data ring: one persistently mapped host-coherent buffer that
++     * every staged constant buffer is a slice of, instead of a buffer and a
++     * vkAllocateMemory each (~20 a frame for frame generation, each a kernel
++     * call). Slices are written once and read by a frame that completes long
++     * before the ring wraps (64 KiB of constants a frame, 8 MiB ring). */
++    VkBuffer cbRing = VK_NULL_HANDLE;
++    VkDeviceMemory cbRingMemory = VK_NULL_HANDLE;
++    uint8_t* cbRingMapped = nullptr;
++    VkDeviceSize cbRingSize = 0u, cbRingHead = 0u, cbRingAlign = 256u;
++    bool cbRingTried = false;
+ 
+     FfxVkFsr3_3_1_5Bridge(VkPhysicalDevice inPhysicalDevice,
+                            VkDevice inDevice,
+@@ -240,7 +252,7 @@ static bool create_image_views(FfxVkFsr3_3_1_5Bridge* bridge, BridgeResource* re
+ static void destroy_constant_buffer(FfxVkFsr3_3_1_5Bridge* bridge,
+                                     BridgeConstantBuffer* constantBuffer)
+ {
+-    if (!bridge || !constantBuffer)
++    if (!bridge || !constantBuffer || constantBuffer->pooled)
+         return;
+     if (constantBuffer->buffer != VK_NULL_HANDLE)
+         vkDestroyBuffer(bridge->device, constantBuffer->buffer, bridge->allocationCallbacks);
+@@ -466,6 +478,7 @@ static bool record_compute_job(FfxVkFsr3_3_1_5Bridge* bridge,
+                 constantBuffer->size == 0u)
+                 return false;
+             descriptor.buffer = constantBuffer->buffer;
++            descriptor.bufferOffset = constantBuffer->offset;
+             descriptor.bufferRange = constantBuffer->size;
+             ++descriptorCount;
+             break;
+@@ -612,6 +625,12 @@ extern "C" void ffxVkFsr3_3_1_5DestroyBridge(FfxVkFsr3_3_1_5Bridge* bridge)
+         destroy_constant_buffer(bridge, constantBuffer.get());
+     for (const std::unique_ptr<BridgeDescriptorSet>& descriptorSet : bridge->descriptorSets)
+         destroy_descriptor_set(descriptorSet.get());
++    if (bridge->cbRingMapped)
++        vkUnmapMemory(bridge->device, bridge->cbRingMemory);
++    if (bridge->cbRing != VK_NULL_HANDLE)
++        vkDestroyBuffer(bridge->device, bridge->cbRing, bridge->allocationCallbacks);
++    if (bridge->cbRingMemory != VK_NULL_HANDLE)
++        vkFreeMemory(bridge->device, bridge->cbRingMemory, bridge->allocationCallbacks);
+     delete bridge;
+ }
+ 
+@@ -825,6 +844,54 @@ extern "C" FfxErrorCode ffxVkFsr3_3_1_5BridgeStageConstantBufferData(
+         return static_cast<FfxErrorCode>(FFX_ERROR_INVALID_ARGUMENT);
+     if (!constantBuffer)
+         return static_cast<FfxErrorCode>(FFX_ERROR_OUT_OF_MEMORY);
++    {
++        std::lock_guard<std::mutex> lock(bridge->mutex);
++        if (!bridge->cbRingTried) {
++            bridge->cbRingTried = true;
++            VkPhysicalDeviceProperties props{};
++            vkGetPhysicalDeviceProperties(bridge->physicalDevice, &props);
++            if (props.limits.minUniformBufferOffsetAlignment > bridge->cbRingAlign)
++                bridge->cbRingAlign = props.limits.minUniformBufferOffsetAlignment;
++            VkBufferCreateInfo ringInfo{};
++            ringInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++            ringInfo.size = 8u << 20;
++            ringInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
++            VkMemoryRequirements ringReq{};
++            VkMemoryAllocateInfo ringAlloc{};
++            void* ringMapped = nullptr;
++            if (vkCreateBuffer(bridge->device, &ringInfo, bridge->allocationCallbacks, &bridge->cbRing) == VK_SUCCESS) {
++                vkGetBufferMemoryRequirements(bridge->device, bridge->cbRing, &ringReq);
++                ringAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++                ringAlloc.allocationSize = ringReq.size;
++                ringAlloc.memoryTypeIndex = find_memory_type(bridge->physicalDevice, ringReq.memoryTypeBits,
++                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++                if (ringAlloc.memoryTypeIndex != UINT32_MAX &&
++                    vkAllocateMemory(bridge->device, &ringAlloc, bridge->allocationCallbacks,
++                                     &bridge->cbRingMemory) == VK_SUCCESS &&
++                    vkBindBufferMemory(bridge->device, bridge->cbRing, bridge->cbRingMemory, 0u) == VK_SUCCESS &&
++                    vkMapMemory(bridge->device, bridge->cbRingMemory, 0u, VK_WHOLE_SIZE, 0u, &ringMapped) == VK_SUCCESS) {
++                    bridge->cbRingMapped = static_cast<uint8_t*>(ringMapped);
++                    bridge->cbRingSize = ringInfo.size;
++                }
++            }
++        }
++        if (bridge->cbRingMapped && size <= bridge->cbRingSize / 4u) {
++            VkDeviceSize at = (bridge->cbRingHead + bridge->cbRingAlign - 1u) & ~(bridge->cbRingAlign - 1u);
++            if (at + size > bridge->cbRingSize)
++                at = 0u;
++            std::memcpy(bridge->cbRingMapped + at, data, size);
++            bridge->cbRingHead = at + size;
++            constantBuffer->buffer = bridge->cbRing;
++            constantBuffer->offset = at;
++            constantBuffer->size = size;
++            constantBuffer->pooled = true;
++            constantBuffer->frameId = bridge->activeFrameId;
++            outConstantBuffer->num32BitEntries = size / sizeof(uint32_t);
++            outConstantBuffer->data = reinterpret_cast<uint32_t*>(constantBuffer.get());
++            bridge->constantBuffers.emplace_back(std::move(constantBuffer));
++            return FFX_OK;
++        }
++    }
+     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+     bufferInfo.size = size;
+     bufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;

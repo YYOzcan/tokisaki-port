@@ -3109,3 +3109,21 @@ nothing in this mode; an out-of-date swapchain is flagged to it. Dumps are
 read back by the presenter with its own buffer. Window, level, 150 s: 68
 frames/s shown from 34 rendered (32 before), 1.55 GB flat, dumped triples
 clean. The rendered rate is still under the ~41 without it.
+
+**Its cost, found and removed.** With FSR's recording on the presenter the
+rendered rate stayed at ~34; the presenter itself costs nothing (presenting
+only the real frames from it: 42.0, FG off: 41.9). `/proc` put the presenter
+at ~29% of a core, ~26 of it kernel time, which a 1 kHz user-space profile
+does not see: the bridge created a uniform buffer with its own
+`vkAllocateMemory` (and freed it a few frames later) for every constant
+block FSR stages, ~20 a frame. `patches/UniversalScalers-Vulkan/0002` makes
+them slices of one persistently mapped, host-coherent 8 MiB ring (offset
+aligned to `minUniformBufferOffsetAlignment`, written once, read long before
+the ring wraps). Patch 0088 also waits for the presenter's fence by polling
+its status every 200 us instead of `vkWaitForFences`, which spins on NVIDIA,
+and names the thread `kz2-fsr-present`. After: the presenter's kernel time 8
+ticks in 20 s (was 524), user 50; the level at **83.6 frames/s shown from
+41.8 rendered** -- the rendered rate of FG off -- memory 1.62 GB flat, the
+dumped triples clean (the intro's subtitles stay sharp in the generated
+frame). The launcher's default is now AMD FSR 3.1 (settings saved before
+take it once).
