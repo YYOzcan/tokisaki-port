@@ -3096,3 +3096,16 @@ each dispatch) and the second present per frame run on the FIFO thread, which
 is on the frame's path. Moving both to the presenter thread is next.
 The environment's default is now off; the launcher offers off / AMD FSR 3.1 /
 the port's interpolation / AFMF.
+
+FSR on the presenter thread (patch 0087): at a flip the FIFO thread now only
+copies the frame into a history slot (submitted before the hand-over) and
+passes the slot, the flip time and the interval to `vk_fsr_thread`; that
+thread records FSR's Prepare/Dispatch into its own command buffer, takes a
+swapchain image without waiting under the queue lock (acquire with timeout 0,
+1 ms retries), blits and presents the generated frame, retires FSR's frame
+after its own fence, then presents the real frame half an interval after the
+flip (or at once when the next flip is waiting). The FIFO thread presents
+nothing in this mode; an out-of-date swapchain is flagged to it. Dumps are
+read back by the presenter with its own buffer. Window, level, 150 s: 68
+frames/s shown from 34 rendered (32 before), 1.55 GB flat, dumped triples
+clean. The rendered rate is still under the ~41 without it.

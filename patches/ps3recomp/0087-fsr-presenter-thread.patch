@@ -1,0 +1,395 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index beca63e3..5863dbdd 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -2564,6 +2564,14 @@ static struct {
+     void* fsr;
+     vk_image fsr_depth, fsr_mv;
+     unsigned long long fsr_id;
++    /* the FSR presenter thread's job: the flip's history slot, its time, the
++     * frame interval then, and whether FSR starts over (vk_fsr_thread) */
++    int j_have, j_reset;
++    u32 j_r, j_busy_r;
++    unsigned long long j_t;
++    double j_dt;
++    volatile int sc_lost;         /* the presenter saw the swapchain out of date */
++    vk_buffer fsr_rb;             /* PS3RECOMP_VK_FRAMEGEN_DUMP readback, presenter side */
+     VkDescriptorSetLayout dsl;
+     VkPipelineLayout pl;
+     VkShaderModule mod;
+@@ -2588,6 +2596,7 @@ static struct {
+     u32 t_seq;                    /* bumped at every flip: a generated frame of an older one is dropped */
+     u32 t_shown, t_dropped;
+ } s_fg = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
++static void* vk_fsr_thread(void* arg);   /* the FSR presenter, below */
+ 
+ /* PS3RECOMP_VK_FRAMEGEN (windowed only): unset or 0 = off (the default),
+  * 1 = extrapolate (experimental), interp or 2 = interpolate, fsr or 3 = AMD
+@@ -2702,6 +2711,14 @@ static int vk_fg_init(void)
+             goto fail;
+         }
+         s_fg.fsr = c;
++        s_fg.j_busy_r = ~0u;
++        if (vk_create_host_buffer(&s_fg.fsr_rb, (VkDeviceSize)w * h * 4u * 3u, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
++            s_fg.fsr_rb.buf = VK_NULL_HANDLE;
++        extern int vk_fg_thread_start_fn(void* (*fn)(void*));
++        if (vk_fg_thread_start_fn(vk_fsr_thread)) {
++            VK_LOG("FSR 3.1.6 frame generation: the presenter thread could not start\n");
++            goto fail;
++        }
+     }
+ #endif
+     s_fg.extrap = vk_fg_mode() == 1;
+@@ -2848,7 +2865,10 @@ static void* vk_fg_thread(void* arg)
+     return NULL;
+ }
+ 
+-int vk_fg_thread_start(void)
++static void* vk_fsr_thread(void* arg);
++int vk_fg_thread_start_fn(void* (*fn)(void*));
++int vk_fg_thread_start(void) { return vk_fg_thread_start_fn(vk_fg_thread); }
++int vk_fg_thread_start_fn(void* (*fn)(void*))
+ {
+     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                     .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+@@ -2864,11 +2884,234 @@ int vk_fg_thread_start(void)
+         pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_fg.tacq) != VK_SUCCESS) return -1;
+     for (int i = 0; i < 8; i++)
+         if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_fg.tdone[i]) != VK_SUCCESS) return -1;
+-    if (pthread_create(&s_fg.thread, NULL, vk_fg_thread, NULL)) return -1;
++    if (pthread_create(&s_fg.thread, NULL, fn, NULL)) return -1;
+     pthread_detach(s_fg.thread);
+     return 0;
+ }
+ 
++#if defined(RSX_VK_HAVE_FSR_FG)
++/* ---- the FSR presenter ------------------------------------------------------
++ * Everything FSR costs, off the FIFO thread: for each flip handed over, record
++ * FSR's optical flow and interpolation into this thread's own command buffer
++ * (the bridge's allocations included), take a swapchain image, blit the
++ * generated frame and present it; then, half the frame interval after the
++ * flip (or at once when the next flip is already waiting), present the real
++ * frame. The queue lock is held only to acquire, submit and present; the
++ * copy into the history slot was submitted before the hand-over and the first
++ * barrier here covers everything submitted before. */
++static void vk_fsr_present(VkImage src, int with_fsr, u32 r, int reset, double dt_ns)
++{
++    pvkResetCommandBuffer(s_fg.tcmd, 0);
++    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    pvkBeginCommandBuffer(s_fg.tcmd, &bi);
++    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                           .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++                           .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
++    pvkCmdPipelineBarrier(s_fg.tcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                          0, 1, &mb, 0, NULL, 0, NULL);
++    int shown_generated = 0;
++    if (with_fsr) {
++        const VkImageUsageFlags use = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++        const FfxVkFsr3_3_1_6FrameGenerationImage col = { s_fg.hist[r].img, VK_FORMAT_R8G8B8A8_UNORM,
++                                                          s_fg.w, s_fg.h, VK_IMAGE_LAYOUT_GENERAL, use };
++        const float ft = (float)(dt_ns * 1e-6);
++        s_fg.fsr_id++;
++        FfxVkFsr3_3_1_6FrameGenerationPrepareInfo pi = {
++            .commandBuffer = s_fg.tcmd, .color = col,
++            .depth = { s_fg.fsr_depth.img, VK_FORMAT_R32_SFLOAT, s_fg.w, s_fg.h, VK_IMAGE_LAYOUT_GENERAL, use },
++            .motionVectors = { s_fg.fsr_mv.img, VK_FORMAT_R16G16_SFLOAT, s_fg.w, s_fg.h, VK_IMAGE_LAYOUT_GENERAL, use },
++            .renderWidth = s_fg.w, .renderHeight = s_fg.h,
++            .motionVectorScaleX = (float)s_fg.w, .motionVectorScaleY = (float)s_fg.h,
++            .frameTimeMilliseconds = ft, .minLuminance = 0.0f, .maxLuminance = 1.0f,
++            .transferFunction = FFX_VK_FSR3_3_1_6_FRAMEGEN_TRANSFER_SRGB,
++            .cameraNear = 0.1f, .cameraFar = 1000.0f, .viewSpaceToMeters = 1.0f, .cameraVerticalFovRadians = 1.0f,
++            .cameraPosition = { 0, 0, 0 }, .cameraUp = { 0, 1, 0 }, .cameraRight = { 1, 0, 0 },
++            .cameraForward = { 0, 0, -1 }, .frameId = s_fg.fsr_id, .reset = reset };
++        FfxVkFsr3_3_1_6FrameGenerationContext* c = (FfxVkFsr3_3_1_6FrameGenerationContext*)s_fg.fsr;
++        int rc = (int)ffxVkFsr3_3_1_6FrameGenerationContextRecordPrepare(c, &pi);
++        if (rc == FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {   /* a Prepare is always followed by its Dispatch */
++            FfxVkFsr3_3_1_6FrameGenerationDispatchInfo di = {
++                .commandBuffer = s_fg.tcmd, .color = col,
++                .output = { s_fg.interp.img, VK_FORMAT_R8G8B8A8_UNORM, s_fg.w, s_fg.h, VK_IMAGE_LAYOUT_GENERAL, use },
++                .displayWidth = s_fg.w, .displayHeight = s_fg.h, .frameTimeMilliseconds = ft,
++                .cameraNear = 0.1f, .cameraFar = 1000.0f, .viewSpaceToMeters = 1.0f, .cameraVerticalFovRadians = 1.0f,
++                .minLuminance = 0.0f, .maxLuminance = 1.0f, .transferFunction = FFX_VK_FSR3_3_1_6_FRAMEGEN_TRANSFER_SRGB,
++                .frameId = s_fg.fsr_id, .reset = reset ? VK_TRUE : VK_FALSE };
++            rc = (int)ffxVkFsr3_3_1_6FrameGenerationContextRecordDispatch(c, &di);
++            shown_generated = rc == FFX_VK_FSR3_3_1_6_FRAMEGEN_OK && !reset;
++        }
++        if (rc != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
++            static int warned;
++            if (!warned++) VK_LOG("FSR 3.1.6 frame generation: record failed (%d)\n", rc);
++        }
++        VkMemoryBarrier mbo = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT };
++        pvkCmdPipelineBarrier(s_fg.tcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                              0, 1, &mbo, 0, NULL, 0, NULL);
++        if (!shown_generated) src = VK_NULL_HANDLE;    /* FSR ran (its history moves on), nothing to show */
++    }
++    /* a swapchain image: never wait for one with the queue lock held */
++    u32 idx = 0;
++    int have_image = 0;
++    if (src != VK_NULL_HANDLE && s_vk.windowed) {
++        for (int tries = 0; tries < 50; tries++) {
++            vk_qlock();
++            if (!s_vk.swapchain || s_fg.sc_lost) { vk_qunlock(); break; }
++            const VkResult ar = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, 0, s_fg.tacq, VK_NULL_HANDLE, &idx);
++            if (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) { have_image = idx < 8; if (have_image) break; }
++            vk_qunlock();
++            if (ar == VK_ERROR_OUT_OF_DATE_KHR) { s_fg.sc_lost = 1; break; }
++            struct timespec ts = { 0, 1000000 };      /* 1 ms */
++            nanosleep(&ts, NULL);
++        }
++    }
++    if (have_image) {      /* the queue lock is held */
++        VkImageMemoryBarrier b = {
++            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image = s_vk.sc_images[idx], .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++        pvkCmdPipelineBarrier(s_fg.tcmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                              0, 0, NULL, 0, NULL, 1, &b);
++        VkImageBlit blit = {
++            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++            .srcOffsets = { { 0, 0, 0 }, { (int32_t)s_fg.w, (int32_t)s_fg.h, 1 } },
++            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++            .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } } };
++        pvkCmdBlitImage(s_fg.tcmd, src, VK_IMAGE_LAYOUT_GENERAL, s_vk.sc_images[idx],
++                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
++        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = 0;
++        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++        pvkCmdPipelineBarrier(s_fg.tcmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                              0, 0, NULL, 0, NULL, 1, &b);
++    }
++    pvkEndCommandBuffer(s_fg.tcmd);
++    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
++    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++                        .commandBufferCount = 1, .pCommandBuffers = &s_fg.tcmd };
++    if (have_image) {
++        si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s_fg.tacq; si.pWaitDstStageMask = &ws;
++        si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s_fg.tdone[idx];
++    } else {
++        vk_qlock();
++    }
++    pvkResetFences(s_vk.device, 1, &s_fg.tfence);
++    const VkResult sr = pvkQueueSubmit(s_vk.queue, 1, &si, s_fg.tfence);
++    if (have_image && sr == VK_SUCCESS) {
++        VkPresentInfoKHR pinfo = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
++                                   .waitSemaphoreCount = 1, .pWaitSemaphores = &s_fg.tdone[idx],
++                                   .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx };
++        const VkResult pr = pvkQueuePresentKHR(s_vk.queue, &pinfo);
++        if (pr == VK_ERROR_OUT_OF_DATE_KHR) s_fg.sc_lost = 1;
++        __atomic_add_fetch(&s_fg.t_shown, 1u, __ATOMIC_RELAXED);
++    }
++    vk_qunlock();
++    if (sr == VK_SUCCESS)
++        pvkWaitForFences(s_vk.device, 1, &s_fg.tfence, VK_TRUE, 1000000000ull);
++    if (with_fsr)    /* this frame's FSR work has run: its views, descriptor sets and constants can go */
++        ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame((FfxVkFsr3_3_1_6FrameGenerationContext*)s_fg.fsr,
++                                                         s_fg.fsr_id);
++}
++
++/* PS3RECOMP_VK_FRAMEGEN_DUMP=<path with %u>,<every n> in the FSR mode: the
++ * frame before, the generated one and the frame after, side by side, read
++ * back by the presenter (its own buffer and command buffer). */
++static void vk_fsr_dump(u32 prev, u32 cur)
++{
++    static const char* path; static unsigned every; static int read_ = 0; static unsigned calls;
++    if (!read_) { read_ = 1; const char* e = getenv("PS3RECOMP_VK_FRAMEGEN_DUMP");
++        if (e) { static char buf[512]; snprintf(buf, sizeof buf, "%s", e); char* c = strchr(buf, ',');
++                 every = 30; if (c) { *c = 0; every = (unsigned)atoi(c + 1); if (!every) every = 30; } path = buf; } }
++    if (!path || (++calls % every) != 0 || !s_fg.fsr_rb.buf) return;
++    const u32 w = s_fg.w, h = s_fg.h;
++    const VkImage imgs[3] = { s_fg.hist[prev].img, s_fg.interp.img, s_fg.hist[cur].img };
++    pvkResetCommandBuffer(s_fg.tcmd, 0);
++    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    pvkBeginCommandBuffer(s_fg.tcmd, &bi);
++    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                           .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT };
++    pvkCmdPipelineBarrier(s_fg.tcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                          0, 1, &mb, 0, NULL, 0, NULL);
++    for (u32 k = 0; k < 3; k++) {
++        VkBufferImageCopy region = { .bufferOffset = (VkDeviceSize)k * w * h * 4u,
++                                     .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++                                     .imageExtent = { w, h, 1 } };
++        pvkCmdCopyImageToBuffer(s_fg.tcmd, imgs[k], VK_IMAGE_LAYOUT_GENERAL, s_fg.fsr_rb.buf, 1, &region);
++    }
++    pvkEndCommandBuffer(s_fg.tcmd);
++    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &s_fg.tcmd };
++    pvkResetFences(s_vk.device, 1, &s_fg.tfence);
++    vk_qlock();
++    const VkResult sr = pvkQueueSubmit(s_vk.queue, 1, &si, s_fg.tfence);
++    vk_qunlock();
++    if (sr != VK_SUCCESS) return;
++    pvkWaitForFences(s_vk.device, 1, &s_fg.tfence, VK_TRUE, 1000000000ull);
++    vk_invalidate(&s_fg.fsr_rb);
++    unsigned char* rows = (unsigned char*)malloc((size_t)w * 3u * h * 3u);
++    if (!rows) return;
++    const unsigned char* px = (const unsigned char*)s_fg.fsr_rb.ptr;
++    for (u32 k = 0; k < 3; k++)
++        for (u32 y = 0; y < h; y++)
++            for (u32 x = 0; x < w; x++) {
++                const unsigned char* q = px + (size_t)k * w * h * 4u + ((size_t)y * w + x) * 4u;
++                unsigned char* d = rows + ((size_t)y * w * 3u + (size_t)k * w + x) * 3u;
++                d[0] = q[0]; d[1] = q[1]; d[2] = q[2];
++            }
++    char fn[600]; snprintf(fn, sizeof fn, path, calls);
++    FILE* f = fopen(fn, "wb");
++    if (f) { fprintf(f, "P6\n%u %u\n255\n", w * 3u, h); fwrite(rows, 1, (size_t)w * 3u * h * 3u, f); fclose(f); }
++    free(rows);
++}
++
++static void* vk_fsr_thread(void* arg)
++{
++    (void)arg;
++    u32 prev = ~0u;
++    pthread_mutex_lock(&s_fg.mu);
++    for (;;) {
++        while (!s_fg.j_have) pthread_cond_wait(&s_fg.cv, &s_fg.mu);
++        const u32 r = s_fg.j_r;
++        const unsigned long long t = s_fg.j_t;
++        const double dt = s_fg.j_dt;
++        const int reset = s_fg.j_reset || prev == ~0u;
++        s_fg.j_have = 0;
++        __atomic_store_n(&s_fg.j_busy_r, r, __ATOMIC_RELEASE);
++        pthread_mutex_unlock(&s_fg.mu);
++
++        vk_fsr_present(s_fg.interp.img, 1, r, reset, dt);       /* FSR, and the generated frame */
++        if (!reset && prev != ~0u) vk_fsr_dump(prev, r);
++        /* the real frame half an interval after its flip, or now if the next is waiting */
++        const unsigned long long due = t + (unsigned long long)(dt * 0.5);
++        pthread_mutex_lock(&s_fg.mu);
++        while (!s_fg.j_have) {
++            const unsigned long long now = vk_now_ns();
++            if (now >= due) break;
++            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++            unsigned long long abs_ns = (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec + (due - now);
++            struct timespec at = { (time_t)(abs_ns / 1000000000ull), (long)(abs_ns % 1000000000ull) };
++            /* s_fg.cv is a CLOCK_REALTIME condition; sleep on the monotonic clock in short steps */
++            pthread_mutex_unlock(&s_fg.mu);
++            struct timespec step = { 0, (long)((due - now) < 2000000ull ? (due - now) : 2000000ull) };
++            (void)at; nanosleep(&step, NULL);
++            pthread_mutex_lock(&s_fg.mu);
++        }
++        pthread_mutex_unlock(&s_fg.mu);
++        vk_fsr_present(s_fg.hist[r].img, 0, r, 0, dt);
++        prev = r;
++        __atomic_store_n(&s_fg.j_busy_r, ~0u, __ATOMIC_RELEASE);
++        pthread_mutex_lock(&s_fg.mu);
++    }
++    return NULL;
++}
++#else
++static void* vk_fsr_thread(void* arg) { (void)arg; return NULL; }
++#endif
++
+ static void vk_fg_dump(u32 r);
+ /* At a flip: returns 1 when frame generation presented (or scheduled) it. */
+ static int vk_fg_present(void)
+@@ -2943,84 +3186,34 @@ static int vk_fg_present(void)
+     }
+ #if defined(RSX_VK_HAVE_FSR_FG)
+     if (s_fg.fsr) {
+-        /* AMD FSR 3.1.6: optical flow over this frame, then the frame half way
+-         * from the last one, shown at once; this one follows half an interval
+-         * later (vk_fg_tick), as in the interp mode */
++        /* AMD FSR 3.1.6, on the presenter thread (vk_fsr_thread): here only the
++         * copy of this frame into its history slot, queued before the hand-over
++         * (the presenter's first barrier covers it), then the slot, the time and
++         * the interval go to the presenter. The FIFO thread presents nothing. */
++        if (s_fg.sc_lost) {           /* the presenter found the swapchain out of date */
++            vk_qlock(); vk_swapchain_lost(); vk_qunlock();
++            s_fg.sc_lost = 0;
++        }
++        u32 slot = r;
++        if (slot == __atomic_load_n(&s_fg.j_busy_r, __ATOMIC_ACQUIRE)) slot = (slot + 1u) % 3u;   /* still on screen */
+         if (vk_begin()) return 0;
+         vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+         VkImageCopy cpf = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                             .extent = { s_fg.w, s_fg.h, 1 } };
+         pvkCmdCopyImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
+-                        s_fg.hist[r].img, VK_IMAGE_LAYOUT_GENERAL, 1, &cpf);
+-        VkMemoryBarrier mbf = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+-                                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+-                                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+-                                                 VK_ACCESS_TRANSFER_READ_BIT };
+-        pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                              0, 1, &mbf, 0, NULL, 0, NULL);
+-        const VkImageUsageFlags use = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+-                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+-        const FfxVkFsr3_3_1_6FrameGenerationImage col = { s_fg.hist[r].img, VK_FORMAT_R8G8B8A8_UNORM,
+-                                                          s_fg.w, s_fg.h, VK_IMAGE_LAYOUT_GENERAL, use };
+-        const float ft = (float)(s_fg.dt_ns > 0 ? s_fg.dt_ns * 1e-6 : 16.7);
+-        const int reset = fresh || !s_fg.have_prev;
+-        s_fg.fsr_id++;
+-        FfxVkFsr3_3_1_6FrameGenerationPrepareInfo pi = {
+-            .commandBuffer = s_vk.cmd, .color = col,
+-            .depth = { s_fg.fsr_depth.img, VK_FORMAT_R32_SFLOAT, s_fg.w, s_fg.h, VK_IMAGE_LAYOUT_GENERAL, use },
+-            .motionVectors = { s_fg.fsr_mv.img, VK_FORMAT_R16G16_SFLOAT, s_fg.w, s_fg.h, VK_IMAGE_LAYOUT_GENERAL, use },
+-            .renderWidth = s_fg.w, .renderHeight = s_fg.h,
+-            .motionVectorScaleX = (float)s_fg.w, .motionVectorScaleY = (float)s_fg.h,
+-            .frameTimeMilliseconds = ft, .minLuminance = 0.0f, .maxLuminance = 1.0f,
+-            .transferFunction = FFX_VK_FSR3_3_1_6_FRAMEGEN_TRANSFER_SRGB,
+-            .cameraNear = 0.1f, .cameraFar = 1000.0f, .viewSpaceToMeters = 1.0f, .cameraVerticalFovRadians = 1.0f,
+-            .cameraPosition = { 0, 0, 0 }, .cameraUp = { 0, 1, 0 }, .cameraRight = { 1, 0, 0 },
+-            .cameraForward = { 0, 0, -1 }, .frameId = s_fg.fsr_id, .reset = reset };
+-        int rc = (int)ffxVkFsr3_3_1_6FrameGenerationContextRecordPrepare(
+-            (FfxVkFsr3_3_1_6FrameGenerationContext*)s_fg.fsr, &pi);
+-        /* a Prepare is always followed by its Dispatch (the context accepts the
+-         * next Prepare only then); on a reset frame the result is not shown */
+-        const int gen = rc == FFX_VK_FSR3_3_1_6_FRAMEGEN_OK && !reset;
+-        if (rc == FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+-            FfxVkFsr3_3_1_6FrameGenerationDispatchInfo di = {
+-                .commandBuffer = s_vk.cmd, .color = col,
+-                .output = { s_fg.interp.img, VK_FORMAT_R8G8B8A8_UNORM, s_fg.w, s_fg.h, VK_IMAGE_LAYOUT_GENERAL, use },
+-                .displayWidth = s_fg.w, .displayHeight = s_fg.h, .frameTimeMilliseconds = ft,
+-                .cameraNear = 0.1f, .cameraFar = 1000.0f, .viewSpaceToMeters = 1.0f, .cameraVerticalFovRadians = 1.0f,
+-                .minLuminance = 0.0f, .maxLuminance = 1.0f, .transferFunction = FFX_VK_FSR3_3_1_6_FRAMEGEN_TRANSFER_SRGB,
+-                .frameId = s_fg.fsr_id, .reset = reset ? VK_TRUE : VK_FALSE };
+-            rc = (int)ffxVkFsr3_3_1_6FrameGenerationContextRecordDispatch(
+-                (FfxVkFsr3_3_1_6FrameGenerationContext*)s_fg.fsr, &di);
+-        }
+-        if (rc != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+-            static int warned;
+-            if (!warned++) VK_LOG("FSR 3.1.6 frame generation: record failed (%d)\n", rc);
+-        }
+-        VkMemoryBarrier mbo = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+-                                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+-                                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT };
+-        pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                              0, 1, &mbo, 0, NULL, 0, NULL);
++                        s_fg.hist[slot].img, VK_IMAGE_LAYOUT_GENERAL, 1, &cpf);
+         s_b.ops++;
+-        if (gen && rc == FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+-            vk_present_image(s_fg.interp.img);
+-            s_fg.shown++;
+-            vk_fg_dump(r);
+-            s_fg.pending = 1; s_fg.pend_r = r;
+-            s_fg.due_ns = now + (unsigned long long)(s_fg.dt_ns * 0.5);
+-        } else {
+-            vk_present_image(s_fg.hist[r].img);
+-            s_fg.shown++;
+-        }
+-        /* the views FSR made for frames whose batches have certainly retired
+-         * (every batch slot has been reused since) */
+-        if (s_fg.fsr_id > (unsigned long long)s_b.nslots + 2u)
+-            ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(
+-                (FfxVkFsr3_3_1_6FrameGenerationContext*)s_fg.fsr, s_fg.fsr_id - s_b.nslots - 2u);
++        vk_submit_async();
++        pthread_mutex_lock(&s_fg.mu);
++        if (s_fg.j_have) __atomic_add_fetch(&s_fg.t_dropped, 1u, __ATOMIC_RELAXED);   /* the last one never got out */
++        s_fg.j_r = slot; s_fg.j_t = now; s_fg.j_dt = s_fg.dt_ns > 0 ? s_fg.dt_ns : 16.7e6;
++        s_fg.j_reset = fresh || !s_fg.have_prev;
++        s_fg.j_have = 1;
++        pthread_cond_signal(&s_fg.cv);
++        pthread_mutex_unlock(&s_fg.mu);
+         s_fg.have_prev = 1;
+-        s_fg.r = (r + 1u) % 3u;
++        s_fg.r = (slot + 1u) % 3u;
+         vk_fg_stat();
+         return 1;
+     }
