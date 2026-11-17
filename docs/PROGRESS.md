@@ -3057,3 +3057,42 @@ profile after it (kzprof, 20 s at 41 fps) the skinning copy is still the
 largest lane symbol, 8.5 ms a frame of the lanes' 80; then memcpy and the
 other libc copies 7.3, `mfc_do_transfer` 3.1, Particles.VertexJob 0x50F8 3.0,
 `spu_lookup` 2.6, Raycast 0x6C58 2.2, the PUT/lock-line/coherency hooks ~5.
+
+## 105. AMD FSR 3.1 frame generation
+
+`PS3RECOMP_VK_FRAMEGEN=fsr` (windowed): AMD FSR 3.1.6 optical flow and frame
+interpolation, from FireBurn/UniversalScalers-Vulkan (MIT; it carries the
+AMD FidelityFX SDK subsets, MIT), a new submodule built by the port's CMake
+(`KZ2_FSR_FG=OFF` leaves it out). Patch 0086 carries the frame-generation
+work of PROGRESS 99-101 (presenter thread, queue lock, the port's own
+interpolation and extrapolation) plus the FSR mode: at each flip the frame is
+copied into a history image, FSR's Prepare (optical flow) and Dispatch (the
+frame half way from the last one) are recorded into the open batch, the
+generated frame is shown at once and the real one half an interval later
+(the interp mode's pacing: half a frame of latency). The RSX output has no
+depth or motion vectors of its own yet, so FSR gets a far plane and zero
+motion and its optical flow carries the interpolation.
+
+Checked on the RTX 3060: the library's FSR 3.1.6 smoke test passes without
+the validation layer; in the game, "64.0 frames/s shown from 32.0 rendered"
+in the level; the dumped triples (before | generated | after,
+`PS3RECOMP_VK_FRAMEGEN_DUMP`) show clean in-between frames, including the
+fastest camera turn of the run (no tearing or broken blocks, slightly soft).
+
+Two faults on the way:
+- The bridge tags its per-dispatch descriptor sets and constant buffers with
+  an active frame ID and frees them in its RetireFrame; the 3.1.6 frame
+  generation context never set the ID nor retired the bridge, so all of them
+  stayed (ID 0 is never freed): the process grew ~1 MB a frame, 1.5 -> 18 GB
+  in 150 s. `patches/UniversalScalers-Vulkan/0001` sets and retires it
+  (`tools/apply_patches.sh` applies it); 1.57 GB flat after.
+- A Prepare must be followed by its Dispatch (the context refuses the next
+  Prepare until then): on a reset frame the Dispatch now runs too and its
+  result is not shown.
+
+Cost: the rendered rate in the window fell to ~32 from ~41 -- the FSR
+recording (a vkAllocateMemory per constant buffer, descriptor sets and views
+each dispatch) and the second present per frame run on the FIFO thread, which
+is on the frame's path. Moving both to the presenter thread is next.
+The environment's default is now off; the launcher offers off / AMD FSR 3.1 /
+the port's interpolation / AFMF.

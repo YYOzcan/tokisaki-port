@@ -1,0 +1,23 @@
+diff --git a/src/ffx_vk_fsr3_3_1_6_framegen.cpp b/src/ffx_vk_fsr3_3_1_6_framegen.cpp
+index 9636cec..4679c04 100644
+--- a/src/ffx_vk_fsr3_3_1_6_framegen.cpp
++++ b/src/ffx_vk_fsr3_3_1_6_framegen.cpp
+@@ -493,6 +493,10 @@ ffxVkFsr3_3_1_6FrameGenerationContextRecordPrepare(
+      * a descriptor target underneath those commands. */
+     context->prepared = true;
+     context->frameId = info->frameId;
++    /* Tag this frame's transient bridge objects (descriptor sets, constant
++     * buffers) with its ID so RetireFrame can free them; untagged (ID 0) ones
++     * were never retired and accumulated every frame. */
++    ffxVkFsr3_3_1_5BridgeBeginFrame(context->bridge, info->frameId);
+     context->renderWidth = info->renderWidth;
+     context->renderHeight = info->renderHeight;
+     context->preparedColorImage = info->color.image;
+@@ -666,6 +670,7 @@ ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(
+         context->renderWidth = 0u;
+         context->renderHeight = 0u;
+     }
++    ffxVkFsr3_3_1_5BridgeRetireFrame(context->bridge, completedFrameId);
+     auto retained = context->retainedFrames.begin();
+     while (retained != context->retainedFrames.end()) {
+         if (retained->frameId <= completedFrameId) {

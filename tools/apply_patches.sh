@@ -4,6 +4,20 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="${ROOT}/external/ps3recomp"
+# external/UniversalScalers-Vulkan (FSR frame generation): its own short series.
+USV="${ROOT}/external/UniversalScalers-Vulkan"
+if [ -d "${USV}/src" ]; then
+    for p in "${ROOT}"/patches/UniversalScalers-Vulkan/*.patch; do
+        [ -e "${p}" ] || continue
+        if git -C "${USV}" apply --reverse --check "${p}" 2>/dev/null; then
+            echo "[patch] present  UniversalScalers-Vulkan/$(basename "${p}")"
+        elif git -C "${USV}" apply --check "${p}" 2>/dev/null; then
+            git -C "${USV}" apply "${p}" && echo "[patch] applied  UniversalScalers-Vulkan/$(basename "${p}")"
+        else
+            echo "[patch] CONFLICT UniversalScalers-Vulkan/$(basename "${p}")" >&2; exit 1
+        fi
+    done
+fi
 # A stacked series cannot be checked patch by patch once it is all applied
 # (a later patch rewrites lines an earlier one added), so check the newest
 # patch first: if it is in, the whole series is.

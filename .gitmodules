@@ -2,3 +2,6 @@
 	path = external/ps3recomp
 	url = https://github.com/sp00nznet/ps3recomp
 	ignore = dirty
+[submodule "external/UniversalScalers-Vulkan"]
+	path = external/UniversalScalers-Vulkan
+	url = https://github.com/FireBurn/UniversalScalers-Vulkan

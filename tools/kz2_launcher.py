@@ -35,7 +35,7 @@ RED, RED_HOT, INK, PANEL, LINE, PALE, STEEL = "#B3121B", "#E0262F", "#0B0D10", "
 DEFAULTS = {
     "fullscreen": False,
     "vsync": "mailbox",          # fifo | mailbox | immediate
-    "framegen": "0",             # 0 | 1 (PS3RECOMP_VK_FRAMEGEN) | afmf (the afmf-linux Vulkan layer)
+    "framegen": "0",             # 0 | fsr | interp (PS3RECOMP_VK_FRAMEGEN) | afmf (the afmf-linux Vulkan layer)
     "post_blur": False,
     "mouse_sens": 3.0,
     "mouse_invert": False,
@@ -51,6 +51,8 @@ def load_settings():
         s.update({k: v for k, v in json.loads(CONFIG.read_text()).items() if k in DEFAULTS})
     except (OSError, ValueError):
         pass
+    if s.get("framegen") == "1":       # before 2026-11-18 "1" was the port's interpolation
+        s["framegen"] = "interp"
     return s
 
 
@@ -415,7 +417,8 @@ class Launcher(QtWidgets.QWidget):
         p.lay.addWidget(heading("AKICILIK"))
         c, l = card()
         self.fg = QtWidgets.QComboBox()
-        fg_modes = [("Kapalı", "0"), ("Port — iki kare arasına bir kare", "1")]
+        fg_modes = [("Kapalı", "0"), ("AMD FSR 3.1 — ara kare", "fsr"),
+                    ("Port — ara kare", "interp")]
         if afmf_installed():
             fg_modes.append(("AFMF (afmf-linux katmanı)", "afmf"))
         for label, key in fg_modes:

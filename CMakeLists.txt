@@ -81,6 +81,25 @@ endif()
 
 add_subdirectory("${PS3RECOMP_DIR}" ps3recomp EXCLUDE_FROM_ALL)
 
+# AMD FSR 3.1.6 frame generation through FireBurn/UniversalScalers-Vulkan (MIT;
+# AMD FidelityFX SDK subsets inside, MIT): PS3RECOMP_VK_FRAMEGEN=fsr at run time.
+# KZ2_FSR_FG=OFF builds without it.
+option(KZ2_FSR_FG "Link AMD FSR 3.1.6 frame generation (external/UniversalScalers-Vulkan)" ON)
+set(KZ2_USV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/UniversalScalers-Vulkan")
+if(KZ2_FSR_FG AND EXISTS "${KZ2_USV_DIR}/CMakeLists.txt")
+    set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
+    set(FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN OFF CACHE BOOL "" FORCE)
+    set(FFX_VK_PORTABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${KZ2_USV_DIR}" usv EXCLUDE_FROM_ALL)
+    target_compile_definitions(ps3recomp_runtime PRIVATE RSX_VK_HAVE_FSR_FG=1)
+    target_include_directories(ps3recomp_runtime PRIVATE "${KZ2_USV_DIR}/include")
+    set(KZ2_FSR_FG_LIBS ffx_vulkan_fsr3_vk_framegeneration_3_1_6)
+elseif(KZ2_FSR_FG)
+    message(STATUS "external/UniversalScalers-Vulkan missing: no FSR frame generation "
+                   "(git submodule update --init)")
+endif()
+
 # ---------------------------------------------------------------------------
 # Generated inputs
 # ---------------------------------------------------------------------------
@@ -181,7 +200,7 @@ target_include_directories(killzone2 PRIVATE
 
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)        # Edge Zlib requests are inflated on the host
-target_link_libraries(killzone2 PRIVATE ps3recomp_runtime Threads::Threads ZLIB::ZLIB ${CMAKE_DL_LIBS})
+target_link_libraries(killzone2 PRIVATE ps3recomp_runtime ${KZ2_FSR_FG_LIBS} Threads::Threads ZLIB::ZLIB ${CMAKE_DL_LIBS})
 set_target_properties(killzone2 PROPERTIES LINKER_LANGUAGE CXX)
 
 if(MSVC)
