@@ -12,6 +12,10 @@ export KZ2_RUN_DIR="${KZ2_RUN_DIR:-${ROOT}/run_test}" PS3RECOMP_VK_WINDOW="${PS3
 if [ -n "${KZ2_RUN_TEMPLATE:-}" ]; then
     rm -rf "${KZ2_RUN_DIR}"; mkdir -p "${KZ2_RUN_DIR}"; cp -a "${KZ2_RUN_TEMPLATE}/gamedata" "${KZ2_RUN_DIR}/"
 fi
+# MangoHud off unless KZ2_MANGOHUD=1: a MANGOHUD=1 in the desktop environment
+# (~/.config/environment.d) would load its layer and thread into every run --
+# ~3% of the game's CPU on a CPU-bound benchmark; the launcher leaves it off too.
+export MANGOHUD="${KZ2_MANGOHUD:-0}"
 export PS3RECOMP_VK_PRESENT_READBACK="${PS3RECOMP_VK_PRESENT_READBACK:-0}"
 export PAD_SCRIPT="${PAD_SCRIPT:-20:0x4000,26:0x4000,32:0x4000,38:0x0008,44:0x4000,50:0x4000,56:0x0008,62:0x4000}"
 "${ROOT}/tools/run.sh" > "${LOG}" 2>&1 &

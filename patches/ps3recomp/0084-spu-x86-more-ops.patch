@@ -1,0 +1,113 @@
+diff --git a/runtime/spu/spu_helpers_x86.h b/runtime/spu/spu_helpers_x86.h
+index 14417acf..7c9c20d5 100644
+--- a/runtime/spu/spu_helpers_x86.h
++++ b/runtime/spu/spu_helpers_x86.h
+@@ -301,6 +301,58 @@ SPU_X_INLINE u128 spu_frsqest_x86(u128 a)
+ }
+ #endif
+ 
++/* ---- more ops the x86 build left as scalar loops or u64 pairs (from the
++ * inFAMOUS 2 port's engine/runtime/spu/spu_helpers_x86int.h, SamiEnazi/
++ * infamous2-port, MIT, sp00nznet's ps3recomp): immediate word and halfword
++ * shifts and rotates, the byte/halfword immediate logicals, the u64-pair
++ * logicals (which split into scalars once registers live in C locals) and
++ * the quadword shifts by 0..7 bits. SSE shifts by a count above the lane
++ * width give 0 (logical) or the sign fill (arithmetic): the SPU's rule. ---- */
++SPU_X_INLINE u128 spu_shli_x86(u128 a, int sh)   { return spu__x_st(_mm_sll_epi32(X_A, _mm_cvtsi32_si128(sh & 0x3F))); }
++SPU_X_INLINE u128 spu_rotmi_x86(u128 a, int i7)  { return spu__x_st(_mm_srl_epi32(X_A, _mm_cvtsi32_si128((0 - i7) & 0x3F))); }
++SPU_X_INLINE u128 spu_rotmai_x86(u128 a, int i7) { return spu__x_st(_mm_sra_epi32(X_A, _mm_cvtsi32_si128((0 - i7) & 0x3F))); }
++SPU_X_INLINE u128 spu_roti_x86(u128 a, int sh)
++{
++    sh &= 31;   /* 0: the right shift by 32 is 0 */
++    return spu__x_st(_mm_or_si128(_mm_sll_epi32(X_A, _mm_cvtsi32_si128(sh)), _mm_srl_epi32(X_A, _mm_cvtsi32_si128(32 - sh))));
++}
++SPU_X_INLINE u128 spu_shlhi_x86(u128 a, int sh)  { return spu__x_st(_mm_sll_epi16(X_A, _mm_cvtsi32_si128(sh & 0x1F))); }
++SPU_X_INLINE u128 spu_rothmi_x86(u128 a, int i7) { return spu__x_st(_mm_srl_epi16(X_A, _mm_cvtsi32_si128((0 - i7) & 0x1F))); }
++SPU_X_INLINE u128 spu_rothi_x86(u128 a, int sh)
++{
++    sh &= 15;
++    return spu__x_st(_mm_or_si128(_mm_sll_epi16(X_A, _mm_cvtsi32_si128(sh)), _mm_srl_epi16(X_A, _mm_cvtsi32_si128(16 - sh))));
++}
++SPU_X_INLINE u128 spu_andhi_x86(u128 a, int32_t i) { return spu__x_st(_mm_and_si128(X_A, _mm_set1_epi16((short)i))); }
++SPU_X_INLINE u128 spu_orhi_x86(u128 a, int32_t i)  { return spu__x_st(_mm_or_si128(X_A, _mm_set1_epi16((short)i))); }
++SPU_X_INLINE u128 spu_xorhi_x86(u128 a, int32_t i) { return spu__x_st(_mm_xor_si128(X_A, _mm_set1_epi16((short)i))); }
++SPU_X_INLINE u128 spu_andbi_x86(u128 a, int32_t i) { return spu__x_st(_mm_and_si128(X_A, _mm_set1_epi8((char)i))); }
++SPU_X_INLINE u128 spu_orbi_x86(u128 a, int32_t i)  { return spu__x_st(_mm_or_si128(X_A, _mm_set1_epi8((char)i))); }
++SPU_X_INLINE u128 spu_xorbi_x86(u128 a, int32_t i) { return spu__x_st(_mm_xor_si128(X_A, _mm_set1_epi8((char)i))); }
++SPU_X_INLINE u128 spu_iohl_x86(u128 a, uint16_t i) { return spu__x_st(_mm_or_si128(X_A, _mm_set1_epi32((int)(uint32_t)i))); }
++SPU_X_INLINE u128 spu_andc_x86(u128 a, u128 b) { return spu__x_st(_mm_andnot_si128(X_B, X_A)); }
++SPU_X_INLINE u128 spu_orc_x86(u128 a, u128 b)  { return spu__x_st(_mm_or_si128(X_A, _mm_xor_si128(X_B, _mm_set1_epi32(-1)))); }
++SPU_X_INLINE u128 spu_nand_x86(u128 a, u128 b) { return spu__x_st(_mm_xor_si128(_mm_and_si128(X_A, X_B), _mm_set1_epi32(-1))); }
++SPU_X_INLINE u128 spu_nor_x86(u128 a, u128 b)  { return spu__x_st(_mm_xor_si128(_mm_or_si128(X_A, X_B), _mm_set1_epi32(-1))); }
++SPU_X_INLINE u128 spu_eqv_x86(u128 a, u128 b)  { return spu__x_st(_mm_xor_si128(_mm_xor_si128(X_A, X_B), _mm_set1_epi32(-1))); }
++/* quadword shifts by 0..7 bits: lane i is SPU word i (word 0 the most
++ * significant), so the bits crossing into lane i come from lane i+1 (left)
++ * or lane i-1 (right); a count of 0 shifts the neighbour by 32, giving 0 */
++SPU_X_INLINE __m128i spu__x_qbl(__m128i x, __m128i next, int sh)
++{
++    return _mm_or_si128(_mm_sll_epi32(x, _mm_cvtsi32_si128(sh)), _mm_srl_epi32(next, _mm_cvtsi32_si128(32 - sh)));
++}
++SPU_X_INLINE __m128i spu__x_qbr(__m128i x, int sh)
++{
++    return _mm_or_si128(_mm_srl_epi32(x, _mm_cvtsi32_si128(sh)), _mm_sll_epi32(_mm_slli_si128(x, 4), _mm_cvtsi32_si128(32 - sh)));
++}
++SPU_X_INLINE u128 spu_shlqbii_x86(u128 a, int sh) { return spu__x_st(spu__x_qbl(X_A, _mm_srli_si128(X_A, 4), sh & 7)); }
++SPU_X_INLINE u128 spu_shlqbi_x86(u128 a, u128 b)  { return spu_shlqbii_x86(a, (int)(b._u32[0] & 7)); }
++SPU_X_INLINE u128 spu_rotqbii_x86(u128 a, int sh) { return spu__x_st(spu__x_qbl(X_A, _mm_shuffle_epi32(X_A, _MM_SHUFFLE(0, 3, 2, 1)), sh & 7)); }
++SPU_X_INLINE u128 spu_rotqbi_x86(u128 a, u128 b)  { return spu_rotqbii_x86(a, (int)(b._u32[0] & 7)); }
++SPU_X_INLINE u128 spu_rotqmbii_x86(u128 a, int i7) { return spu__x_st(spu__x_qbr(X_A, (0 - i7) & 7)); }
++SPU_X_INLINE u128 spu_rotqmbi_x86(u128 a, u128 b)  { return spu_rotqmbii_x86(a, (int)b._u32[0]); }
++
+ #undef X_A
+ #undef X_B
+ 
+@@ -375,6 +427,33 @@ SPU_X_INLINE u128 spu_frsqest_x86(u128 a)
+ #define spu_chx(...)    spu_chx_x86(__VA_ARGS__)
+ #define spu_cbx(...)    spu_cbx_x86(__VA_ARGS__)
+ #define spu_cdx(...)    spu_cdx_x86(__VA_ARGS__)
++#ifndef SPU_NO_X86_MORE   /* the second set (diagnostic: compile without it) */
++#define spu_shli(...)    spu_shli_x86(__VA_ARGS__)
++#define spu_rotmi(...)   spu_rotmi_x86(__VA_ARGS__)
++#define spu_rotmai(...)  spu_rotmai_x86(__VA_ARGS__)
++#define spu_roti(...)    spu_roti_x86(__VA_ARGS__)
++#define spu_shlhi(...)   spu_shlhi_x86(__VA_ARGS__)
++#define spu_rothmi(...)  spu_rothmi_x86(__VA_ARGS__)
++#define spu_rothi(...)   spu_rothi_x86(__VA_ARGS__)
++#define spu_andhi(...)   spu_andhi_x86(__VA_ARGS__)
++#define spu_orhi(...)    spu_orhi_x86(__VA_ARGS__)
++#define spu_xorhi(...)   spu_xorhi_x86(__VA_ARGS__)
++#define spu_andbi(...)   spu_andbi_x86(__VA_ARGS__)
++#define spu_orbi(...)    spu_orbi_x86(__VA_ARGS__)
++#define spu_xorbi(...)   spu_xorbi_x86(__VA_ARGS__)
++#define spu_iohl(...)    spu_iohl_x86(__VA_ARGS__)
++#define spu_andc(...)    spu_andc_x86(__VA_ARGS__)
++#define spu_orc(...)     spu_orc_x86(__VA_ARGS__)
++#define spu_nand(...)    spu_nand_x86(__VA_ARGS__)
++#define spu_nor(...)     spu_nor_x86(__VA_ARGS__)
++#define spu_eqv(...)     spu_eqv_x86(__VA_ARGS__)
++#define spu_shlqbii(...) spu_shlqbii_x86(__VA_ARGS__)
++#define spu_shlqbi(...)  spu_shlqbi_x86(__VA_ARGS__)
++#define spu_rotqbii(...) spu_rotqbii_x86(__VA_ARGS__)
++#define spu_rotqbi(...)  spu_rotqbi_x86(__VA_ARGS__)
++#define spu_rotqmbii(...) spu_rotqmbii_x86(__VA_ARGS__)
++#define spu_rotqmbi(...) spu_rotqmbi_x86(__VA_ARGS__)
++#endif
+ #endif /* SPU_NO_X86_REDIRECT */
+ 
+ #endif /* x86 SSE4.1 */
+diff --git a/runtime/spu/tests/test_spu_helpers_x86.c b/runtime/spu/tests/test_spu_helpers_x86.c
+index 0bafdb58..d8b5883b 100644
+--- a/runtime/spu/tests/test_spu_helpers_x86.c
++++ b/runtime/spu/tests/test_spu_helpers_x86.c
+@@ -56,6 +56,11 @@ int main(void)
+ #if defined(__AVX2__)
+         C2(shl); C2(rot); C2(rotm); C2(rotma); C2(shlh); C2(rothm); C2(rothma);
+ #endif
++        CI(shli); CI(rotmi); CI(rotmai); CI(roti); CI(shlhi); CI(rothmi); CI(rothi);
++        CI(andhi); CI(orhi); CI(xorhi); CI(andbi); CI(orbi); CI(xorbi);
++        { const uint16_t u = (uint16_t)rnd(); chk("iohl", spu_iohl_x86(a, u), spu_iohl(a, u), a, b, u); }
++        C2(andc); C2(orc); C2(nand); C2(nor); C2(eqv);
++        CI(shlqbii); C2(shlqbi); CI(rotqbii); C2(rotqbi); CI(rotqmbii); C2(rotqmbi);
+         C2(ah); CI(ahi); C2(sfh); CI(sfhi); C2(ceqh); CI(ceqhi); C2(cgth); CI(cgthi); C2(clgth); CI(clgthi);
+         { const int i7 = (int)(rnd() % 128) - 64; chk("rotmahi", spu_rotmahi_x86(a, i7), spu_rotmahi(a, i7), a, b, i7); }
+         C2(ceqb); CI(ceqbi); C2(cgtb); CI(cgtbi); C2(clgtb); CI(clgtbi); C2(absdb); C2(avgb); C1(cntb);

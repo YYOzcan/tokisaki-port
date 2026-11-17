@@ -35,7 +35,7 @@ RED, RED_HOT, INK, PANEL, LINE, PALE, STEEL = "#B3121B", "#E0262F", "#0B0D10", "
 DEFAULTS = {
     "fullscreen": False,
     "vsync": "mailbox",          # fifo | mailbox | immediate
-    "framegen": "0",             # 0 | 1 (PS3RECOMP_VK_FRAMEGEN)
+    "framegen": "0",             # 0 | 1 (PS3RECOMP_VK_FRAMEGEN) | afmf (the afmf-linux Vulkan layer)
     "post_blur": False,
     "mouse_sens": 3.0,
     "mouse_invert": False,
@@ -59,6 +59,13 @@ def save_settings(s):
     CONFIG.write_text(json.dumps(s, indent=2))
 
 
+def afmf_installed():
+    """The afmf-linux implicit Vulkan layer (github: afmf-linux), installed per user or system-wide."""
+    dirs = [Path.home() / ".local/share/vulkan/implicit_layer.d", Path("/usr/share/vulkan/implicit_layer.d"),
+            Path("/etc/vulkan/implicit_layer.d")]
+    return any((d / "afmf-linux.json").exists() for d in dirs)
+
+
 def game_env(s):
     """The runtime switches for these settings (tools/play.sh adds the window)."""
     env = dict(os.environ)
@@ -66,7 +73,15 @@ def game_env(s):
         env.pop(k, None)
     env["PS3RECOMP_VK_WINDOW"] = "1"
     env["PS3RECOMP_VK_PRESENT"] = s["vsync"]
-    env["PS3RECOMP_VK_FRAMEGEN"] = s["framegen"]
+    # "afmf": the afmf-linux Vulkan layer (AFMF_ENABLE=1) generates the frames instead of the
+    # port's own interpolation, which is then off so the two do not stack
+    env.pop("AFMF_ENABLE", None)
+    if s["framegen"] == "afmf":
+        env["PS3RECOMP_VK_FRAMEGEN"] = "0"
+        if afmf_installed():
+            env["AFMF_ENABLE"] = "1"
+    else:
+        env["PS3RECOMP_VK_FRAMEGEN"] = s["framegen"]
     env["KZ2_FPS"] = "1"
     for key, var in (("fullscreen", "PS3RECOMP_VK_FULLSCREEN"), ("post_blur", "KZ2_POST_BLUR")):
         if s[key]:
@@ -400,7 +415,10 @@ class Launcher(QtWidgets.QWidget):
         p.lay.addWidget(heading("AKICILIK"))
         c, l = card()
         self.fg = QtWidgets.QComboBox()
-        for label, key in (("Kapalı", "0"), ("Açık — iki kare arasına bir kare", "1")):
+        fg_modes = [("Kapalı", "0"), ("Port — iki kare arasına bir kare", "1")]
+        if afmf_installed():
+            fg_modes.append(("AFMF (afmf-linux katmanı)", "afmf"))
+        for label, key in fg_modes:
             self.fg.addItem(label, key)
         self.fg.setCurrentIndex(max(0, self.fg.findData(self.s["framegen"])))
         self.fg.currentIndexChanged.connect(lambda _: self.set("framegen", self.fg.currentData()))

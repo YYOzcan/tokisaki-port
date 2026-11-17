@@ -2997,3 +2997,34 @@ in-level frame (110 s) is unchanged.
 
 The draw dump lines now carry the alpha function and reference
 (`af .. ar .. fmt ..`) and both faces' stencil reference and masks.
+
+## 103. Borrowed from the other PS3 ports; the CPU per frame
+
+The MIT-licensed ports of the same generation built on ps3recomp (God of War:
+Ascension -- otavix010/gow-ascension-pc, rigaz29/Ascension-R, snuri00/GoWA-pc;
+inFAMOUS 2 -- SamiEnazi/infamous2-port, ThiagoFraga761/infamous2-pc) were read
+for what carries over. Their largest generic wins: SPU ops that were scalar
+loops on x86 written as vector instructions, single-precision ops native under
+an RZ/FTZ/DAZ MXCSR, a leaner DMA path, threads pinned per core (Windows),
+per-line lock-line locks, and (inFAMOUS 2) speculative float runs -- one
+range test for a straight run of float ops instead of one per op.
+
+- This port already had the RZ MXCSR forms (`SPU_FP_RZ_ASSUMED`, ~7 operations
+  an fa/fm/fma) and SSE forms of most integer ops (`spu_helpers_x86.h`).
+- Patch 0084 adds the 25 the x86 build still left as loops or u64 pairs
+  (immediate word/halfword shifts and rotates, byte/halfword immediate
+  logicals, andc/orc/nand/nor/eqv, the quadword shifts by bits), from
+  SamiEnazi/infamous2-port's `spu_helpers_x86int.h` (MIT); bit-exact against
+  the originals (`test_spu_helpers_x86.c`, 2 M random + edge vectors;
+  `SPU_NO_X86_MORE` compiles without them). Static instructions in the hot
+  job modules: -0.4% (Anim.Skinning) to -1.8% (Raycast); clang had vectorised
+  most of the loops already. Measured with the new `tools/ab_cpu.sh` (the
+  game's CPU time per presented frame, 100-155 s in, three rounds each):
+  158.5 / 164.4 / 155.7 ms against 160.8 / 157.9 / 157.2 -- no change.
+- `MANGOHUD=1` in `~/.config/environment.d` had loaded MangoHud's layer and
+  thread into every benchmark (~3% of the game's CPU; the launcher leaves it
+  out unless its overlay is chosen). `tools/longrun.sh` now sets MANGOHUD=0
+  unless `KZ2_MANGOHUD=1`.
+
+The frame costs ~159 ms of CPU on 6.5 of the 12 hardware threads at ~41 fps;
+a real 60 needs it near 100 ms.
